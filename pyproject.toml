@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=71.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot-snvla"
+version = "0.1.0"
+description = "SN-VLA extension package for Hugging Face LeRobot"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "lerobot[dataset,pi]>=0.6.0,<0.7.0",
+    "transformers>=5.4.0,<5.6.0",
+    "numpy>=1.26.0",
+    "torch>=2.8.0",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "matplotlib>=3.10.0",
+    "pandas>=2.2.0",
+    "seaborn>=0.13.0",
+    "bokeh>=3.0.0",
+]
+dev = [
+    "pytest>=8.1.0,<9.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+snvla-train = "lerobot_snvla.cli:train"
+snvla-eval = "lerobot_snvla.cli:eval"
+snvla-dataset-viz = "lerobot_snvla.cli:dataset_viz"
+snvla-analyze-dataset-stats = "lerobot_snvla.scripts.analyze_dataset_stats:main"
+snvla-augment-narrations = "lerobot_snvla.scripts.augment_narrations:main"
+snvla-debug-inference = "lerobot_snvla.scripts.debug_inference:main"
+snvla-generate-paper-figure = "lerobot_snvla.scripts.generate_paper_figure:main"
+snvla-generate-partial-scoop-episodes = "lerobot_snvla.scripts.generate_partial_scoop_episodes:main"
+snvla-rewrite-dataset-text = "lerobot_snvla.scripts.rewrite_dataset_text:main"
+snvla-stroboscopic-image = "lerobot_snvla.scripts.stroboscopic_image:main"
+snvla-visualize = "lerobot_snvla.scripts.visualize:main"
+snvla-visualize-narration-flow = "lerobot_snvla.scripts.visualize_narration_flow:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lerobot_snvla = ["scripts/*.sh"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "T20", "N", "UP", "SIM"]
+ignore = ["E501", "T201", "T203", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "F403"]
+"src/lerobot_snvla/scripts/*.py" = ["ALL"]
