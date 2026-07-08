@@ -43,12 +43,29 @@ from .configuration_snvla import SNVLAConfig
 TASK_KEY = "task"
 
 
-def discretize_state(state: torch.Tensor, max_dim: int, num_bins: int = 256) -> torch.Tensor:
+def discretize_state(state: torch.Tensor, max_dim: int, num_bins: int = 256) -> np.ndarray:
     """Discretizes the continuous state into bins."""
     state = pad_vector(state, max_dim)
     state_np = state.cpu().numpy()
     discretized = np.digitize(state_np, bins=np.linspace(-1, 1, num_bins + 1)[:-1]) - 1
     return discretized
+
+
+def parse_previous_narrations(value: Any) -> list[str]:
+    if not isinstance(value, str) or not value:
+        return []
+
+    try:
+        narrations = json.loads(value)
+    except json.JSONDecodeError:
+        logging.warning("Failed to parse '%s' as JSON; using empty narration history.", PREVIOUS_NARRATIONS)
+        return []
+
+    if not isinstance(narrations, list):
+        logging.warning("Expected '%s' to decode to a list; using empty narration history.", PREVIOUS_NARRATIONS)
+        return []
+
+    return [narration for narration in narrations if isinstance(narration, str)]
 
 
 def make_prefix_prompt(
@@ -134,13 +151,7 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
             # Prepare state string for this item
             state_str = " ".join(map(str, discretized_states[i]))
 
-            # Split previous narrations
-            if isinstance(previous_narrations_json_str, str):
-                previous_narrations = (
-                    json.loads(previous_narrations_json_str) if previous_narrations_json_str else []
-                )
-            else:
-                previous_narrations = []
+            previous_narrations = parse_previous_narrations(previous_narrations_json_str)
 
             # コンテキスト
             context_str = make_prefix_prompt(task, previous_narrations, state_str, self.tokenizer.bos_token)

@@ -153,17 +153,12 @@ def create_flow_chart(frames, events, background, masks, output_path):
     fig_w = 20
     fig_h = 5 * n_rows
     
-    fig, axes = plt.subplots(n_rows, events_per_row * 3, figsize=(fig_w, fig_h)) 
+    fig, axes = plt.subplots(n_rows, events_per_row * 3, figsize=(fig_w, fig_h))
     # *3 because: Keyframe, Arrow, Strobe. (Next Keyframe is start of next event, so we don't duplicate).
     # Actually the user diagram shows: Keyframe1 -> Strobe1 -> Keyframe2.
     # Keyframe2 is the start of Event 2.
     
-    # Flatten axes if needed
-    if n_rows == 1:
-        axes = [axes]
-    else:
-        # axes is (n_rows, cols)
-        pass
+    axes = np.asarray(axes).reshape(n_rows, events_per_row * 3)
 
     # Helper to clean axes
     def clean_axis(ax):
@@ -186,7 +181,7 @@ def create_flow_chart(frames, events, background, masks, output_path):
         
         # Determine Axes (we might have more axes than needed if grid is uniform)
         # axes[row_idx] is array of subplots
-        row_axes = axes[row_idx] if n_rows > 1 else axes[0]
+        row_axes = axes[row_idx]
         
         ax_key = row_axes[col_base_idx]
         ax_arrow1 = row_axes[col_base_idx + 1]
@@ -249,22 +244,10 @@ def create_flow_chart(frames, events, background, masks, output_path):
         # For now, let's leave it as triples. The flow is implied left-to-right.
         
     # Hide unused axes
-    for r in range(n_rows):
-        row_axes = axes[r] if n_rows > 1 else axes[0]
-        for c in range(events_per_row * 3):
-            # If this column index > what we filled
-            total_filled_idx = (r * events_per_row * 3) + c
-            # We filled 3 distinct plots per event.
-            # Total used slots = n_events * 3.
-            if i * 3 + 2 < total_filled_idx: # Heuristic check? No, simpler manually.
-                 pass
-
-    # Better loop to hide unused
-    total_slots = n_rows * events_per_row * 3
     used_slots = n_events * 3
     
     # Iterate all axes flat
-    all_axes = axes.flatten() if isinstance(axes, np.ndarray) else axes
+    all_axes = axes.flatten()
     for j in range(used_slots, len(all_axes)):
         all_axes[j].axis('off')
         

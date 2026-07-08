@@ -335,8 +335,6 @@ def create_visualization(doc):
 
     slider.on_change("value", update)
 
-    slider.on_change("value", update)
-
     # State for real-time playback
     playback_state = {
         "start_wall_time": 0.0,

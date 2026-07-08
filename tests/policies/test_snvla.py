@@ -105,3 +105,26 @@ def test_processor_step_tokenizes_narration_without_external_download(monkeypatc
     assert observation[OBS_LANGUAGE_TOKEN_AR_MASK].dtype is torch.bool
     assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].dtype is torch.float32
     assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].sum() > 0
+
+
+def test_processor_step_tolerates_invalid_previous_narrations_json(monkeypatch):
+    import lerobot_snvla.policies.snvla.processor_snvla as processor_snvla
+
+    monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
+    cfg = make_test_config()
+    processor = SNVLAPrepareTrainingTokenizerProcessorStep(config=cfg)
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(1, cfg.max_state_dim)},
+        TransitionKey.ACTION: torch.zeros(1, cfg.max_action_dim),
+        TransitionKey.COMPLEMENTARY_DATA: {
+            TASK_KEY: ["pick up the red block"],
+            CURRENT_NARRATION: ["approaching the block"],
+            PREVIOUS_NARRATIONS: ["[not json"],
+        },
+    }
+
+    processed = processor(transition)
+    observation = processed[TransitionKey.OBSERVATION]
+
+    assert observation[OBS_LANGUAGE_TOKENS].shape[0] == 1
+    assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].sum() > 0

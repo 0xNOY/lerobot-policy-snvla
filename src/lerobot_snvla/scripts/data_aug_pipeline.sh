@@ -1,22 +1,21 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
 HF_USER=0xNOY
 SRC=${HF_USER}/so101_wn
 
 SRC_SCOOPS=10
 
-
-
-cd $(dirname $0)/../..
+cd "$(dirname "$0")/../.."
 
 TARGET_SCOOPS=$(seq -s, 1 $SRC_SCOOPS)
 
-examples/snvla/generate_partial_scoop_episodes.py $SRC outputs/${SRC}_gen --source-scoops $SRC_SCOOPS --target-object "soybeans,red beans" --target-scoops "$TARGET_SCOOPS" &&
+snvla-generate-partial-scoop-episodes "$SRC" "outputs/${SRC}_gen" --source-scoops "$SRC_SCOOPS" --target-object "soybeans,red beans" --target-scoops "$TARGET_SCOOPS" &&
 
-hf upload --repo-type dataset --revision main ${SRC}_gen outputs/${SRC}_gen &&
+hf upload --repo-type dataset --revision main "${SRC}_gen" "outputs/${SRC}_gen" &&
 
-lerobot-edit-dataset --repo_id ${SRC}_mix --operation.type merge --operation.repo_id="['${SRC}', '${SRC}_gen']" &&
+lerobot-edit-dataset --repo_id "${SRC}_mix" --operation.type merge --operation.repo_id="['${SRC}', '${SRC}_gen']" &&
 
-examples/snvla/augment_narrations.py ${SRC}_mix outputs/${SRC}_aug --window-size 8 &&
+snvla-augment-narrations "${SRC}_mix" "outputs/${SRC}_aug" --window-size 8 &&
 
-hf upload --repo-type dataset --revision main ${SRC}_aug outputs/${SRC}_aug
+hf upload --repo-type dataset --revision main "${SRC}_aug" "outputs/${SRC}_aug"
