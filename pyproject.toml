@@ -32,6 +32,7 @@ dev = [
 snvla-train = "lerobot_snvla.cli:train"
 snvla-eval = "lerobot_snvla.cli:eval"
 snvla-dataset-viz = "lerobot_snvla.cli:dataset_viz"
+snvla-record = "lerobot_snvla.scripts.snvla_record:main"
 snvla-analyze-dataset-stats = "lerobot_snvla.scripts.analyze_dataset_stats:main"
 snvla-augment-narrations = "lerobot_snvla.scripts.augment_narrations:main"
 snvla-debug-inference = "lerobot_snvla.scripts.debug_inference:main"
