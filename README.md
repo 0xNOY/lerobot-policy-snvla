@@ -30,6 +30,31 @@ The extension also patches LeRobot's batch converter so top-level dataset column
 `current_narration` and `previous_narrations` are passed to the SN-VLA processor as
 complementary data.
 
+## Narrated Data Collection
+
+Use `snvla-record` instead of `lerobot-record` when collecting demonstrations with
+step narrations:
+
+```bash
+snvla-record \
+  --robot.type=so100_follower \
+  --robot.port=/dev/tty.usbmodem58760431541 \
+  --robot.id=black \
+  --teleop.type=so100_leader \
+  --teleop.port=/dev/tty.usbmodem58760431551 \
+  --teleop.id=blue \
+  --dataset.repo_id=<user>/<dataset> \
+  --dataset.single_task="Scoop beans into the bowl" \
+  --dataset.narrations='["approach the scoop", "scoop beans", "move to the bowl", "pour beans"]'
+```
+
+During recording, press `n` to insert the next narration into the current frame.
+The command writes `current_narration` and `previous_narrations` columns directly
+into the LeRobot dataset, so the resulting dataset can be consumed by
+`snvla-train` without the original SN-VLA LeRobot fork. Press `t` to change the
+task description for subsequent frames, and use the standard LeRobot arrow/Esc
+controls for episode flow.
+
 ## Python Usage
 
 ```python
@@ -44,6 +69,7 @@ cfg = make_policy_config("snvla")
 
 SN-VLA helper scripts are exposed as console commands:
 
+- `snvla-record`
 - `snvla-analyze-dataset-stats`
 - `snvla-augment-narrations`
 - `snvla-debug-inference`
