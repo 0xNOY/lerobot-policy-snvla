@@ -371,6 +371,8 @@ def record_loop(
 
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
+    if control_time_s is None:
+        raise ValueError("control_time_s must be set before starting the recording loop.")
 
     teleop_arm = teleop_keyboard = None
     if isinstance(teleop, list):
