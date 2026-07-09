@@ -402,8 +402,6 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
-    if narration_manager.is_enabled():
-        events["narration_occurred"] = True
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -634,7 +632,7 @@ def record(
                     else:
                         logging.info("Task update cancelled.")
 
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                log_say(f"Recording episode {dataset.num_episodes + 1}", cfg.play_sounds)
                 narration_manager.reset()
                 record_loop(
                     robot=robot,
