@@ -1,6 +1,6 @@
 import json
 
-from lerobot_snvla.scripts.snvla_record import (
+from lerobot_policy_snvla.scripts.snvla_record import (
     NarrationManager,
     add_snvla_recording_features,
     fill_narration_frame_defaults,

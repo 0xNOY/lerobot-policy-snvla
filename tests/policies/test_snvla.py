@@ -5,6 +5,7 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 
 import lerobot_policy_snvla
 from lerobot_policy_snvla import SNVLAConfig
+from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
 from lerobot_policy_snvla.processor_snvla import (
     CURRENT_NARRATION,
     OBS_LANGUAGE_TOKEN_AR_MASK,
@@ -13,7 +14,6 @@ from lerobot_policy_snvla.processor_snvla import (
     TASK_KEY,
     SNVLAPrepareTrainingTokenizerProcessorStep,
 )
-from lerobot_snvla.compat import FeatureType, PolicyFeature
 
 
 class DummyTokenizer:
@@ -88,7 +88,7 @@ def test_snvla_pre_post_processors_are_created_before_pi05_fallback():
 
 
 def test_processor_step_tokenizes_narration_without_external_download(monkeypatch):
-    import lerobot_snvla.policies.snvla.processor_snvla as processor_snvla
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
 
     monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
     cfg = make_test_config()
@@ -115,7 +115,7 @@ def test_processor_step_tokenizes_narration_without_external_download(monkeypatc
 
 
 def test_processor_step_tolerates_invalid_previous_narrations_json(monkeypatch):
-    import lerobot_snvla.policies.snvla.processor_snvla as processor_snvla
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
 
     monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
     cfg = make_test_config()

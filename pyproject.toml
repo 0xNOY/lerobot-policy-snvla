@@ -29,28 +29,25 @@ dev = [
 ]
 
 [project.scripts]
-snvla-train = "lerobot_snvla.cli:train"
-snvla-eval = "lerobot_snvla.cli:eval"
-snvla-dataset-viz = "lerobot_snvla.cli:dataset_viz"
-snvla-record = "lerobot_snvla.scripts.snvla_record:main"
-snvla-analyze-dataset-stats = "lerobot_snvla.scripts.analyze_dataset_stats:main"
-snvla-augment-narrations = "lerobot_snvla.scripts.augment_narrations:main"
-snvla-debug-inference = "lerobot_snvla.scripts.debug_inference:main"
-snvla-generate-paper-figure = "lerobot_snvla.scripts.generate_paper_figure:main"
-snvla-generate-partial-scoop-episodes = "lerobot_snvla.scripts.generate_partial_scoop_episodes:main"
-snvla-rewrite-dataset-text = "lerobot_snvla.scripts.rewrite_dataset_text:main"
-snvla-stroboscopic-image = "lerobot_snvla.scripts.stroboscopic_image:main"
-snvla-visualize = "lerobot_snvla.scripts.visualize:main"
-snvla-visualize-narration-flow = "lerobot_snvla.scripts.visualize_narration_flow:main"
+snvla-record = "lerobot_policy_snvla.scripts.snvla_record:main"
+snvla-analyze-dataset-stats = "lerobot_policy_snvla.scripts.analyze_dataset_stats:main"
+snvla-augment-narrations = "lerobot_policy_snvla.scripts.augment_narrations:main"
+snvla-debug-inference = "lerobot_policy_snvla.scripts.debug_inference:main"
+snvla-generate-paper-figure = "lerobot_policy_snvla.scripts.generate_paper_figure:main"
+snvla-generate-partial-scoop-episodes = "lerobot_policy_snvla.scripts.generate_partial_scoop_episodes:main"
+snvla-rewrite-dataset-text = "lerobot_policy_snvla.scripts.rewrite_dataset_text:main"
+snvla-stroboscopic-image = "lerobot_policy_snvla.scripts.stroboscopic_image:main"
+snvla-visualize = "lerobot_policy_snvla.scripts.visualize:main"
+snvla-visualize-narration-flow = "lerobot_policy_snvla.scripts.visualize_narration_flow:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-lerobot_snvla = ["scripts/*.sh"]
+lerobot_policy_snvla = ["scripts/*.sh"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 line-length = 110
 
 [tool.ruff.lint]
@@ -59,4 +56,4 @@ ignore = ["E501", "T201", "T203", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
-"src/lerobot_snvla/scripts/*.py" = ["ALL"]
+"src/lerobot_policy_snvla/scripts/*.py" = ["ALL"]

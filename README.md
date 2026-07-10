@@ -18,19 +18,7 @@ The distribution is named `lerobot_policy_snvla`, so LeRobot's third-party plugi
 discovery imports it automatically. `lerobot-train --policy.type=snvla` works
 without importing this package manually.
 
-The legacy `lerobot_snvla` import path and the provided `snvla-*` commands remain
-available as convenience wrappers.
-
 ## Training
-
-```bash
-snvla-train \
-  --policy.type=snvla \
-  --dataset.repo_id=<user>/<dataset> \
-  --output_dir=outputs/train/snvla
-```
-
-The same policy can also be used through LeRobot's standard CLI:
 
 ```bash
 lerobot-train \
@@ -39,9 +27,8 @@ lerobot-train \
   --output_dir=outputs/train/snvla
 ```
 
-The extension also patches LeRobot's batch converter so top-level dataset columns
-`current_narration` and `previous_narrations` are passed to the SN-VLA processor as
-complementary data.
+The plugin passes the top-level dataset columns `current_narration` and
+`previous_narrations` to the SN-VLA processor as complementary data.
 
 ## Narrated Data Collection
 
@@ -64,15 +51,15 @@ snvla-record \
 During recording, press `n` to insert the next narration into the current frame.
 The command writes `current_narration` and `previous_narrations` columns directly
 into the LeRobot dataset, so the resulting dataset can be consumed by
-`snvla-train` without the original SN-VLA LeRobot fork. Press `t` to change the
+`lerobot-train --policy.type=snvla` without the original SN-VLA LeRobot fork. Press `t` to change the
 task description for subsequent frames, and use the standard LeRobot arrow/Esc
 controls for episode flow.
 
 ## Python Usage
 
 ```python
-from lerobot.policies.factory import make_policy_config
 import lerobot_policy_snvla  # noqa: F401
+from lerobot.policies.factory import make_policy_config
 
 cfg = make_policy_config("snvla")
 ```
@@ -95,5 +82,5 @@ SN-VLA helper scripts are exposed as console commands:
 The Bokeh visualizer remains a script module:
 
 ```bash
-bokeh serve src/lerobot_snvla/scripts/visualize_snvla_eval.py --args --repo-id <repo_id> --episode-index <idx>
+bokeh serve src/lerobot_policy_snvla/scripts/visualize_snvla_eval.py --args --repo-id <repo_id> --episode-index <idx>
 ```
