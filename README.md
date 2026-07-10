@@ -10,7 +10,7 @@ git clone --branch v0.6.0 https://github.com/huggingface/lerobot.git
 cd lerobot
 pip install -e '.[pi]'
 
-cd /path/to/lerobot-snvla
+cd /path/to/lerobot-policy-snvla
 pip install -e '.[analysis,dev]'
 ```
 
