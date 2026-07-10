@@ -1,6 +1,6 @@
-# LeRobot SN-VLA Extension
+# LeRobot SN-VLA Policy Plugin
 
-This repository packages SN-VLA as an installable extension for Hugging Face LeRobot.
+This repository packages SN-VLA as an installable policy plugin for Hugging Face LeRobot.
 It is intended to replace maintaining SN-VLA inside a long-lived LeRobot fork.
 
 ## Install
@@ -14,13 +14,26 @@ cd /path/to/lerobot-snvla
 pip install -e '.[analysis,dev]'
 ```
 
-Importing `lerobot_snvla` registers the `snvla` policy type with LeRobot.
-The provided `snvla-*` commands do that registration before delegating to LeRobot.
+The distribution is named `lerobot_policy_snvla`, so LeRobot's third-party plugin
+discovery imports it automatically. `lerobot-train --policy.type=snvla` works
+without importing this package manually.
+
+The legacy `lerobot_snvla` import path and the provided `snvla-*` commands remain
+available as convenience wrappers.
 
 ## Training
 
 ```bash
 snvla-train \
+  --policy.type=snvla \
+  --dataset.repo_id=<user>/<dataset> \
+  --output_dir=outputs/train/snvla
+```
+
+The same policy can also be used through LeRobot's standard CLI:
+
+```bash
+lerobot-train \
   --policy.type=snvla \
   --dataset.repo_id=<user>/<dataset> \
   --output_dir=outputs/train/snvla
@@ -58,9 +71,8 @@ controls for episode flow.
 ## Python Usage
 
 ```python
-import lerobot_snvla
-
 from lerobot.policies.factory import make_policy_config
+import lerobot_policy_snvla  # noqa: F401
 
 cfg = make_policy_config("snvla")
 ```

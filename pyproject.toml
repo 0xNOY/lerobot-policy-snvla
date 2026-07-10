@@ -3,12 +3,12 @@ requires = ["setuptools>=71.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lerobot-snvla"
+name = "lerobot_policy_snvla"
 version = "0.1.0"
-description = "SN-VLA extension package for Hugging Face LeRobot"
+description = "SN-VLA policy plugin for Hugging Face LeRobot"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "lerobot[dataset,pi]>=0.6.0,<0.7.0",
     "transformers>=5.4.0,<5.6.0",

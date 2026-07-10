@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 
 PALIGEMMA_SPECIAL_TOKEN_IDS = {
@@ -9,6 +10,7 @@ PALIGEMMA_SPECIAL_TOKEN_IDS = {
 }
 
 
+@PreTrainedConfig.register_subclass("snvla")
 @dataclass
 class SNVLAConfig(PI05Config):
     """Configuration class for the SN-VLA (Self-Narrating Vision-Language-Action) model."""

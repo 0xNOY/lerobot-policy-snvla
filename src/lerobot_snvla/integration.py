@@ -51,22 +51,9 @@ def _patch_policy_factory() -> None:
     from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
     from lerobot_snvla.policies.snvla.configuration_snvla import SNVLAConfig
-    from lerobot_snvla.policies.snvla.modeling_snvla import SNVLAPolicy
     from lerobot_snvla.policies.snvla.processor_snvla import make_snvla_pre_post_processors
 
-    original_get_policy_class = factory.get_policy_class
-    original_make_policy_config = factory.make_policy_config
     original_make_pre_post_processors = factory.make_pre_post_processors
-
-    def get_policy_class(name: str):
-        if name == "snvla":
-            return SNVLAPolicy
-        return original_get_policy_class(name)
-
-    def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
-        if policy_type == "snvla":
-            return SNVLAConfig(**kwargs)
-        return original_make_policy_config(policy_type, **kwargs)
 
     def make_pre_post_processors(
         policy_cfg: PreTrainedConfig,
@@ -120,8 +107,6 @@ def _patch_policy_factory() -> None:
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    factory.get_policy_class = get_policy_class
-    factory.make_policy_config = make_policy_config
     factory.make_pre_post_processors = make_pre_post_processors
 
 
