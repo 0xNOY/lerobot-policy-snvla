@@ -167,8 +167,7 @@ from lerobot.utils.visualization_utils import (
     shutdown_visualization,
 )
 
-from lerobot_snvla import register as register_snvla
-from lerobot_snvla.constants import CURRENT_NARRATION, PREVIOUS_NARRATIONS
+from lerobot_policy_snvla.constants import CURRENT_NARRATION, PREVIOUS_NARRATIONS
 
 
 @dataclass
@@ -714,7 +713,6 @@ def record(
 
 def main():
     register_third_party_plugins()
-    register_snvla()
     record()
 
 

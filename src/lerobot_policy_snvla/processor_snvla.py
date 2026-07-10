@@ -14,6 +14,7 @@ from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
+    ProcessorStepRegistry,
     RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
@@ -29,15 +30,14 @@ from lerobot.utils.constants import (
 )
 from transformers import AutoTokenizer
 
-from lerobot_snvla.compat import EnvTransition, FeatureType, PipelineFeatureType, PolicyFeature, TransitionKey
-from lerobot_snvla.constants import (
+from .compat import EnvTransition, FeatureType, PipelineFeatureType, PolicyFeature, TransitionKey
+from .configuration_snvla import SNVLAConfig
+from .constants import (
     CURRENT_NARRATION,
     OBS_LANGUAGE_TOKEN_AR_MASK,
     OBS_LANGUAGE_TOKEN_LOSS_MASK,
     PREVIOUS_NARRATIONS,
 )
-
-from .configuration_snvla import SNVLAConfig
 
 # 学習データセットが提供するキー
 TASK_KEY = "task"
@@ -81,6 +81,7 @@ def make_prefix_prompt(
     return f"{bos_token_str}Task: {task.strip()}{session_separator}State: {state_str};{session_separator}Progress: {narration_history}"
 
 
+@ProcessorStepRegistry.register(name="snvla_prepare_training_tokenizer_processor_step")
 @dataclass
 class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
     """Processor step for SN-VLA training."""

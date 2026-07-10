@@ -3,13 +3,14 @@ import torch
 from lerobot.processor import TransitionKey, batch_to_transition
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
-import lerobot_snvla  # noqa: F401
-from lerobot_snvla.compat import FeatureType, PolicyFeature
-from lerobot_snvla.constants import CURRENT_NARRATION, PREVIOUS_NARRATIONS
-from lerobot_snvla.policies.snvla.configuration_snvla import SNVLAConfig
-from lerobot_snvla.policies.snvla.processor_snvla import (
+import lerobot_policy_snvla
+from lerobot_policy_snvla import SNVLAConfig
+from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
+from lerobot_policy_snvla.processor_snvla import (
+    CURRENT_NARRATION,
     OBS_LANGUAGE_TOKEN_AR_MASK,
     OBS_LANGUAGE_TOKEN_LOSS_MASK,
+    PREVIOUS_NARRATIONS,
     TASK_KEY,
     SNVLAPrepareTrainingTokenizerProcessorStep,
 )
@@ -55,6 +56,12 @@ def test_snvla_registers_with_lerobot_factory():
     assert policy_factory.get_policy_class("snvla").__name__ == "SNVLAPolicy"
 
 
+def test_official_plugin_package_exposes_policy_building_blocks():
+    assert lerobot_policy_snvla.SNVLAConfig is SNVLAConfig
+    assert lerobot_policy_snvla.SNVLAPolicy.name == "snvla"
+    assert lerobot_policy_snvla.make_snvla_pre_post_processors.__name__ == "make_snvla_pre_post_processors"
+
+
 def test_snvla_narration_columns_are_complementary_data():
     transition = batch_to_transition(
         {
@@ -81,7 +88,7 @@ def test_snvla_pre_post_processors_are_created_before_pi05_fallback():
 
 
 def test_processor_step_tokenizes_narration_without_external_download(monkeypatch):
-    import lerobot_snvla.policies.snvla.processor_snvla as processor_snvla
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
 
     monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
     cfg = make_test_config()
@@ -108,7 +115,7 @@ def test_processor_step_tokenizes_narration_without_external_download(monkeypatc
 
 
 def test_processor_step_tolerates_invalid_previous_narrations_json(monkeypatch):
-    import lerobot_snvla.policies.snvla.processor_snvla as processor_snvla
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
 
     monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
     cfg = make_test_config()
