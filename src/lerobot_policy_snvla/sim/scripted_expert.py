@@ -155,7 +155,7 @@ PLACE_OFFSETS = [
 class T1Expert:
     """Sequentially pick-and-place each block into the basket using privileged state."""
 
-    def __init__(self, env, n_blocks: int, category: str | None = None):
+    def __init__(self, env, n_blocks: int, category: str | None = None, rng=None):
         from .t1_count_blocks import BASKET_BODY, DEFAULT_CATEGORY, object_body_names
 
         self.env = env
@@ -163,6 +163,11 @@ class T1Expert:
         self.basket_body = BASKET_BODY
         self._idx = 0
         self._sm = PickPlaceStateMachine(ExpertConfig())
+        # かご内の置き位置の割当。rngを与えると順序がエピソードごとにシャッフルされ、
+        # 最終配置とアプローチ軌道に多様性が出る
+        self._offsets = [PLACE_OFFSETS[i % len(PLACE_OFFSETS)] for i in range(n_blocks)]
+        if rng is not None:
+            rng.shuffle(self._offsets)
 
     @property
     def finished(self) -> bool:
@@ -173,7 +178,7 @@ class T1Expert:
             return np.zeros(7)
         eef = np.asarray(obs["robot0_eef_pos"])
         obj = get_body_pos(self.env, self.bodies[self._idx])
-        offset = PLACE_OFFSETS[self._idx % len(PLACE_OFFSETS)]
+        offset = self._offsets[self._idx]
         # 高さはステートマシンのplace_transit/place_release(かご壁クリア/低ドロップ)が積む
         place = get_body_pos(self.env, self.basket_body) + offset
         action, done = self._sm.step(eef, obj, place)

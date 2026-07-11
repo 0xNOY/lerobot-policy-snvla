@@ -77,7 +77,12 @@ def _features(camera_hw: int) -> dict:
 
 
 def _run_episode(
-    env, n_blocks: int, task_str: str, fmt: NarrationFormat, category: str
+    env,
+    n_blocks: int,
+    task_str: str,
+    fmt: NarrationFormat,
+    category: str,
+    rng: np.random.Generator | None = None,
 ) -> tuple[list[dict], int, bool]:
     """1エピソード実行。(frames, n_events, success) を返す。
 
@@ -91,7 +96,7 @@ def _run_episode(
         half_extents=BASKET_HALF_EXTENTS,
     )
     tracker = EventTracker(region, bodies)
-    expert = T1Expert(env, n_blocks, category=category)
+    expert = T1Expert(env, n_blocks, category=category, rng=rng)
     history: list[str] = []
     frames: list[dict] = []
     # (narration_fragment, sim_event_json) のFIFO
@@ -159,9 +164,10 @@ def collect_episodes(
     while saved < n_episodes:
         attempted += 1
         env = make_t1_env(n_blocks=n_blocks, seed=seed, camera_hw=camera_hw, object_category=category)
+        rng = np.random.default_rng(seed)  # 置き順シャッフル用（配置と同じseed系列）
         seed += 1
         try:
-            frames, n_events, success = _run_episode(env, n_blocks, task_str, fmt, category)
+            frames, n_events, success = _run_episode(env, n_blocks, task_str, fmt, category, rng=rng)
         finally:
             env.close()
         if not success or n_events != n_blocks:
@@ -178,6 +184,84 @@ def collect_episodes(
     return CollectStats(saved, attempted, time.perf_counter() - t0, narration_ok)
 
 
+def _collect_shard_worker(kwargs: dict) -> CollectStats:
+    """spawn子プロセス用のトップレベルエントリポイント。"""
+    import os
+
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    logging.basicConfig(level=logging.INFO, format=f"[shard {kwargs.pop('shard_id')}] %(message)s")
+    return collect_episodes(**kwargs)
+
+
+def collect_episodes_parallel(
+    repo_id: str,
+    root: Path,
+    n_episodes: int,
+    n_blocks: int,
+    seed0: int,
+    workers: int,
+    camera_hw: int = 256,
+    fps: int = LIBERO_FPS,
+    push_to_hub: bool = False,
+    category: str = DEFAULT_CATEGORY,
+    object_name: str | None = None,
+) -> CollectStats:
+    """ワーカープロセスでシャードを並列収集し、aggregate_datasetsで1つに結合する。
+
+    シミュレーション（mujoco物理）はプロセスあたりCPU1コアが律速のため、
+    エピソード並列でほぼ線形にスケールする。各ワーカーは独立したseed帯を使う。
+    """
+    import shutil
+    from concurrent.futures import ProcessPoolExecutor
+    from multiprocessing import get_context
+
+    from lerobot.datasets.aggregate import aggregate_datasets
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    root = Path(root)
+    if root.exists():
+        raise FileExistsError(f"{root} already exists; refusing to overwrite")
+    shards_root = root.parent / f"{root.name}_shards"
+    per_worker = [n_episodes // workers + (1 if w < n_episodes % workers else 0) for w in range(workers)]
+    jobs = []
+    for w, n_w in enumerate(per_worker):
+        if n_w == 0:
+            continue
+        jobs.append(
+            {
+                "shard_id": w,
+                "repo_id": f"{repo_id}_w{w}",
+                "root": shards_root / f"w{w}",
+                "n_episodes": n_w,
+                "n_blocks": n_blocks,
+                # 棄却リトライでseedが進んでも帯が重ならないよう十分離す
+                "seed0": seed0 + w * 100_000,
+                "camera_hw": camera_hw,
+                "fps": fps,
+                "category": category,
+                "object_name": object_name,
+            }
+        )
+    t0 = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as pool:
+        shard_stats = list(pool.map(_collect_shard_worker, jobs))
+    aggregate_datasets(
+        repo_ids=[j["repo_id"] for j in jobs],
+        aggr_repo_id=repo_id,
+        roots=[j["root"] for j in jobs],
+        aggr_root=root,
+    )
+    shutil.rmtree(shards_root)
+    if push_to_hub:
+        LeRobotDataset(repo_id, root=root).push_to_hub()
+    return CollectStats(
+        episodes_saved=sum(s.episodes_saved for s in shard_stats),
+        episodes_attempted=sum(s.episodes_attempted for s in shard_stats),
+        wall_time_s=time.perf_counter() - t0,
+        narration_counts_ok=sum(s.narration_counts_ok for s in shard_stats),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-id", required=True)
@@ -192,20 +276,42 @@ def main():
         default=None,
         help="Display name used in task/narrations (default: category with underscores removed)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel collection workers (requires --root; shards are merged at the end)",
+    )
     parser.add_argument("--push-to-hub", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    stats = collect_episodes(
-        args.repo_id,
-        args.root,
-        args.episodes,
-        args.blocks,
-        args.seed,
-        camera_hw=args.camera_hw,
-        push_to_hub=args.push_to_hub,
-        category=args.category,
-        object_name=args.object_name,
-    )
+    if args.workers > 1:
+        if args.root is None:
+            parser.error("--workers > 1 requires --root")
+        stats = collect_episodes_parallel(
+            args.repo_id,
+            args.root,
+            args.episodes,
+            args.blocks,
+            args.seed,
+            workers=args.workers,
+            camera_hw=args.camera_hw,
+            push_to_hub=args.push_to_hub,
+            category=args.category,
+            object_name=args.object_name,
+        )
+    else:
+        stats = collect_episodes(
+            args.repo_id,
+            args.root,
+            args.episodes,
+            args.blocks,
+            args.seed,
+            camera_hw=args.camera_hw,
+            push_to_hub=args.push_to_hub,
+            category=args.category,
+            object_name=args.object_name,
+        )
     eph = stats.episodes_saved / (stats.wall_time_s / 3600) if stats.wall_time_s else 0.0
     print(
         f"saved={stats.episodes_saved}/{stats.episodes_attempted} "

@@ -14,6 +14,50 @@ def test_make_t1_bddl_creates_parseable_file(tmp_path):
     assert text.count("basket_1_contain_region") == 3  # goal に3ブロック分の In 述語
 
 
+def test_layout_randomized_per_seed_and_deterministic(tmp_path):
+    from lerobot_policy_snvla.sim.t1_count_blocks import make_t1_bddl
+
+    text1 = make_t1_bddl(3, tmp_path / "a", seed=1).read_text()
+    text1b = make_t1_bddl(3, tmp_path / "b", seed=1).read_text()
+    text2 = make_t1_bddl(3, tmp_path / "c", seed=2).read_text()
+    assert text1 == text1b  # 同一seedは再現
+    assert text1 != text2  # 異なるseedで配置が変わる
+
+
+def test_sample_layout_respects_min_distance():
+    import numpy as np
+
+    from lerobot_policy_snvla.sim.t1_count_blocks import BLOCK_MIN_DIST, sample_layout
+
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        centers, basket = sample_layout(4, rng)
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                d = np.hypot(centers[i][0] - centers[j][0], centers[i][1] - centers[j][1])
+                assert d >= BLOCK_MIN_DIST
+
+
+def test_env_object_positions_differ_across_seeds(tmp_path):
+    import numpy as np
+
+    from lerobot_policy_snvla.sim.t1_count_blocks import make_t1_env, object_body_names
+
+    positions = {}
+    for seed in (0, 1):
+        env = make_t1_env(n_blocks=2, seed=seed, camera_hw=128, out_dir=tmp_path)
+        try:
+            env.reset()
+            sim = env.env.sim
+            positions[seed] = np.array(
+                [sim.data.body_xpos[sim.model.body_name2id(b)] for b in object_body_names(2)]
+            )
+        finally:
+            env.close()
+    max_shift = np.abs(positions[0] - positions[1]).max()
+    assert max_shift > 0.05, f"layouts too similar across seeds (max shift {max_shift:.3f}m)"
+
+
 def test_make_t1_env_has_n_blocks_and_basket(tmp_path):
     from lerobot_policy_snvla.sim.t1_count_blocks import (
         BASKET_BODY,
