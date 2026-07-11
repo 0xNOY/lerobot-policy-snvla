@@ -54,3 +54,31 @@ def test_collect_two_episodes_produces_valid_dataset(tmp_path):
         assert placed_events[ep] == 2  # n_blocks
 
     assert ds.meta.tasks.index.tolist() == ["Put 2 chocolate puddings into the basket."]
+
+
+def test_parallel_collection_aggregates_shards(tmp_path):
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    from lerobot_policy_snvla.sim.collect import collect_episodes_parallel
+
+    stats = collect_episodes_parallel(
+        repo_id="local/t1_par",
+        root=tmp_path / "ds_par",
+        n_episodes=2,
+        n_blocks=1,
+        seed0=0,
+        workers=2,
+        camera_hw=128,
+    )
+    assert stats.episodes_saved == 2
+
+    ds = LeRobotDataset("local/t1_par", root=tmp_path / "ds_par")
+    assert ds.num_episodes == 2
+    assert not (tmp_path / "ds_par_shards").exists()  # シャードは結合後に削除される
+
+    expected_stream = "Placing chocolate pudding 1 of 1 in the basket... completed.\nTask completed.\n"
+    hf = ds.hf_dataset.select_columns(["episode_index", "current_narration"])
+    streams: dict[int, str] = {}
+    for row in hf:
+        streams[int(row["episode_index"])] = streams.get(int(row["episode_index"]), "") + row["current_narration"]
+    assert streams == {0: expected_stream, 1: expected_stream}
