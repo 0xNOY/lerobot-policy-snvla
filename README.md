@@ -235,13 +235,17 @@ Collect T1 (put N objects into the basket) episodes:
 ```bash
 MUJOCO_GL=egl snvla-sim-collect \
   --repo-id <user>/t1_n3 --root ~/datasets/t1_n3 \
-  --episodes 50 --blocks 3 --seed 0 \
+  --episodes 50 --blocks 3 --seed 0 --workers 8 \
   --category chocolate_pudding --object-name "chocolate pudding"
 ```
 
-`--category` selects the LIBERO object placed into the basket and
-`--object-name` the display name used in the task instruction and narrations
-(defaults: `chocolate_pudding` / category name with underscores removed).
+Object and basket positions are randomized per episode (derived from the
+episode seed). `--category` selects the LIBERO object placed into the basket
+and `--object-name` the display name used in the task instruction and
+narrations (defaults: `chocolate_pudding` / category name with underscores
+removed). `--workers N` collects episode shards in parallel processes (mujoco
+physics is single-core per env) and merges them into one dataset at the end;
+it requires `--root`.
 
 Narrations follow the `0xNOY/so101_wn` fragment convention — fragments
 concatenate into a complete stream. For `--blocks 2` the task is
