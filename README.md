@@ -208,6 +208,49 @@ The paper training dataset `0xNOY/so101_wn_aug` can be used directly. To rebuild
 an augmented dataset from narrated demonstrations, use
 `snvla-generate-partial-scoop-episodes` and `snvla-augment-narrations`.
 
+## Simulation (LIBERO)
+
+The `sim` extra provides a LIBERO/robosuite-based memory-task suite for developing
+and debugging narration features without a physical robot (design spec P5; task T1
+implemented). A scripted expert collects narrated demonstrations fully
+automatically — narration timing/text is derived from ground-truth simulator
+events, enforcing the observation-description convention (spec P3) by
+construction.
+
+```bash
+pip install -e '.[sim]'
+```
+
+Notes for first-time setup:
+
+- `egl-probe` (a transitive dependency) fails to build with CMake ≥ 4; install it
+  with `CMAKE_POLICY_VERSION_MINIMUM=3.5 pip install egl-probe` first if needed.
+- On the first `import libero`, answer `N` to the dataset-path prompt (or run
+  `echo N | python -c "import libero.libero"` once). Assets are downloaded
+  automatically from the Hugging Face Hub.
+- Use `MUJOCO_GL=egl` for headless rendering.
+
+Collect T1 (put N blocks into the basket) episodes:
+
+```bash
+MUJOCO_GL=egl snvla-sim-collect \
+  --repo-id <user>/t1_n3 --root ~/datasets/t1_n3 \
+  --episodes 50 --blocks 3 --seed 0
+```
+
+The resulting LeRobot v3.0 dataset contains `current_narration` /
+`previous_narrations` columns (same schema as `0xNOY/so101_wn_aug`) plus a
+`sim_event` column with the ground-truth event log for narration-timing
+evaluation. Only successful episodes (all blocks placed, all events detected)
+are saved.
+
+Simulation tests are marked `sim`:
+
+```bash
+MUJOCO_GL=egl python -m pytest tests/ -m sim      # sim integration tests
+python -m pytest tests/ -m "not sim"              # pure logic tests only
+```
+
 ## Python Usage
 
 ```python
@@ -222,6 +265,7 @@ cfg = make_policy_config("snvla")
 SN-VLA helper scripts are exposed as console commands:
 
 - `snvla-record`
+- `snvla-sim-collect`
 - `snvla-analyze-dataset-stats`
 - `snvla-augment-narrations`
 - `snvla-debug-inference`
