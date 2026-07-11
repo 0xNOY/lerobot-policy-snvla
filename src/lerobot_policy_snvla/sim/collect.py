@@ -29,6 +29,9 @@ from .t1_count_blocks import (
 BASKET_HALF_EXTENTS = np.array([0.09, 0.09, 0.09])
 MAX_STEPS_PER_BLOCK = 750
 LIBERO_FPS = 20  # OffScreenRenderEnv の control_freq
+# pickedイベントの持ち上げ閾値。床上の物体(z≈0.02)とかご内静止(z≈0.063)より十分高く、
+# LIFT高度(0.30)より十分低い
+PICK_HEIGHT = 0.12
 
 
 @dataclass
@@ -83,25 +86,30 @@ def _run_episode(
     fmt: NarrationFormat,
     category: str,
     rng: np.random.Generator | None = None,
-) -> tuple[list[dict], int, bool]:
-    """1エピソード実行。(frames, n_events, success) を返す。
+) -> tuple[list[dict], bool, bool]:
+    """1エピソード実行。(frames, success, narration_ok) を返す。
 
     実況断片は1フレームに1つだけ発行する。同一フレームで複数の断片が確定した場合
-    （例: 完了断片と次ブロックの開始断片）はキューで次フレームへ繰り越す。
+    はFIFOで次フレームへ繰り越す。narration_okは、発行断片の連結が
+    fmt.expected_stream(n_blocks) と完全一致したかどうか。
     """
+    from .scripted_expert import Phase
+
     bodies = object_body_names(n_blocks, category)
     obs = env.reset()
     region = BasketRegion(
         center=get_body_pos(env, BASKET_BODY) + np.array([0.0, 0.0, 0.05]),
         half_extents=BASKET_HALF_EXTENTS,
     )
-    tracker = EventTracker(region, bodies)
+    tracker = EventTracker(region, bodies, pick_height=PICK_HEIGHT)
     expert = T1Expert(env, n_blocks, category=category, rng=rng)
     history: list[str] = []
     frames: list[dict] = []
     # (narration_fragment, sim_event_json) のFIFO
-    pending: list[tuple[str, str]] = [(fmt.start_narration(1, n_blocks), "")]
-    started = 1  # 開始断片を発行済みのブロック数
+    pending: list[tuple[str, str]] = [(fmt.pick_narration(1, n_blocks), "")]
+    pick_started = 1  # pick開始断片を発行済みのブロック数
+    place_started = 0  # place開始断片を発行済みのブロック数
+    place_phases = {Phase.MOVE, Phase.LOWER, Phase.RELEASE, Phase.RETREAT}
     # robosuiteはhorizon到達後のstepで例外を出すため、必ず手前で打ち切る
     horizon = getattr(env.env, "horizon", 1000)
     max_steps = min(MAX_STEPS_PER_BLOCK * n_blocks, horizon - 2)
@@ -109,15 +117,26 @@ def _run_episode(
         positions = {b: get_body_pos(env, b) for b in bodies}
         event = tracker.update(frame_idx, positions)
         if event:
-            pending.append((fmt.completed_fragment, json.dumps(dataclasses.asdict(event))))
-            if event.ordinal == n_blocks:
+            pending.append((fmt.done_fragment, json.dumps(dataclasses.asdict(event))))
+            if event.kind == "placed" and event.ordinal == n_blocks:
                 pending.append((fmt.task_completed_fragment, ""))
 
         action = expert.act(obs)
-        # 次ブロックの動作開始（actでの_idx遷移）を開始断片として発行
-        if not expert.finished and expert._idx + 1 > started:
-            started = expert._idx + 1
-            pending.append((fmt.start_narration(started, n_blocks), ""))
+        if not expert.finished:
+            cur_block = expert._idx + 1
+            # 次ブロックへの着手（actでの_idx遷移）をpick開始断片として発行
+            if cur_block > pick_started:
+                pick_started = cur_block
+                pending.append((fmt.pick_narration(cur_block, n_blocks), ""))
+            # 運搬フェーズ入りをplace開始断片として発行。pickedイベントが未確定の
+            # うちは保留し、「... (done)\nPutting ...」の順序を保証する
+            if (
+                place_started < cur_block
+                and expert._sm.phase in place_phases
+                and tracker.count("picked") >= cur_block
+            ):
+                place_started = cur_block
+                pending.append((fmt.place_narration(cur_block, n_blocks), ""))
 
         narration, sim_event = pending.pop(0) if pending else ("", "")
         frames.append(
@@ -134,9 +153,10 @@ def _run_episode(
         if narration:
             history.append(narration)
         obs, reward, done, info = env.step(action)
-        if expert.finished and len(tracker.events) == n_blocks and not pending:
+        if expert.finished and tracker.count("placed") == n_blocks and not pending:
             break
-    return frames, len(tracker.events), bool(env.check_success())
+    narration_ok = "".join(history) == fmt.expected_stream(n_blocks)
+    return frames, bool(env.check_success()), narration_ok
 
 
 def collect_episodes(
@@ -167,17 +187,17 @@ def collect_episodes(
         rng = np.random.default_rng(seed)  # 置き順シャッフル用（配置と同じseed系列）
         seed += 1
         try:
-            frames, n_events, success = _run_episode(env, n_blocks, task_str, fmt, category, rng=rng)
+            frames, success, stream_ok = _run_episode(env, n_blocks, task_str, fmt, category, rng=rng)
         finally:
             env.close()
-        if not success or n_events != n_blocks:
-            logging.warning("episode rejected (success=%s, events=%d)", success, n_events)
+        if not success or not stream_ok:
+            logging.warning("episode rejected (success=%s, narration_stream_ok=%s)", success, stream_ok)
             continue
         for frame in frames:
             dataset.add_frame(frame)
         dataset.save_episode()
         saved += 1
-        narration_ok += 1  # saved エピソードは n_events == n_blocks を満たす
+        narration_ok += 1  # saved エピソードはストリーム完全一致を満たす
         logging.info("episode %d/%d saved (%d frames)", saved, n_episodes, len(frames))
     if push_to_hub:
         dataset.push_to_hub()
@@ -279,8 +299,8 @@ def main():
     parser.add_argument(
         "--workers",
         type=int,
-        default=1,
-        help="Parallel collection workers (requires --root; shards are merged at the end)",
+        default=16,
+        help="Parallel collection workers (requires --root when > 1; shards are merged at the end)",
     )
     parser.add_argument("--push-to-hub", action="store_true")
     args = parser.parse_args()

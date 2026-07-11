@@ -27,15 +27,17 @@ def test_collect_two_episodes_produces_valid_dataset(tmp_path):
     assert ds.num_episodes == stats.episodes_saved
 
     expected_stream = (
-        "Placing chocolate pudding 1 of 2 in the basket... completed.\n"
-        "Placing chocolate pudding 2 of 2 in the basket... completed.\n"
+        "Picking up chocolate pudding 1 of 2... (done)\n"
+        "Putting chocolate pudding 1 of 2 into the basket... (done)\n"
+        "Picking up chocolate pudding 2 of 2... (done)\n"
+        "Putting chocolate pudding 2 of 2 into the basket... (done)\n"
         "Task completed.\n"
     )
     hf = ds.hf_dataset.select_columns(
         ["episode_index", "current_narration", "previous_narrations", "sim_event", "task_index"]
     )
     streams: dict[int, str] = {}
-    placed_events: dict[int, int] = {}
+    events_per_ep: dict[int, list[str]] = {}
     for row in hf:
         ep = int(row["episode_index"])
         cn = row["current_narration"]
@@ -46,12 +48,12 @@ def test_collect_two_episodes_produces_valid_dataset(tmp_path):
         streams[ep] = streams.get(ep, "") + cn
         if se:
             event = json.loads(se)
-            assert event["kind"] == "placed"
-            assert cn == " completed.\n"  # 真値イベントフレームの実況は完了断片
-            placed_events[ep] = placed_events.get(ep, 0) + 1
+            assert cn == " (done)\n"  # 真値イベントフレームの実況は完了断片
+            events_per_ep.setdefault(ep, []).append(event["kind"])
     for ep in range(ds.num_episodes):
         assert streams[ep] == expected_stream
-        assert placed_events[ep] == 2  # n_blocks
+        # pick→place がブロックごとに交互に確定する
+        assert events_per_ep[ep] == ["picked", "placed", "picked", "placed"]
 
     assert ds.meta.tasks.index.tolist() == ["Put 2 chocolate puddings into the basket."]
 
@@ -76,7 +78,11 @@ def test_parallel_collection_aggregates_shards(tmp_path):
     assert ds.num_episodes == 2
     assert not (tmp_path / "ds_par_shards").exists()  # シャードは結合後に削除される
 
-    expected_stream = "Placing chocolate pudding 1 of 1 in the basket... completed.\nTask completed.\n"
+    expected_stream = (
+        "Picking up chocolate pudding 1 of 1... (done)\n"
+        "Putting chocolate pudding 1 of 1 into the basket... (done)\n"
+        "Task completed.\n"
+    )
     hf = ds.hf_dataset.select_columns(["episode_index", "current_narration"])
     streams: dict[int, str] = {}
     for row in hf:
