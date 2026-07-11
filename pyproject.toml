@@ -32,6 +32,9 @@ dev = [
     "pytest>=8.1.0,<9.0.0",
     "ruff>=0.6.0",
 ]
+sim = [
+    "lerobot[libero]>=0.6.0,<0.7.0",
+]
 
 [project.scripts]
 snvla-record = "lerobot_policy_snvla.scripts.snvla_record:main"
@@ -50,6 +53,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 lerobot_policy_snvla = ["scripts/*.sh"]
+
+[tool.pytest.ini_options]
+markers = [
+    "sim: requires LIBERO simulator (deselect with '-m \"not sim\"')",
+]
 
 [tool.ruff]
 target-version = "py312"
