@@ -10,7 +10,9 @@ from pathlib import Path
 T1_TASK_DESCRIPTION_TEMPLATE = "put {n} blocks into the basket"
 BASKET_BODY = "basket_1_main"
 BLOCK_BODY_TEMPLATE = "{category}_{i}_main"
-DEFAULT_CATEGORY = "alphabet_soup"  # libero_objectのbasketタスクで把持実績のあるカテゴリ
+# 把持しやすく（高さ0.1で指がかかる）、footprint(半径0.025)が小さいので
+# かご(内寸half≈0.064)に複数個置いても衝突しにくい
+DEFAULT_CATEGORY = "chocolate_pudding"
 
 # problem名はLIBEROの登録済みシーンクラス（TASK_MAPPING）に一致させる必要がある
 _BDDL_TEMPLATE = """(define (problem LIBERO_Floor_Manipulation)

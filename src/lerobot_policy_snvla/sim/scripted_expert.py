@@ -21,19 +21,52 @@ class Phase(Enum):
 @dataclass
 class ExpertConfig:
     hover_height: float = 0.12
-    lift_height: float = 0.18
+    # 把持物が横倒し(長辺半分≈0.05-0.06)でもかごの壁上端(≈0.145)を越えて運べる高さ
+    lift_height: float = 0.30
     pos_tol: float = 0.015
     grasp_frames: int = 8
     release_frames: int = 8
     kp: float = 6.0
+    phase_timeout: int = 120  # 位置到達が収束しない場合の強制フェーズ遷移
+    # 置き動作の2段高さ: 横移動(MOVE)は容器の壁上端をクリアし、
+    # リリース(LOWER)は低くしてドロップの跳ねを抑える
+    place_transit_height: float = 0.30
+    place_release_height: float = 0.17
 
 
 class PickPlaceStateMachine:
+    _PHASE_ORDER = [
+        Phase.HOVER,
+        Phase.DESCEND,
+        Phase.GRASP,
+        Phase.LIFT,
+        Phase.MOVE,
+        Phase.LOWER,
+        Phase.RELEASE,
+        Phase.RETREAT,
+        Phase.DONE,
+    ]
+
     def __init__(self, cfg: ExpertConfig):
         self.cfg = cfg
         self.phase = Phase.HOVER
         self._counter = 0
         self._lift_target: np.ndarray | None = None
+        self._phase_steps = 0
+
+    def _tick_timeout(self):
+        """到達判定が収束しないままphase_timeoutを超えたら次フェーズへ強制遷移する。
+
+        障害物（積まれたブロック等）でwaypointに到達できない場合にhorizonを
+        浪費しないための保険。強制遷移したエピソードは通常successしないため
+        収集側の棄却フィルタで除外される。
+        """
+        self._phase_steps += 1
+        if self._phase_steps >= self.cfg.phase_timeout:
+            idx = self._PHASE_ORDER.index(self.phase)
+            self.phase = self._PHASE_ORDER[idx + 1] if idx + 1 < len(self._PHASE_ORDER) else Phase.DONE
+            self._phase_steps = 0
+            self._counter = 0
 
     def _move_action(self, eef: np.ndarray, target: np.ndarray, grip: float) -> np.ndarray:
         delta = np.clip(self.cfg.kp * (target - eef), -1.0, 1.0)
@@ -43,14 +76,23 @@ class PickPlaceStateMachine:
         return bool(np.linalg.norm(eef - target) < self.cfg.pos_tol)
 
     def step(self, eef_pos, obj_pos, place_pos):
+        prev_phase = self.phase
+        action, done = self._step_inner(eef_pos, obj_pos, place_pos)
+        if self.phase != prev_phase:
+            self._phase_steps = 0
+        else:
+            self._tick_timeout()
+        return action, done
+
+    def _step_inner(self, eef_pos, obj_pos, place_pos):
         c = self.cfg
         hover = np.array([obj_pos[0], obj_pos[1], obj_pos[2] + c.hover_height])
         grasp = np.array([obj_pos[0], obj_pos[1], obj_pos[2] + 0.005])
         lift = self._lift_target
         if lift is None:
             lift = np.array([obj_pos[0], obj_pos[1], obj_pos[2] + c.lift_height])
-        above_place = np.array([place_pos[0], place_pos[1], place_pos[2] + c.lift_height])
-        lower = np.array([place_pos[0], place_pos[1], place_pos[2] + c.hover_height])
+        above_place = np.array([place_pos[0], place_pos[1], place_pos[2] + c.place_transit_height])
+        lower = np.array([place_pos[0], place_pos[1], place_pos[2] + c.place_release_height])
 
         if self.phase == Phase.HOVER:
             if self._at(eef_pos, hover):
@@ -98,6 +140,18 @@ def get_body_pos(env, body_name: str) -> np.ndarray:
     return sim.data.body_xpos[sim.model.body_name2id(body_name)].copy()
 
 
+# かご内の置き位置オフセット。同一地点に置くと積み重なってcontain_regionを外れるため
+# ブロックごとに横へずらす。かご内寸（壁内側half≈0.064）と缶footprint（half≈0.025）から
+# 中心は±0.04以内、缶間距離は0.05以上を確保する。
+PLACE_OFFSETS = [
+    np.array([-0.03, -0.03, 0.0]),
+    np.array([0.03, 0.03, 0.0]),
+    np.array([0.03, -0.03, 0.0]),
+    np.array([-0.03, 0.03, 0.0]),
+    np.array([0.0, 0.0, 0.0]),
+]
+
+
 class T1Expert:
     """Sequentially pick-and-place each block into the basket using privileged state."""
 
@@ -119,7 +173,9 @@ class T1Expert:
             return np.zeros(7)
         eef = np.asarray(obs["robot0_eef_pos"])
         obj = get_body_pos(self.env, self.bodies[self._idx])
-        place = get_body_pos(self.env, self.basket_body) + np.array([0.0, 0.0, 0.10])
+        offset = PLACE_OFFSETS[self._idx % len(PLACE_OFFSETS)]
+        # 高さはステートマシンのplace_transit/place_release(かご壁クリア/低ドロップ)が積む
+        place = get_body_pos(self.env, self.basket_body) + offset
         action, done = self._sm.step(eef, obj, place)
         if done:
             self._idx += 1

@@ -81,7 +81,10 @@ def _run_episode(env, n_blocks: int, camera_hw: int, task_str: str) -> tuple[lis
     expert = T1Expert(env, n_blocks)
     history: list[str] = []
     frames: list[dict] = []
-    for frame_idx in range(MAX_STEPS_PER_BLOCK * n_blocks):
+    # robosuiteはhorizon到達後のstepで例外を出すため、必ず手前で打ち切る
+    horizon = getattr(env.env, "horizon", 1000)
+    max_steps = min(MAX_STEPS_PER_BLOCK * n_blocks, horizon - 2)
+    for frame_idx in range(max_steps):
         action = expert.act(obs)
         positions = {b: get_body_pos(env, b) for b in bodies}
         event = tracker.update(frame_idx, positions)
