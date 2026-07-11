@@ -235,7 +235,7 @@ Collect T1 (put N objects into the basket) episodes:
 ```bash
 MUJOCO_GL=egl snvla-sim-collect \
   --repo-id <user>/t1_n3 --root ~/datasets/t1_n3 \
-  --episodes 50 --blocks 3 --seed 0 --workers 8 \
+  --episodes 50 --blocks 3 --seed 0 --workers 16 \
   --category chocolate_pudding --object-name "chocolate pudding"
 ```
 
@@ -248,14 +248,20 @@ physics is single-core per env) and merges them into one dataset at the end;
 it requires `--root`.
 
 Narrations follow the `0xNOY/so101_wn` fragment convention — fragments
-concatenate into a complete stream. For `--blocks 2` the task is
-`Put 2 chocolate puddings into the basket.` and the fragments are:
+concatenate into a complete stream, with pick and place narrated separately.
+For `--blocks 2` the task is `Put 2 chocolate puddings into the basket.` and
+the fragments are:
 
 | Timing | Fragment |
 |---|---|
-| Motion toward object k starts | `Placing chocolate pudding k of 2 in the basket...` |
-| Object k settles in the basket (ground truth) | ` completed.\n` |
+| Motion toward object k starts | `Picking up chocolate pudding k of 2...` |
+| Object k lifted above 0.12 m (ground truth) | ` (done)\n` |
+| Transport toward the basket starts | `Putting chocolate pudding k of 2 into the basket...` |
+| Object k settles in the basket (ground truth) | ` (done)\n` |
 | After the last placement | `Task completed.\n` |
+
+Episodes whose assembled fragment stream does not exactly match the expected
+stream are rejected at collection time.
 
 The resulting LeRobot v3.0 dataset contains `current_narration` /
 `previous_narrations` columns (same schema as `0xNOY/so101_wn_aug`) plus a

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 from bokeh.layouts import column, layout, row
-from bokeh.models import Button, CheckboxGroup, ColumnDataSource, Div, Slider, Span
+from bokeh.models import Button, CheckboxGroup, ColumnDataSource, Div, Select, Slider, Span
 from bokeh.plotting import curdoc, figure
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -199,6 +199,14 @@ def create_visualization(doc):
 
     # --- Components ---
 
+    # 0. Episode Selector
+    episode_select = Select(
+        title="Episode:",
+        value=str(episode_index),
+        options=[str(i) for i in range(dataset.num_episodes)],
+        width=200,
+    )
+
     # 1. Instruction Box (User)
     instruction_div = Div(
         text=INSTRUCTION_DIV_TEMPLATE.format(
@@ -341,6 +349,62 @@ def create_visualization(doc):
 
     slider.on_change("value", update)
 
+    def change_episode(attr, old, new):
+        nonlocal data, num_frames, episode_index
+        new_ep_idx = int(new)
+        logging.info(f"Switching to Episode: {new_ep_idx}")
+
+        # Stop playback if running
+        if play_button.label == "Pause":
+            toggle_play()
+
+        # Load new data
+        try:
+            new_data, _ = load_data(dataset, new_ep_idx)
+        except Exception as e:
+            logging.error(f"Error loading episode {new_ep_idx}: {e}")
+            return
+
+        # Update outer state variables
+        data = new_data
+        episode_index = new_ep_idx
+        num_frames = len(data["index"])
+
+        # Update data sources
+        for key in camera_keys:
+            if key in data["images"] and len(data["images"][key]) > 0:
+                image_sources[key].data = {"image": [data["images"][key][0]]}
+
+        timeline_source.data = {
+            "index": data["index"],
+            "prob_bon": data["prob_bon"],
+            "prob_boa": data["prob_boa"],
+        }
+
+        new_bon_gt_boa_indices = [
+            i for i, (bon, boa) in enumerate(zip(data["prob_bon"], data["prob_boa"], strict=True)) if bon > boa
+        ]
+        bon_gt_boa_source.data = {
+            "index": new_bon_gt_boa_indices,
+            "prob_bon": [data["prob_bon"][i] for i in new_bon_gt_boa_indices],
+        }
+
+        # Update UI components
+        instruction_div.text = INSTRUCTION_DIV_TEMPLATE.format(
+            font_size=CONFIG.narration_font_size,
+            task_instruction=data["task_instruction"],
+        )
+
+        # Reset slider and plot ranges
+        slider.end = num_frames - 1
+        slider.value = 0
+        bon_plot.x_range.end = num_frames
+
+        # Trigger frame update for frame 0
+        update(None, None, 0)
+
+    episode_select.on_change("value", change_episode)
+
     # State for real-time playback
     playback_state = {
         "start_wall_time": 0.0,
@@ -440,6 +504,7 @@ def create_visualization(doc):
         [
             row(
                 column(
+                    episode_select,
                     row(image_plots),
                     bon_plot,
                     timestamp_div,
