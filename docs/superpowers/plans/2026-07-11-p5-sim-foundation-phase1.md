@@ -2,6 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **STATUS: 完了（2026-07-12、mainへマージ済み）**。Task 1〜6すべて完了。実装は本計画から
+> 一部進化しているため、確定仕様は末尾の「実装結果と計画からの差分」節・README・
+> `docs/superpowers/reports/2026-07-11-p5-e1-report.md` を正とすること。
+
 **Goal:** LIBERO上に記憶タスクT1（ブロックN個をかごに入れる）を実装し、スクリプトエキスパートによるテレオペ不要の自動データ収集で、実況（`current_narration`/`previous_narrations`）と真値イベントログ付きのLeRobotデータセットを生成できるようにする（スペックのP5-E1に相当）。
 
 **Architecture:** `libero.libero.envs.OffScreenRenderEnv` を直接使い（lerobotのenv factoryは評価統合フェーズまで不要）、BDDLテキストテンプレートでT1タスクを生成する。純粋関数のイベント判定器（`events.py`）がシム状態から「観測記述」規約（P3）どおりのタイミングで実況を付与し、waypointステートマシンのエキスパート（`scripted_expert.py`）がデモを生成、収集CLI（`collect.py`）がLeRobot v3.0データセットに書き出す。
@@ -38,14 +42,14 @@
 **Interfaces:**
 - Produces: pytest marker `sim`、fixture なし。以後の全simテストは `pytest.importorskip("libero")` 相当のskipガードを `conftest.py` 経由で得る
 
-- [ ] **Step 1: ブランチ作成**
+- [x] **Step 1: ブランチ作成**
 
 ```bash
 cd /home/noy/Workspaces/lerobot-policy-snvla
 git checkout -b feat/p5-sim-t1
 ```
 
-- [ ] **Step 2: pyproject.toml に sim extra と pytest 設定を追加**
+- [x] **Step 2: pyproject.toml に sim extra と pytest 設定を追加**
 
 `[project.optional-dependencies]` に追記:
 
@@ -64,7 +68,7 @@ markers = [
 ]
 ```
 
-- [ ] **Step 3: インストール（時間がかかる場合はバックグラウンド + agyに監視委任）**
+- [x] **Step 3: インストール（時間がかかる場合はバックグラウンド + agyに監視委任）**
 
 ```bash
 uv pip install --python .venv/bin/python -e '.[sim,analysis,dev]'
@@ -72,7 +76,7 @@ uv pip install --python .venv/bin/python -e '.[sim,analysis,dev]'
 
 Expected: `+ hf-libero`, `+ robosuite==1.4.0`, `+ mujoco==3.8.1` などが入り、torch / transformers / lerobot 本体はバージョン無変更。
 
-- [ ] **Step 4: conftest.py を作成**
+- [x] **Step 4: conftest.py を作成**
 
 ```python
 # tests/sim/conftest.py
@@ -81,7 +85,7 @@ import pytest
 libero = pytest.importorskip("libero", reason="LIBERO not installed (pip install -e '.[sim]')")
 ```
 
-- [ ] **Step 5: スモークテストを書く**
+- [x] **Step 5: スモークテストを書く**
 
 ```python
 # tests/sim/test_env_smoke.py
@@ -124,7 +128,7 @@ def test_offscreen_env_steps_random_actions():
         env.close()
 ```
 
-- [ ] **Step 6: 実行（初回はアセットDLが走る。長い場合はagyで監視）**
+- [x] **Step 6: 実行（初回はアセットDLが走る。長い場合はagyで監視）**
 
 ```bash
 MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_env_smoke.py -v
@@ -132,7 +136,7 @@ MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_env_smoke.py -v
 
 Expected: 2 passed（初回はダウンロードで数分〜）。obsのキー名が異なって失敗した場合は、失敗出力の実キー名でテストを直してから先へ進む（以後のタスクのキー名前提も同時に更新）。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add pyproject.toml tests/sim/
@@ -155,7 +159,7 @@ git commit -m "feat(sim): add LIBERO sim extra and environment smoke tests"
   - `T1_TASK_DESCRIPTION_TEMPLATE = "put {n} blocks into the basket"` — 言語指示
   - モジュール定数 `BLOCK_BODY_TEMPLATE = "{category}_{i}_main"`, `BASKET_BODY = "basket_1_main"`（robosuiteのbody命名）
 
-- [ ] **Step 1: 参照BDDLをダンプして構造を確認（探索ステップ）**
+- [x] **Step 1: 参照BDDLをダンプして構造を確認（探索ステップ）**
 
 ```bash
 .venv/bin/python - <<'EOF'
@@ -171,7 +175,7 @@ EOF
 
 Expected: `(define (problem LIBERO_...)` 形式のBDDL。`(:objects ...)`, `(:regions ...)`, `(:goal (And (In xxx_1 basket_1_contain_region)))` の構造とオブジェクト名（`basket_1` など）を確認する。**以降のテンプレートはこのダンプ結果に合わせて調整する**（構造が想定と違えばテンプレート文字列だけ直せばよい設計にする）。
 
-- [ ] **Step 2: 失敗するテストを書く**
+- [x] **Step 2: 失敗するテストを書く**
 
 ```python
 # tests/sim/test_t1_env.py
@@ -215,7 +219,7 @@ def test_make_t1_env_has_n_blocks_and_basket(tmp_path):
         env.close()
 ```
 
-- [ ] **Step 3: 実行して失敗を確認**
+- [x] **Step 3: 実行して失敗を確認**
 
 ```bash
 MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_t1_env.py -v
@@ -223,7 +227,7 @@ MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_t1_env.py -v
 
 Expected: FAIL (`ModuleNotFoundError: lerobot_policy_snvla.sim`)
 
-- [ ] **Step 4: t1_count_blocks.py を実装**
+- [x] **Step 4: t1_count_blocks.py を実装**
 
 Step 1でダンプした実BDDLをテンプレート化する。骨子（オブジェクト名・region書式はStep 1の実物に合わせる）:
 
@@ -325,7 +329,7 @@ def make_t1_env(n_blocks: int, seed: int, camera_hw: int = 256, out_dir: Path | 
     return env
 ```
 
-- [ ] **Step 5: テスト実行、通るまでBDDLテンプレートを実物に合わせて調整**
+- [x] **Step 5: テスト実行、通るまでBDDLテンプレートを実物に合わせて調整**
 
 ```bash
 MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_t1_env.py -v
@@ -333,7 +337,7 @@ MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_t1_env.py -v
 
 Expected: 2 passed。BDDLパースエラーが出たら、Step 1のダンプとの差分（region書式、fixture宣言、`:language` の書式等）を1つずつ潰す。`object_category` がLIBEROのオブジェクト辞書に無ければ、`libero.libero.envs.objects` の `get_object_dict()`（探索: `.venv/bin/python -c "from libero.libero.envs.objects import get_object_dict; print(sorted(get_object_dict()))"`）から把持可能な小物を選び直す。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/lerobot_policy_snvla/sim/ tests/sim/test_t1_env.py
@@ -357,7 +361,7 @@ git commit -m "feat(sim): add T1 counting task (BDDL generation + env factory)"
   - `narration_for_event(event: Event, n_total: int) -> str` — 既定テンプレート `"Placed block {ordinal} of {n_total} into the basket."`
   - `EventTracker.events: list[Event]`（確定済みイベントの履歴）
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 ```python
 # tests/sim/test_events.py
@@ -415,7 +419,7 @@ def test_narration_template():
     assert narration_for_event(ev, n_total=3) == "Placed block 2 of 3 into the basket."
 ```
 
-- [ ] **Step 2: 実行して失敗を確認**
+- [x] **Step 2: 実行して失敗を確認**
 
 ```bash
 .venv/bin/pytest tests/sim/test_events.py -v
@@ -423,7 +427,7 @@ def test_narration_template():
 
 Expected: FAIL (`ModuleNotFoundError` または `ImportError`)
 
-- [ ] **Step 3: 実装**
+- [x] **Step 3: 実装**
 
 ```python
 # src/lerobot_policy_snvla/sim/events.py
@@ -491,7 +495,7 @@ def narration_for_event(event: Event, n_total: int) -> str:
     return f"Placed block {event.ordinal} of {n_total} into the basket."
 ```
 
-- [ ] **Step 4: テスト実行**
+- [x] **Step 4: テスト実行**
 
 ```bash
 .venv/bin/pytest tests/sim/test_events.py -v
@@ -499,7 +503,7 @@ def narration_for_event(event: Event, n_total: int) -> str:
 
 Expected: 6 passed
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/lerobot_policy_snvla/sim/events.py tests/sim/test_events.py
@@ -523,7 +527,7 @@ git commit -m "feat(sim): add ground-truth event tracker enforcing observation-d
   - `get_body_pos(env, body_name: str) -> np.ndarray` — 特権シム状態から位置取得
 - フェーズ列: `HOVER → DESCEND → GRASP → LIFT → MOVE → LOWER → RELEASE → RETREAT → DONE`
 
-- [ ] **Step 1: 純粋部分の失敗テストを書く**
+- [x] **Step 1: 純粋部分の失敗テストを書く**
 
 ```python
 # tests/sim/test_scripted_expert.py
@@ -575,7 +579,7 @@ def test_gripper_open_during_hover_closed_during_lift():
     assert action[6] == -1.0  # HOVER中は開
 ```
 
-- [ ] **Step 2: 実行して失敗を確認**
+- [x] **Step 2: 実行して失敗を確認**
 
 ```bash
 .venv/bin/pytest tests/sim/test_scripted_expert.py -v
@@ -583,7 +587,7 @@ def test_gripper_open_during_hover_closed_during_lift():
 
 Expected: FAIL (ImportError)
 
-- [ ] **Step 3: 実装**
+- [x] **Step 3: 実装**
 
 ```python
 # src/lerobot_policy_snvla/sim/scripted_expert.py
@@ -712,7 +716,7 @@ class T1Expert:
         return action
 ```
 
-- [ ] **Step 4: 純粋テストが通ることを確認**
+- [x] **Step 4: 純粋テストが通ることを確認**
 
 ```bash
 .venv/bin/pytest tests/sim/test_scripted_expert.py -v -m "not sim"
@@ -720,7 +724,7 @@ class T1Expert:
 
 Expected: 3 passed
 
-- [ ] **Step 5: 統合テスト（実環境で成功率を測る）を追加**
+- [x] **Step 5: 統合テスト（実環境で成功率を測る）を追加**
 
 同ファイルに追記:
 
@@ -749,7 +753,7 @@ def test_expert_succeeds_in_t1(tmp_path):
     assert n_success >= 2  # 3シード中2成功以上
 ```
 
-- [ ] **Step 6: 統合テスト実行・チューニング**
+- [x] **Step 6: 統合テスト実行・チューニング**
 
 ```bash
 MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_scripted_expert.py -v -m sim
@@ -757,7 +761,7 @@ MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_scripted_expert.py -v -m sim
 
 Expected: PASS。失敗時のチューニング順: (i) `grasp` の高さオフセット（オブジェクト形状依存）、(ii) `kp` を下げ振動抑制、(iii) `pos_tol` 緩和、(iv) 対象オブジェクトのカテゴリ変更（Task 2 Step 5参照）。`env.check_success()` が存在しない場合は `env.env._check_success()` を試し、Interfaces節へ反映。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/lerobot_policy_snvla/sim/scripted_expert.py tests/sim/test_scripted_expert.py
@@ -781,7 +785,7 @@ git commit -m "feat(sim): add waypoint scripted expert for T1 with success-rate 
   - `main()` — argparse CLI
   - データセットschema: `action` float32 (7,), `observation.state` float32 (8,)（eef_pos 3 + eef axis-angle 3 + gripper_qpos 2, LiberoProcessorStep互換）, `observation.images.image` / `observation.images.image2` video (camera_hw, camera_hw, 3), `current_narration` string (1,), `previous_narrations` string (1,), `sim_event` string (1,)（真値イベントのJSON、無イベントフレームは `""`）
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 ```python
 # tests/sim/test_collect.py
@@ -837,7 +841,7 @@ def test_collect_two_episodes_produces_valid_dataset(tmp_path):
     assert isinstance(last_prev, list)
 ```
 
-- [ ] **Step 2: 実行して失敗を確認**
+- [x] **Step 2: 実行して失敗を確認**
 
 ```bash
 MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_collect.py -v
@@ -845,7 +849,7 @@ MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_collect.py -v
 
 Expected: FAIL (ImportError)
 
-- [ ] **Step 3: collect.py を実装**
+- [x] **Step 3: collect.py を実装**
 
 ```python
 # src/lerobot_policy_snvla/sim/collect.py
@@ -1024,7 +1028,7 @@ if __name__ == "__main__":
 snvla-sim-collect = "lerobot_policy_snvla.sim.collect:main"
 ```
 
-- [ ] **Step 4: テスト実行**
+- [x] **Step 4: テスト実行**
 
 ```bash
 MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_collect.py -v
@@ -1032,7 +1036,7 @@ MUJOCO_GL=egl .venv/bin/pytest tests/sim/test_collect.py -v
 
 Expected: PASS。`LeRobotDataset.create` のfeatures書式エラーが出た場合は `~/.cache/huggingface/lerobot/0xNOY/so101_wn_aug/meta/info.json` の実スキーマ（確認済み: string [1] 等）に合わせて `_features` を修正。scipy未導入なら `uv pip install --python .venv/bin/python scipy`（lerobot[libero]はscipy-dep включ済みのはず）。
 
-- [ ] **Step 5: 全テスト回帰**
+- [x] **Step 5: 全テスト回帰**
 
 ```bash
 MUJOCO_GL=egl .venv/bin/pytest tests/ -v
@@ -1040,7 +1044,7 @@ MUJOCO_GL=egl .venv/bin/pytest tests/ -v
 
 Expected: 全pass（既存テスト含む）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/lerobot_policy_snvla/sim/collect.py tests/sim/test_collect.py pyproject.toml
@@ -1057,7 +1061,7 @@ git commit -m "feat(sim): add automated T1 collection CLI writing narrated LeRob
 **Interfaces:**
 - Consumes: Task 5の `snvla-sim-collect` CLI と `CollectStats` 出力
 
-- [ ] **Step 1: 収集ランをバックグラウンド起動（監視はagyに委任可）**
+- [x] **Step 1: 収集ランをバックグラウンド起動（監視はagyに委任可）**
 
 ```bash
 MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.collect \
@@ -1067,7 +1071,7 @@ MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.collect \
 
 Expected: `saved=50/... throughput=... eps/h narration_ok=50/50`
 
-- [ ] **Step 2: データセット健全性チェック**
+- [x] **Step 2: データセット健全性チェック**
 
 ```bash
 .venv/bin/python - <<'EOF'
@@ -1082,12 +1086,12 @@ EOF
 
 Expected: episodes: 50、narration列が読める
 
-- [ ] **Step 3: P5-E1レポートを書く**
+- [x] **Step 3: P5-E1レポートを書く**
 
 `docs/superpowers/reports/2026-07-11-p5-e1-report.md` に以下を記録:
 収集スループット（eps/h）、棄却率（attempted vs saved）、実況付与の真値一致率（narration_ok、および `sim_event` と `current_narration` の同フレーム性 = 構成的に100%である旨）、既知の制約（かご内容物の遮蔽強度が未調整である旨と、T1 v2でのかご壁高さ調整の提案）。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/superpowers/reports/2026-07-11-p5-e1-report.md
@@ -1101,3 +1105,40 @@ git commit -m "docs(sim): add P5-E1 collection throughput and narration accuracy
 - スペックP5フェーズ1の範囲（LIBERO統合確認・T1・スクリプトエキスパート・自動収集・P5-E1）を全てカバー。P5-E2（学習+評価）とT2〜T5は次フェーズの計画で扱う
 - LIBERO/robosuiteのAPI表面（BDDL書式、body命名、obsキー名）は未インストール時点の知識で書いており、Task 1 Step 6 / Task 2 Step 1・5 / Task 4 Step 6 に**実物との照合・調整ステップ**を明示的に置いた。調整が発生したら本計画のInterfaces節も更新すること
 - 型・命名の整合: `object_body_names` / `BASKET_BODY` / `EventTracker.update` / `T1Expert.act` はTask間で署名一致を確認済み
+
+---
+
+## 実装結果と計画からの差分（2026-07-12 完了時点）
+
+全Task完了・mainへマージ済み。計画のコードブロックからの主な差分（現行実装が正）:
+
+1. **実況フォーマット**: 計画時の `narration_for_event`（単発文）から、so101_wn互換の
+   **pick/place 2段階断片ストリーム**に進化した（ユーザー指示による）。
+   `NarrationFormat`（`events.py`）が担い、断片は
+   `Picking up <obj> k of N...` → ` (done)\n`（持ち上げz>0.12mの真値）→
+   `Putting <obj> k of N into the basket...` → ` (done)\n`（かごsettleの真値）→
+   `Task completed.\n`。タスク指示は `Put N <obj>s into the basket.`
+2. **EventTracker**: `picked`（z閾値+debounce）と `placed`（region settle）の2種イベント、
+   ordinalはkindごと。収集時は組み立てストリームが `NarrationFormat.expected_stream` と
+   完全一致しないエピソードを棄却
+3. **対象オブジェクト**: 既定は `chocolate_pudding`（`alphabet_soup`はドロップ散乱、
+   `butter`/`cream_cheese`は薄すぎて把持不可）。`--category`/`--object-name` で変更可能
+4. **エキスパート**: 壁クリア高度の2段置き（transit 0.30 / release 0.17）、
+   ブロックごとの対角置きオフセット（rngでシャッフル）、フェーズタイムアウト120を追加。
+   BDDLのproblem名は登録済みの `LIBERO_Floor_Manipulation` を使用し、`:objects` は
+   1行グループ形式で宣言する必要がある
+5. **配置ランダム化**: ブロック・かごのspawn位置をエピソードseedからサンプリング
+   （`sample_layout`、最小距離0.10m）
+6. **並列収集**: `--workers`（既定16）でシャード並列収集し
+   `lerobot.datasets.aggregate.aggregate_datasets` で結合。803.6 eps/h を実測
+7. **conftest**: 計画のimportorskip一括方式は純粋テストまでskipするため、
+   simテストモジュール側で個別にskipガードする方式に変更
+8. **環境注意**: `.venv/bin/*` のshebangが旧リポジトリパスで破損しているため
+   `.venv/bin/python -m pytest` 形式を使う。`egl-probe` は
+   `CMAKE_POLICY_VERSION_MINIMUM=3.5` が必要。LIBERO初回importは `echo N |` で応答
+
+**成果物**: データセット `local/t1_n3_v3`（`~/datasets/t1_n3_v3`、50エピソード、
+ストリーム一致50/50）。v1/v2は旧フォーマットのため学習には v3 を使うこと。
+
+**次フェーズ（スペックのロードマップ）**: P5-E2（t1_n3_v3でSNVLA学習、実況あり≫なしの検証）、
+P2-E3（学習ターゲット分解のデータ変換、並行可）、P0（MolmoAct2移行）。
