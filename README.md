@@ -230,18 +230,33 @@ Notes for first-time setup:
   automatically from the Hugging Face Hub.
 - Use `MUJOCO_GL=egl` for headless rendering.
 
-Collect T1 (put N blocks into the basket) episodes:
+Collect T1 (put N objects into the basket) episodes:
 
 ```bash
 MUJOCO_GL=egl snvla-sim-collect \
   --repo-id <user>/t1_n3 --root ~/datasets/t1_n3 \
-  --episodes 50 --blocks 3 --seed 0
+  --episodes 50 --blocks 3 --seed 0 \
+  --category chocolate_pudding --object-name "chocolate pudding"
 ```
+
+`--category` selects the LIBERO object placed into the basket and
+`--object-name` the display name used in the task instruction and narrations
+(defaults: `chocolate_pudding` / category name with underscores removed).
+
+Narrations follow the `0xNOY/so101_wn` fragment convention — fragments
+concatenate into a complete stream. For `--blocks 2` the task is
+`Put 2 chocolate puddings into the basket.` and the fragments are:
+
+| Timing | Fragment |
+|---|---|
+| Motion toward object k starts | `Placing chocolate pudding k of 2 in the basket...` |
+| Object k settles in the basket (ground truth) | ` completed.\n` |
+| After the last placement | `Task completed.\n` |
 
 The resulting LeRobot v3.0 dataset contains `current_narration` /
 `previous_narrations` columns (same schema as `0xNOY/so101_wn_aug`) plus a
 `sim_event` column with the ground-truth event log for narration-timing
-evaluation. Only successful episodes (all blocks placed, all events detected)
+evaluation. Only successful episodes (all objects placed, all events detected)
 are saved.
 
 Simulation tests are marked `sim`:
