@@ -67,6 +67,12 @@ TIMESTAMP_DIV_TEMPLATE = """
 """
 
 
+def safe_item(val):
+    if hasattr(val, "item"):
+        return val.item()
+    return val
+
+
 def load_data(dataset, episode_index):
     """Load data for a specific episode."""
     from_idx = dataset.meta.episodes["dataset_from_index"][episode_index]
@@ -104,12 +110,12 @@ def load_data(dataset, episode_index):
         frame = dataset[idx]
 
         # Metrics
-        data["prob_bon"].append(frame.get("prob_bon", 0.0).item() if "prob_bon" in frame else 0.0)
-        data["prob_boa"].append(frame.get("prob_boa", 0.0).item() if "prob_boa" in frame else 0.0)
+        data["prob_bon"].append(safe_item(frame["prob_bon"]) if "prob_bon" in frame else 0.0)
+        data["prob_boa"].append(safe_item(frame["prob_boa"]) if "prob_boa" in frame else 0.0)
         data["current_narration"].append(
             frame.get("current_narration", "").replace("\n", "<span style='color: #aaa;'>↵</span><br>")
         )
-        data["timestamp"].append(frame.get("real_timestamp", 0.0).item())
+        data["timestamp"].append(float(safe_item(frame.get("real_timestamp", 0.0))))
 
         data["previous_narrations"].append(prev_narrations)
         prev_narrations += data["current_narration"][-1]

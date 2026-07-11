@@ -1,6 +1,6 @@
 import numpy as np
 
-from lerobot_policy_snvla.sim.events import BasketRegion, Event, EventTracker, narration_for_event
+from lerobot_policy_snvla.sim.events import BasketRegion, Event, EventTracker, NarrationFormat
 
 REGION = BasketRegion(center=np.array([0.0, 0.2, 0.05]), half_extents=np.array([0.08, 0.08, 0.08]))
 IN = np.array([0.0, 0.2, 0.05])
@@ -47,6 +47,29 @@ def test_simultaneous_settles_are_emitted_one_per_frame():
     assert ev2.ordinal == 2
 
 
-def test_narration_template():
-    ev = Event(kind="placed", object_name="blk_1", frame=10, ordinal=2)
-    assert narration_for_event(ev, n_total=3) == "Placed block 2 of 3 into the basket."
+def test_narration_format_so101_wn_style():
+    fmt = NarrationFormat(object_name="chocolate pudding")
+    assert fmt.task_description(2) == "Put 2 chocolate puddings into the basket."
+    assert fmt.task_description(1) == "Put 1 chocolate pudding into the basket."
+    assert fmt.start_narration(1, 2) == "Placing chocolate pudding 1 of 2 in the basket..."
+    assert fmt.completed_fragment == " completed.\n"
+    assert fmt.task_completed_fragment == "Task completed.\n"
+    # 断片を連結すると完全な実況ストリームになる（so101_wnと同じ規約）
+    stream = (
+        fmt.start_narration(1, 2)
+        + fmt.completed_fragment
+        + fmt.start_narration(2, 2)
+        + fmt.completed_fragment
+        + fmt.task_completed_fragment
+    )
+    assert stream == (
+        "Placing chocolate pudding 1 of 2 in the basket... completed.\n"
+        "Placing chocolate pudding 2 of 2 in the basket... completed.\n"
+        "Task completed.\n"
+    )
+
+
+def test_narration_format_custom_object_and_plural():
+    fmt = NarrationFormat(object_name="box", object_name_plural="boxes")
+    assert fmt.task_description(3) == "Put 3 boxes into the basket."
+    assert fmt.start_narration(2, 3) == "Placing box 2 of 3 in the basket..."

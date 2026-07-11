@@ -58,5 +58,28 @@ class EventTracker:
         return event
 
 
-def narration_for_event(event: Event, n_total: int) -> str:
-    return f"Placed block {event.ordinal} of {n_total} into the basket."
+@dataclass(frozen=True)
+class NarrationFormat:
+    """so101_wn互換の実況フォーマット。
+
+    実況は断片の列で、連結すると完全なストリームになる:
+    ``Placing X 1 of N in the basket... completed.\\n ... Task completed.\\n``
+    開始断片は動作開始時、完了断片は結果が観測できたフレーム（P3規約）、
+    task_completed は最後の完了直後に発行される。
+    """
+
+    object_name: str = "chocolate pudding"
+    object_name_plural: str | None = None  # None なら object_name + "s"
+    completed_fragment: str = " completed.\n"
+    task_completed_fragment: str = "Task completed.\n"
+
+    @property
+    def plural(self) -> str:
+        return self.object_name_plural or f"{self.object_name}s"
+
+    def task_description(self, n_total: int) -> str:
+        noun = self.object_name if n_total == 1 else self.plural
+        return f"Put {n_total} {noun} into the basket."
+
+    def start_narration(self, ordinal: int, n_total: int) -> str:
+        return f"Placing {self.object_name} {ordinal} of {n_total} in the basket..."

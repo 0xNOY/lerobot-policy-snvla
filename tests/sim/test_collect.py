@@ -25,22 +25,32 @@ def test_collect_two_episodes_produces_valid_dataset(tmp_path):
 
     ds = LeRobotDataset("local/t1_test", root=tmp_path / "ds")
     assert ds.num_episodes == stats.episodes_saved
-    narrated, gt_events = 0, 0
-    for i in range(ds.num_frames):
-        item = ds[i]
-        cn = item["current_narration"]
-        cn = cn[0] if isinstance(cn, list) else cn
-        se = item["sim_event"]
-        se = se[0] if isinstance(se, list) else se
-        pn = item["previous_narrations"]
-        pn = pn[0] if isinstance(pn, list) else pn
-        if cn:
-            narrated += 1
-            assert se, "実況フレームには真値イベントが必須（規約による構成的一致）"
+
+    expected_stream = (
+        "Placing chocolate pudding 1 of 2 in the basket... completed.\n"
+        "Placing chocolate pudding 2 of 2 in the basket... completed.\n"
+        "Task completed.\n"
+    )
+    hf = ds.hf_dataset.select_columns(
+        ["episode_index", "current_narration", "previous_narrations", "sim_event", "task_index"]
+    )
+    streams: dict[int, str] = {}
+    placed_events: dict[int, int] = {}
+    for row in hf:
+        ep = int(row["episode_index"])
+        cn = row["current_narration"]
+        se = row["sim_event"]
+        # 履歴の連結 + 現在実況 が常にストリームの接頭辞になっている
+        hist = "".join(parse_previous_narrations(row["previous_narrations"]))
+        assert expected_stream.startswith(hist + cn)
+        streams[ep] = streams.get(ep, "") + cn
         if se:
-            gt_events += 1
             event = json.loads(se)
             assert event["kind"] == "placed"
-        assert isinstance(parse_previous_narrations(pn), list)
-    assert narrated == 2 * stats.episodes_saved  # 2 blocks → 実況2フレーム/エピソード
-    assert gt_events == narrated
+            assert cn == " completed.\n"  # 真値イベントフレームの実況は完了断片
+            placed_events[ep] = placed_events.get(ep, 0) + 1
+    for ep in range(ds.num_episodes):
+        assert streams[ep] == expected_stream
+        assert placed_events[ep] == 2  # n_blocks
+
+    assert ds.meta.tasks.index.tolist() == ["Put 2 chocolate puddings into the basket."]
