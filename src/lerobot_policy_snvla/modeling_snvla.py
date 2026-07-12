@@ -304,16 +304,9 @@ class SNVLAPolicy(PI05Policy):
         if config.compile_model:
             if config.training:
                 logging.info(
-                    "Compiling SN-VLA training forward at fixed language length %d...",
+                    "Deferring SN-VLA training compilation until after distributed wrapping "
+                    "(fixed language length %d)...",
                     config.training_padding_length,
-                )
-                # Dataset batches are padded to fixed shapes. Keep FSDP collectives outside this
-                # compiled region and disable CUDA Graphs; Inductor kernel fusion provides the
-                # measured speedup without graph-capture constraints around checkpointing/FSDP.
-                self.model.forward = torch.compile(
-                    self.model.forward,
-                    dynamic=False,
-                    options={"triton.cudagraphs": False},
                 )
             else:
                 logging.info("Compiling SN-VLA inference steps...")
