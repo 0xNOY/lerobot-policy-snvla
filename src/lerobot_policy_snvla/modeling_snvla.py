@@ -236,8 +236,8 @@ class SNVLACore(nn.Module):
 
         if config.compile_model:
             compile_options = {"triton.cudagraphs": config.compile_cudagraphs}
-            self._compute_training_losses = torch.compile(
-                self._compute_training_losses,
+            self._reduce_training_losses = torch.compile(
+                self._reduce_training_losses,
                 dynamic=False,
                 options=compile_options,
             )
@@ -265,22 +265,14 @@ class SNVLACore(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def _compute_training_losses(
+    def _reduce_training_losses(
         self,
-        u_t,
-        v_t,
+        action_loss_raw,
         diffusion_loss_masks,
-        txt_logits,
-        txt_targets,
+        txt_loss_raw,
         language_loss_masks,
     ):
-        action_loss_raw = F.mse_loss(u_t, v_t, reduction="none")
         action_loss = (action_loss_raw * diffusion_loss_masks.view(-1, 1, 1)).mean()
-        txt_loss_raw = F.cross_entropy(
-            txt_logits.transpose(1, 2).float(),
-            txt_targets,
-            reduction="none",
-        )
         valid_loss_mask = language_loss_masks[:, 1:].float()
         weighted_loss = txt_loss_raw * valid_loss_mask
         total_weight = valid_loss_mask.sum().clamp(min=1)
@@ -367,12 +359,16 @@ class SNVLACore(nn.Module):
         txt_targets = language_tokens[:, 1:]
         txt_logits = txt_logits[:, :-1]
 
-        loss, action_loss, txt_loss = self._compute_training_losses(
-            u_t,
-            v_t,
-            diffusion_loss_masks,
-            txt_logits,
+        action_loss_raw = F.mse_loss(u_t, v_t, reduction="none")
+        txt_loss_raw = F.cross_entropy(
+            txt_logits.transpose(1, 2).float(),
             txt_targets,
+            reduction="none",
+        )
+        loss, action_loss, txt_loss = self._reduce_training_losses(
+            action_loss_raw,
+            diffusion_loss_masks,
+            txt_loss_raw,
             language_loss_masks,
         )
         valid_loss_mask = language_loss_masks[:, 1:].float()
