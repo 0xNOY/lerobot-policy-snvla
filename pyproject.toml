@@ -39,6 +39,7 @@ sim = [
 [project.scripts]
 snvla-record = "lerobot_policy_snvla.scripts.snvla_record:main"
 snvla-sim-collect = "lerobot_policy_snvla.sim.collect:main"
+snvla-sim-eval = "lerobot_policy_snvla.sim.evaluate:main"
 snvla-analyze-dataset-stats = "lerobot_policy_snvla.scripts.analyze_dataset_stats:main"
 snvla-augment-narrations = "lerobot_policy_snvla.scripts.augment_narrations:main"
 snvla-debug-inference = "lerobot_policy_snvla.scripts.debug_inference:main"
