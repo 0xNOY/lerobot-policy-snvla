@@ -269,6 +269,31 @@ The resulting LeRobot v3.0 dataset contains `current_narration` /
 evaluation. Only successful episodes (all objects placed, all events detected)
 are saved.
 
+Evaluate a trained policy in the T1 environment (success rate, ground-truth
+placed count, generated narrations; seeds default to an unseen band):
+
+```bash
+MUJOCO_GL=egl snvla-sim-eval \
+  --policy-path outputs/train/<run>/checkpoints/last/pretrained_model \
+  --episodes 30 --blocks 3 \
+  --out outputs/eval/results.json
+
+# narration-disabled ablation of the same checkpoint
+MUJOCO_GL=egl snvla-sim-eval \
+  --policy-path outputs/train/<run>/checkpoints/last/pretrained_model \
+  --episodes 30 --blocks 3 --no-narration \
+  --out outputs/eval/results_no_narration.json
+```
+
+To densify sparse narration frames for training, use the forward-only
+augmentation mode (never propagates a narration to frames before its
+ground-truth event, preserving the observation-description convention):
+
+```bash
+snvla-augment-narrations ~/datasets/t1_n3 ~/datasets/t1_n3_aug \
+  --dst-repo-id local/t1_n3_aug --window-size 10 --forward-only
+```
+
 Simulation tests are marked `sim`:
 
 ```bash
@@ -291,6 +316,7 @@ SN-VLA helper scripts are exposed as console commands:
 
 - `snvla-record`
 - `snvla-sim-collect`
+- `snvla-sim-eval`
 - `snvla-analyze-dataset-stats`
 - `snvla-augment-narrations`
 - `snvla-debug-inference`
