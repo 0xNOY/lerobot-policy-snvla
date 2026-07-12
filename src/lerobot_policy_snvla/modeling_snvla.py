@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Any
 
 import torch
@@ -8,7 +9,9 @@ from lerobot.policies.pi05.modeling_pi05 import (
     PI05Policy,
     PI05Pytorch,
     clone_past_key_values,
+    compute_layer_complete,
     get_gemma_config,
+    layernorm_forward,
     make_att_2d_masks,
 )
 from lerobot.utils.constants import (
@@ -28,6 +31,107 @@ from .processor_snvla import (
     discretize_state,
     make_prefix_prompt,
 )
+
+
+class JointDecoderLayer(nn.Module):
+    """One directly callable paired VLM/expert layer for FSDP wrapping."""
+
+    def __init__(self, paligemma_layer: nn.Module, expert_layer: nn.Module, rotary_emb: nn.Module):
+        super().__init__()
+        self.paligemma_layer = paligemma_layer
+        self.expert_layer = expert_layer
+        # Rotary embedding is shared and has no trainable parameters. Avoid registering the
+        # same module under every joint layer while retaining the original implementation.
+        object.__setattr__(self, "rotary_emb", rotary_emb)
+
+    def forward(self, prefix, suffix, attention_mask, position_ids, prefix_cond, suffix_cond):
+        outputs = compute_layer_complete(
+            [prefix, suffix],
+            attention_mask,
+            position_ids,
+            [prefix_cond, suffix_cond],
+            (self.paligemma_layer, self.expert_layer),
+            self.rotary_emb,
+        )
+        return outputs[0], outputs[1]
+
+
+class JointPaliGemmaWithExpertModel(PaliGemmaWithExpertModel):
+    """PaliGemma/expert model whose paired decoder layers are callable modules."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        language_model = self.paligemma.model.language_model
+        expert_model = self.gemma_expert.model
+        paligemma_layers = list(language_model.layers)
+        expert_layers = list(expert_model.layers)
+        rotary_emb = language_model.rotary_emb
+
+        # Move ownership to joint_layers. Plain-list views preserve the standard single-branch
+        # Gemma inference paths without registering each parameter twice.
+        del language_model.layers
+        del expert_model.layers
+        self.joint_layers = nn.ModuleList(
+            JointDecoderLayer(paligemma_layer, expert_layer, rotary_emb)
+            for paligemma_layer, expert_layer in zip(paligemma_layers, expert_layers, strict=True)
+        )
+        object.__setattr__(language_model, "layers", [layer.paligemma_layer for layer in self.joint_layers])
+        object.__setattr__(expert_model, "layers", [layer.expert_layer for layer in self.joint_layers])
+
+    def forward(
+        self,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        adarms_cond=None,
+    ):
+        if inputs_embeds[0] is None or inputs_embeds[1] is None:
+            return super().forward(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                adarms_cond=adarms_cond,
+            )
+
+        if adarms_cond is None:
+            adarms_cond = [None, None]
+        prefix, suffix = inputs_embeds
+        use_gradient_checkpointing = (
+            getattr(self.gemma_expert.model, "gradient_checkpointing", False) and self.training
+        ) or (getattr(self, "gradient_checkpointing", False) and self.training)
+
+        for joint_layer in self.joint_layers:
+            if use_gradient_checkpointing:
+                prefix, suffix = torch.utils.checkpoint.checkpoint(
+                    joint_layer,
+                    prefix,
+                    suffix,
+                    attention_mask,
+                    position_ids,
+                    adarms_cond[0],
+                    adarms_cond[1],
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                prefix, suffix = joint_layer(
+                    prefix,
+                    suffix,
+                    attention_mask,
+                    position_ids,
+                    adarms_cond[0],
+                    adarms_cond[1],
+                )
+
+        prefix, _ = layernorm_forward(
+            self.paligemma.model.language_model.norm, prefix, adarms_cond[0]
+        )
+        suffix, _ = layernorm_forward(self.gemma_expert.model.norm, suffix, adarms_cond[1])
+        return [prefix, suffix], None
 
 
 class SNVLACore(nn.Module):
@@ -114,7 +218,7 @@ class SNVLACore(nn.Module):
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
 
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(
+        self.paligemma_with_expert = JointPaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
             use_adarms=[False, True],
@@ -284,6 +388,29 @@ class SNVLAPolicy(PI05Policy):
 
     config_class = SNVLAConfig
     name = "snvla"
+
+    def _fix_pytorch_state_dict_keys(self, state_dict, model_config):
+        fixed_state_dict = super()._fix_pytorch_state_dict_keys(state_dict, model_config)
+        remapped_state_dict = {}
+        for key, value in fixed_state_dict.items():
+            key = re.sub(
+                r"(model\.)?paligemma_with_expert\.paligemma\.model\.language_model\.layers\.(\d+)\.",
+                lambda match: (
+                    f"{match.group(1) or ''}paligemma_with_expert.joint_layers."
+                    f"{match.group(2)}.paligemma_layer."
+                ),
+                key,
+            )
+            key = re.sub(
+                r"(model\.)?paligemma_with_expert\.gemma_expert\.model\.layers\.(\d+)\.",
+                lambda match: (
+                    f"{match.group(1) or ''}paligemma_with_expert.joint_layers."
+                    f"{match.group(2)}.expert_layer."
+                ),
+                key,
+            )
+            remapped_state_dict[key] = value
+        return remapped_state_dict
 
     def __init__(self, config: SNVLAConfig, **kwargs):
         # `PI05Policy` の __init__ を意図的にスキップ。`PreTrainedPolicy` の __init__ を呼び出す
