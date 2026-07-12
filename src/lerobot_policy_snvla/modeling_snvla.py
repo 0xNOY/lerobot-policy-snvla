@@ -302,16 +302,23 @@ class SNVLAPolicy(PI05Policy):
         self.model.to(config.device)
 
         if config.compile_model:
-            logging.info("Compiling SN-VLA inference steps...")
-            # Disable CUDA graphs to avoid issues with KV cache reuse
-            # Note: Cannot specify both mode and options, so we only use options
-            compile_options = {
-                "triton.cudagraphs": False,
-            }
-            self._prefill = torch.compile(self._prefill, dynamic=True, options=compile_options)
-            self._narrate_step = torch.compile(self._narrate_step, dynamic=True, options=compile_options)
-            self._act = torch.compile(self._act, dynamic=True, options=compile_options)
-            self.model.forward = torch.compile(self.model.forward, dynamic=True, options=compile_options)
+            if config.training:
+                logging.info("Compiling SN-VLA training forward (%s)...", config.compile_mode)
+                # Dataset batches are padded to fixed shapes. Keep FSDP collectives outside this
+                # compiled region while allowing Inductor and, in reduce-overhead mode, CUDA Graphs
+                # to optimize the compute-heavy forward/backward graph.
+                self.model.forward = torch.compile(
+                    self.model.forward,
+                    dynamic=False,
+                    mode=config.compile_mode,
+                )
+            else:
+                logging.info("Compiling SN-VLA inference steps...")
+                # Inference mutates and grows the KV cache, which is not CUDA Graph safe.
+                compile_options = {"triton.cudagraphs": False}
+                self._prefill = torch.compile(self._prefill, dynamic=True, options=compile_options)
+                self._narrate_step = torch.compile(self._narrate_step, dynamic=True, options=compile_options)
+                self._act = torch.compile(self._act, dynamic=True, options=compile_options)
 
         self.reset()
 
