@@ -623,6 +623,30 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ### Task 4: 単一GPU学習構成のVRAMプローブ
 
+> **実行結果メモ（2026-07-12）**: ローカル3090はbatch=8でピーク24093MiB/24576、
+> **optimizer状態（AdamW moments ~10.8GB）の初期化時点でOOM**。静的コストが支配的で
+> batch縮小では解決しないため、ユーザー指示によりDGX Station A100（`ssh dgx`、
+> 4×A100 40GB）へ移行。DGXでは `CUDA_VISIBLE_DEVICES=0,1,2,3` 必須（DGX Display GPU除外、
+> ユーザー指示）。ここまでに入れたLeRobot 0.6互換修正:
+> (i) `--eval_freq` は廃止（`--env_eval_freq`）なので外す、(ii) `accelerate` をvenvに追加、
+> (iii) `SNVLAPolicy.__init__` の `dataset_stats` kwargs吸収、
+> (iv) processorステップの `get_config()` 直列化対応（チェックポイントの保存/ロード両方に必須）、
+> (v) `--policy.compile_model=false`（compile+gradient checkpointingでdynamoクラッシュ）、
+> (vi) pretrained_path指定時はprocessorがそのパスのJSONからロードされるため、
+> pi05_baseのコピーにSNVLA processor JSONを差し替えた初期化チェックポイント
+> `~/models/snvla_pi05base_init` を作成して使う（作成スクリプトの手順はレポート参照）、
+> (vii) **max_state_dim/max_action_dim は 32/32 を使う**。pi05_baseのaction射影は
+> 32次元で保存されており、7に変えるとstrict loadが形状不一致で全重みロード失敗
+> （"Warning: Could not load state dict" → ランダム初期化で学習が進む罠）になる。
+> 32のままなら全キー一致でロードされ、実action 7への切り出しは推論パス
+> （`modeling_snvla.py:531` の output_features スライス）が行う。
+> DGXのtorchはドライバ570（CUDA 12.8）に合わせ `--torch-backend=cu128` を明示
+> （cu130はCUDA初期化不可でCPU実行になる）。
+>
+> **本学習の確定構成（DGX）**: 4×A100 FSDP SHARD_GRAD_OP / batch 16×4=64 /
+> steps=10000（≒16.6 epoch）/ lr 20e-5（paper値・同global batch）/
+> save_freq=2500 / compile無効 / grad checkpointing有効
+
 **Files:** なし（実験のみ。結果はTask 6のレポートに記録）
 
 **Interfaces:**
