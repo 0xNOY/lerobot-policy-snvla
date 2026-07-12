@@ -299,6 +299,25 @@ class SNVLACore(nn.Module):
         language_loss_masks = language_loss_masks.to(device)
         diffusion_loss_masks = diffusion_loss_masks.to(device)
 
+        if self.config.training_padding_length is not None:
+            target_length = self.config.training_padding_length
+            current_length = language_tokens.shape[1]
+            if current_length > target_length:
+                raise ValueError(
+                    f"Language sequence ({current_length}) exceeds fixed training padding "
+                    f"length ({target_length})"
+                )
+            pad_length = target_length - current_length
+            if pad_length:
+                language_tokens = F.pad(language_tokens, (0, pad_length), value=0)
+                language_padding_masks = F.pad(
+                    language_padding_masks, (0, pad_length), value=False
+                )
+                language_attention_masks = F.pad(
+                    language_attention_masks, (0, pad_length), value=False
+                )
+                language_loss_masks = F.pad(language_loss_masks, (0, pad_length), value=0.0)
+
         if actions.device != device:
             actions = actions.to(device)
 
