@@ -10,6 +10,11 @@ stepperプロトコル（`reset/act/narrations`）注入型で、スクリプト
 
 **Tech Stack:** LeRobot 0.6.0 / hf-libero 0.1.x / Python 3.13 venv (`.venv`) / pytest / RTX 3090 24GB ×1
 
+> **2026-07-13追記:** 当初計画の単GPU学習仮定は成立せず、DGX 2GPU FSDPへ移行した。
+> OOM解消、FSDP + compile/CUDA Graph、現行本番コマンド、残作業は
+> `2026-07-13-p5-e2-handoff.md` を正とする。現在はstep 0→15000のphase-2学習中で、
+> 実況あり/なし各30エピソードの最終評価は未実施。
+
 ## Global Constraints
 
 - 依存を変更しない（`lerobot[dataset,pi]>=0.6.0,<0.7.0`, `transformers>=5.4.0,<5.6.0`）
@@ -646,6 +651,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 > **本学習の確定構成（DGX）**: 4×A100 FSDP SHARD_GRAD_OP / batch 16×4=64 /
 > steps=10000（≒16.6 epoch）/ lr 20e-5（paper値・同global batch）/
 > save_freq=2500 / compile無効 / grad checkpointing有効
+>
+> **2026-07-13上書き:** 上記はphase-1の履歴。phase-2は2×A100 FULL_SHARD / batch 8×2 /
+> lr 10e-5 / 固定形状loss-only compile + CUDA Graph / SDPA / fused QKV /
+> checkpoint interval=2で実行中。完全なコマンドは同日handoff §3を参照。
 
 **Files:** なし（実験のみ。結果はTask 6のレポートに記録）
 
