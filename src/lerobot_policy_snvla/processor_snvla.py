@@ -1,6 +1,6 @@
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 import numpy as np
@@ -86,12 +86,15 @@ def make_prefix_prompt(
 class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
     """Processor step for SN-VLA training."""
 
-    config: SNVLAConfig
+    config: SNVLAConfig | dict[str, Any]
     tokenizer: Any = field(init=False)
 
     task_key: str = TASK_KEY
 
     def __post_init__(self):
+        # from_pretrained 経由（get_configで直列化したdict）からの再構築を受け付ける
+        if isinstance(self.config, dict):
+            self.config = SNVLAConfig(**self.config)
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer_name)
 
         self.begin_of_narration_token = self.tokenizer.convert_ids_to_tokens(
@@ -100,6 +103,28 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
         self.begin_of_action_token = self.tokenizer.convert_ids_to_tokens(
             self.config.begin_of_action_token_id
         )
+
+    def get_config(self) -> dict[str, Any]:
+        """JSON直列化可能な設定を返す（save_pretrained/from_pretrained のラウンドトリップ用）。
+
+        本ステップが参照するのはSNVLAConfigのプリミティブなフィールドのみのため、
+        JSON化できるフィールドだけを保存する（input_features等は学習時にoverridesで
+        再構成されるので不要）。
+        """
+
+        def _jsonable(value: Any) -> bool:
+            if isinstance(value, (str, int, float, bool, type(None))):
+                return True
+            if isinstance(value, (list, tuple)):
+                return all(_jsonable(v) for v in value)
+            return False
+
+        config = {
+            f.name: getattr(self.config, f.name)
+            for f in fields(self.config)
+            if _jsonable(getattr(self.config, f.name))
+        }
+        return {"config": config, "task_key": self.task_key}
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         if not self.config.training:

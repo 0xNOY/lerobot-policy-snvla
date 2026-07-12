@@ -285,8 +285,9 @@ class SNVLAPolicy(PI05Policy):
     config_class = SNVLAConfig
     name = "snvla"
 
-    def __init__(self, config: SNVLAConfig):
+    def __init__(self, config: SNVLAConfig, **kwargs):
         # `PI05Policy` の __init__ を意図的にスキップ。`PreTrainedPolicy` の __init__ を呼び出す
+        # kwargs は from_pretrained が渡す dataset_stats 等の吸収用（PI05Policy と同じ扱いで未使用）
         super(PI05Policy, self).__init__(config)
         config.validate_features()
         self.config = config
