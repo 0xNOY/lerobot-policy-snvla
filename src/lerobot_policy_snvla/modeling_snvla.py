@@ -234,6 +234,14 @@ class SNVLACore(nn.Module):
 
         self.gradient_checkpointing_enabled = False
 
+        if config.compile_model:
+            compile_options = {"triton.cudagraphs": config.compile_cudagraphs}
+            self._compute_training_losses = torch.compile(
+                self._compute_training_losses,
+                dynamic=False,
+                options=compile_options,
+            )
+
         # Convert all parameters to the target dtype
         if self.target_dtype is not None:
             self.to(self.target_dtype)
@@ -256,6 +264,29 @@ class SNVLACore(nn.Module):
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
+
+    def _compute_training_losses(
+        self,
+        u_t,
+        v_t,
+        diffusion_loss_masks,
+        txt_logits,
+        txt_targets,
+        language_loss_masks,
+    ):
+        action_loss_raw = F.mse_loss(u_t, v_t, reduction="none")
+        action_loss = (action_loss_raw * diffusion_loss_masks.view(-1, 1, 1)).mean()
+        txt_loss_raw = F.cross_entropy(
+            txt_logits.transpose(1, 2).float(),
+            txt_targets,
+            reduction="none",
+        )
+        valid_loss_mask = language_loss_masks[:, 1:].float()
+        weighted_loss = txt_loss_raw * valid_loss_mask
+        total_weight = valid_loss_mask.sum().clamp(min=1)
+        txt_loss = weighted_loss.sum() / total_weight
+        loss = txt_loss + self.diffusion_loss_coeff * action_loss
+        return loss, action_loss, txt_loss
 
     def forward(
         self,
@@ -326,9 +357,6 @@ class SNVLACore(nn.Module):
         # Action Loss (L_action)
         suffix_out_actions = suffix_out[:, -self.config.chunk_size :]
         v_t = self.action_out_proj(suffix_out_actions)
-        action_loss_raw = F.mse_loss(u_t, v_t, reduction="none")
-        # diffusion_loss_mask: (B,) -> (B, 1, 1)
-        action_loss = (action_loss_raw * diffusion_loss_masks.view(-1, 1, 1)).mean()
 
         # Text Loss (L_narration)
         language_seq_len = language_tokens.shape[1]
@@ -339,23 +367,15 @@ class SNVLACore(nn.Module):
         txt_targets = language_tokens[:, 1:]
         txt_logits = txt_logits[:, :-1]
 
-        txt_loss_raw = F.cross_entropy(
-            txt_logits.transpose(1, 2).float(),  # (B, L, V) -> (B, V, L)
+        loss, action_loss, txt_loss = self._compute_training_losses(
+            u_t,
+            v_t,
+            diffusion_loss_masks,
+            txt_logits,
             txt_targets,
-            reduction="none",
+            language_loss_masks,
         )
-
-        # 重み付き損失マスク（0.0 = 無効、>0.0 = 重み係数）
         valid_loss_mask = language_loss_masks[:, 1:].float()
-
-        # 重み付き平均損失を計算
-        # マスク値が重みとして機能（1.0 = 通常、>1.0 = より重要）
-        weighted_loss = txt_loss_raw * valid_loss_mask
-        total_weight = valid_loss_mask.sum().clamp(min=1)
-        txt_loss = weighted_loss.sum() / total_weight
-
-        # Total Loss
-        loss = txt_loss + self.diffusion_loss_coeff * action_loss
 
         is_loss_positive = loss > 0
 
@@ -431,9 +451,9 @@ class SNVLAPolicy(PI05Policy):
         if config.compile_model:
             if config.training:
                 logging.info(
-                    "Deferring SN-VLA training compilation until after distributed wrapping "
-                    "(fixed language length %d)...",
+                    "Compiling fixed-shape SN-VLA loss kernel (language length %d, CUDA Graphs=%s)...",
                     config.training_padding_length,
+                    config.compile_cudagraphs,
                 )
             else:
                 logging.info("Compiling SN-VLA inference steps...")

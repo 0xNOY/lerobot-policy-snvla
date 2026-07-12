@@ -79,6 +79,7 @@ class SNVLAConfig(PreTrainedConfig):
     gradient_checkpointing: bool = False
     compile_model: bool = False
     compile_mode: str = "max-autotune"
+    compile_cudagraphs: bool = False
     training_padding_length: int | None = None
 
     freeze_vision_encoder: bool = False
