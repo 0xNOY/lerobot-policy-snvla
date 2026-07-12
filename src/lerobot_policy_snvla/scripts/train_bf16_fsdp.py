@@ -33,14 +33,31 @@ class NativeBF16FSDPAccelerator(Accelerator):
             )
             os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_root / f"rank_{self.process_index}")
             os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
-            # Compile the FSDP/DDP forward in place. Wrapping the distributed module in an
-            # OptimizedModule leaks an `_orig_mod` prefix into checkpoint state-dict names.
-            # Compiling only the bound forward keeps checkpoint serialization unchanged.
-            prepared[0].forward = torch.compile(
-                prepared[0].forward,
-                dynamic=False,
-                options={"triton.cudagraphs": False},
-            )
+            compiled_joint_layers = 0
+            if self.distributed_type.name == "FSDP":
+                from torch.distributed.fsdp import FullyShardedDataParallel
+
+                from lerobot_policy_snvla.modeling_snvla import JointDecoderLayer
+
+                for fsdp_module in FullyShardedDataParallel.fsdp_modules(prepared[0]):
+                    if isinstance(fsdp_module.module, JointDecoderLayer):
+                        # Keep collectives eager. FSDP all-gathers parameters before invoking
+                        # this pure-compute layer, which is the profitable compile boundary.
+                        fsdp_module.module.forward = torch.compile(
+                            fsdp_module.module.forward,
+                            dynamic=False,
+                            options={"triton.cudagraphs": False},
+                        )
+                        compiled_joint_layers += 1
+
+            if compiled_joint_layers == 0:
+                # DDP and root-only FSDP fallback. Compile the bound forward in place so
+                # checkpoint state-dict names are not prefixed with `_orig_mod`.
+                prepared[0].forward = torch.compile(
+                    prepared[0].forward,
+                    dynamic=False,
+                    options={"triton.cudagraphs": False},
+                )
             prepared = tuple(prepared)
         return prepared
 
