@@ -31,10 +31,8 @@ def find_narration_frames(dataset: LeRobotDataset, episode_idx: int) -> list[Nar
     from_idx = dataset.meta.episodes["dataset_from_index"][episode_idx]
     to_idx = dataset.meta.episodes["dataset_to_index"][episode_idx]
 
-    # Ensure the Hugging Face dataset is loaded
-    dataset._ensure_hf_dataset_loaded()
-
     # Efficiently fetch columns if they exist, otherwise use empty strings
+    # (accessing the hf_dataset property lazily loads the dataset on LeRobot 0.6)
     if CURRENT_NARRATION_KEY in dataset.hf_dataset.features:
         current_narrations = dataset.hf_dataset[from_idx:to_idx][CURRENT_NARRATION_KEY]
     else:
@@ -63,8 +61,31 @@ def find_narration_frames(dataset: LeRobotDataset, episode_idx: int) -> list[Nar
     return narration_frames
 
 
+def compute_window(
+    center: int,
+    from_idx: int,
+    to_idx: int,
+    window: int,
+    prev_center: int | None,
+    next_center: int | None,
+    forward_only: bool,
+) -> range:
+    """centerの実況を伝搬するフレーム範囲。
+
+    forward_only=True では center より前に伝搬しない（P3観測記述規約:
+    イベント確定前のフレームに完了実況を書き込まない）。
+    """
+    start_limit = center if forward_only else center - window
+    end_limit = center + window + 1
+    if prev_center is not None:
+        start_limit = max(start_limit, (prev_center + center) // 2 + 1)
+    if next_center is not None:
+        end_limit = min(end_limit, (center + next_center) // 2 + 1)
+    return range(max(from_idx, start_limit), min(to_idx, end_limit))
+
+
 def plan_augmentation_in_episode(
-    dataset: LeRobotDataset, episode_idx: int, window_size: int
+    dataset: LeRobotDataset, episode_idx: int, window_size: int, forward_only: bool = False
 ) -> list[NarrationFrames]:
     from_idx = dataset.meta.episodes["dataset_from_index"][episode_idx]
     to_idx = dataset.meta.episodes["dataset_to_index"][episode_idx]
@@ -72,26 +93,21 @@ def plan_augmentation_in_episode(
     narration_frames = find_narration_frames(dataset, episode_idx)
 
     for i, narration_frame in enumerate(narration_frames):
-        center_idx = narration_frame.abs_center_frame_idx
-
-        start_limit = center_idx - window_size
-        end_limit = center_idx + window_size + 1
-
-        if i > 0:
-            prev_center = narration_frames[i - 1].abs_center_frame_idx
-            midpoint = (prev_center + center_idx) // 2
-            start_limit = max(start_limit, midpoint + 1)
-
-        if i < len(narration_frames) - 1:
-            next_center = narration_frames[i + 1].abs_center_frame_idx
-            midpoint = (center_idx + next_center) // 2
-            end_limit = min(end_limit, midpoint + 1)
-
-        start_idx = max(from_idx, start_limit)
-        end_idx = min(to_idx, end_limit)
-
-        for frame_idx in range(start_idx, end_idx):
-            narration_frame.abs_augmented_frame_idx.append(frame_idx)
+        prev_center = narration_frames[i - 1].abs_center_frame_idx if i > 0 else None
+        next_center = (
+            narration_frames[i + 1].abs_center_frame_idx if i < len(narration_frames) - 1 else None
+        )
+        narration_frame.abs_augmented_frame_idx.extend(
+            compute_window(
+                narration_frame.abs_center_frame_idx,
+                from_idx,
+                to_idx,
+                window_size,
+                prev_center,
+                next_center,
+                forward_only,
+            )
+        )
 
     return narration_frames
 
@@ -200,6 +216,12 @@ def main():
     parser.add_argument("dst_path", type=Path, help="Path to the destination dataset")
     parser.add_argument("--dst-repo-id", type=str, help="Repository ID for the destination dataset")
     parser.add_argument("--window-size", type=int, default=5, help="Window size for augmentation")
+    parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="Propagate narrations only to frames at/after the annotated frame "
+        "(keeps the observation-description convention: never narrate an event before it is visible)",
+    )
     args = parser.parse_args()
 
     try:
@@ -213,7 +235,9 @@ def main():
 
     all_updates = {}
     for episode_idx in tqdm.tqdm(range(len(src.meta.episodes)), desc="Planning augmentations"):
-        narration_frames = plan_augmentation_in_episode(src, episode_idx, args.window_size)
+        narration_frames = plan_augmentation_in_episode(
+            src, episode_idx, args.window_size, forward_only=args.forward_only
+        )
         collect_updates(narration_frames, all_updates)
 
     apply_updates_to_dataset(dst, all_updates)
