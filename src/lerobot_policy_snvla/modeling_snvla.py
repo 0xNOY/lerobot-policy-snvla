@@ -1,5 +1,4 @@
 import logging
-import math
 from typing import Any
 
 import torch
@@ -419,8 +418,9 @@ class SNVLAPolicy(PI05Policy):
     ) -> tuple[Tensor, Tensor, Any, Tensor]:
         """Performs a single autoregressive decoding step for narration generation."""
 
-        token_embedding = self.model.paligemma_with_expert.paligemma.language_model.embed_tokens(token)
-        token_embedding = token_embedding * math.sqrt(token_embedding.shape[-1])
+        # transformers 5.xのGemma埋め込み層はsqrt(hidden)スケールを内蔵している
+        # (GemmaScaledWordEmbedding)ため、手動スケーリングすると二重になる
+        token_embedding = self.model.paligemma_with_expert.embed_language_tokens(token)
 
         # Create attention mask for the current step
         attention_mask = torch.cat(
@@ -466,8 +466,8 @@ class SNVLAPolicy(PI05Policy):
         action_token = torch.full(
             (bsize, 1), self.config.begin_of_action_token_id, dtype=torch.long, device=device
         )
-        action_emb = self.model.paligemma_with_expert.paligemma.language_model.embed_tokens(action_token)
-        action_emb = action_emb * math.sqrt(action_emb.shape[-1])
+        # 上記_narrate_stepと同様、埋め込み層がスケール内蔵のため手動sqrtは掛けない
+        action_emb = self.model.paligemma_with_expert.embed_language_tokens(action_token)
 
         # Create attention mask for the BOA token
         attention_mask = torch.cat(

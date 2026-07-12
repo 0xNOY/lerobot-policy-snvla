@@ -228,7 +228,8 @@ class PolicyStepper:
             task=task,
             robot_type="panda_libero",
         )
-        return action.numpy()
+        # predict_actionはバッチ次元付き(1, action_dim)で返す。bf16はnumpy非対応
+        return action.float().squeeze(0).numpy()
 
     def narrations(self) -> list[str]:
         return list(getattr(self.policy, "_previous_narrations", []))
