@@ -6,7 +6,9 @@ mixed-precision mode disabled while retaining bf16 autocast for the forward
 pass.
 """
 
+import os
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from accelerate import Accelerator
@@ -26,6 +28,11 @@ class NativeBF16FSDPAccelerator(Accelerator):
         prepared = super().prepare(*args, device_placement=device_placement)
         if compile_training_model:
             prepared = list(prepared)
+            cache_root = Path(
+                os.environ.get("TORCHINDUCTOR_CACHE_DIR", Path.home() / ".cache" / "torchinductor_snvla")
+            )
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_root / f"rank_{self.process_index}")
+            os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
             # Compile outside the FSDP wrapper. Compiling the inner policy causes FSDP's
             # per-step parameter-view refresh to invalidate Dynamo guards every iteration.
             prepared[0] = torch.compile(
