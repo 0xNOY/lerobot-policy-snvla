@@ -9,11 +9,11 @@ from lerobot.policies.pi05.modeling_pi05 import (
     PI05Policy,
     PI05Pytorch,
     clone_past_key_values,
-    compute_layer_complete,
     get_gemma_config,
     layernorm_forward,
     make_att_2d_masks,
 )
+from lerobot.policies.pi_gemma import _gated_residual
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -22,6 +22,7 @@ from lerobot.utils.constants import (
 )
 from torch import Tensor, nn
 from transformers import AutoTokenizer
+from transformers.models.gemma import modeling_gemma
 
 from .configuration_snvla import SNVLAConfig
 from .processor_snvla import (
@@ -33,26 +34,110 @@ from .processor_snvla import (
 )
 
 
+def select_text_loss_inputs(language_out, language_tokens, language_loss_masks, max_tokens):
+    """Gather a fixed number of next-token positions that contribute to text loss."""
+    candidate_hidden = language_out[:, :-1]
+    candidate_targets = language_tokens[:, 1:]
+    candidate_weights = language_loss_masks[:, 1:]
+    valid = candidate_weights > 0
+
+    positions = torch.arange(candidate_hidden.shape[1], device=candidate_hidden.device)
+    positions = positions.unsqueeze(0).expand(candidate_hidden.shape[0], -1)
+    sentinel = candidate_hidden.shape[1]
+    selected_positions = torch.where(valid, positions, sentinel).sort(dim=1).values[:, :max_tokens]
+    safe_positions = selected_positions.clamp(max=candidate_hidden.shape[1] - 1)
+
+    hidden_indices = safe_positions.unsqueeze(-1).expand(-1, -1, candidate_hidden.shape[-1])
+    selected_hidden = candidate_hidden.gather(1, hidden_indices)
+    selected_targets = candidate_targets.gather(1, safe_positions)
+    selected_weights = candidate_weights.gather(1, safe_positions)
+    selected_weights = selected_weights * (selected_positions != sentinel)
+    return selected_hidden, selected_targets, selected_weights
+
+
 class JointDecoderLayer(nn.Module):
     """One directly callable paired VLM/expert layer for FSDP wrapping."""
 
-    def __init__(self, paligemma_layer: nn.Module, expert_layer: nn.Module, rotary_emb: nn.Module):
+    def __init__(
+        self,
+        paligemma_layer: nn.Module,
+        expert_layer: nn.Module,
+        rotary_emb: nn.Module,
+        attention_backend: str,
+    ):
         super().__init__()
         self.paligemma_layer = paligemma_layer
         self.expert_layer = expert_layer
         # Rotary embedding is shared and has no trainable parameters. Avoid registering the
         # same module under every joint layer while retaining the original implementation.
         object.__setattr__(self, "rotary_emb", rotary_emb)
+        self.attention_backend = attention_backend
 
     def forward(self, prefix, suffix, attention_mask, position_ids, prefix_cond, suffix_cond):
-        outputs = compute_layer_complete(
-            [prefix, suffix],
-            attention_mask,
-            position_ids,
-            [prefix_cond, suffix_cond],
-            (self.paligemma_layer, self.expert_layer),
-            self.rotary_emb,
+        inputs = [prefix, suffix]
+        conditions = [prefix_cond, suffix_cond]
+        layers = [self.paligemma_layer, self.expert_layer]
+        query_states, key_states, value_states, gates = [], [], [], []
+        for hidden_states, condition, layer in zip(inputs, conditions, layers, strict=True):
+            normalized, gate = layernorm_forward(
+                layer.input_layernorm, hidden_states, condition
+            )
+            gates.append(gate)
+            hidden_shape = (*normalized.shape[:-1], -1, layer.self_attn.head_dim)
+            query_states.append(
+                layer.self_attn.q_proj(normalized).view(hidden_shape).transpose(1, 2)
+            )
+            key_states.append(
+                layer.self_attn.k_proj(normalized).view(hidden_shape).transpose(1, 2)
+            )
+            value_states.append(
+                layer.self_attn.v_proj(normalized).view(hidden_shape).transpose(1, 2)
+            )
+
+        query_states = torch.cat(query_states, dim=2)
+        key_states = torch.cat(key_states, dim=2)
+        value_states = torch.cat(value_states, dim=2)
+        dummy = torch.zeros_like(query_states[:, 0])
+        cos, sin = self.rotary_emb(dummy, position_ids)
+        query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, unsqueeze_dim=1
         )
+        if self.attention_backend == "sdpa":
+            att_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.paligemma_layer.self_attn.scaling,
+                enable_gqa=True,
+            )
+            att_output = att_output.transpose(1, 2).contiguous()
+        else:
+            att_output, _ = modeling_gemma.eager_attention_forward(
+                self.paligemma_layer.self_attn,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                self.paligemma_layer.self_attn.scaling,
+            )
+        att_output = att_output.reshape(query_states.shape[0], -1, query_states.shape[1] * query_states.shape[-1])
+
+        outputs, start = [], 0
+        for hidden_states, condition, gate, layer in zip(
+            inputs, conditions, gates, layers, strict=True
+        ):
+            end = start + hidden_states.shape[1]
+            projected = layer.self_attn.o_proj(att_output[:, start:end])
+            residual = _gated_residual(hidden_states, projected, gate)
+            normalized, mlp_gate = layernorm_forward(
+                layer.post_attention_layernorm, residual, condition
+            )
+            mlp_output = layer.mlp(normalized.to(layer.mlp.up_proj.weight.dtype))
+            outputs.append(_gated_residual(residual, mlp_output, mlp_gate))
+            start = end
         return outputs[0], outputs[1]
 
 
@@ -60,7 +145,10 @@ class JointPaliGemmaWithExpertModel(PaliGemmaWithExpertModel):
     """PaliGemma/expert model whose paired decoder layers are callable modules."""
 
     def __init__(self, *args, **kwargs):
+        checkpoint_interval = kwargs.pop("checkpoint_interval", 1)
+        attention_backend = kwargs.pop("attention_backend", "eager")
         super().__init__(*args, **kwargs)
+        self.checkpoint_interval = checkpoint_interval
         language_model = self.paligemma.model.language_model
         expert_model = self.gemma_expert.model
         paligemma_layers = list(language_model.layers)
@@ -72,7 +160,7 @@ class JointPaliGemmaWithExpertModel(PaliGemmaWithExpertModel):
         del language_model.layers
         del expert_model.layers
         self.joint_layers = nn.ModuleList(
-            JointDecoderLayer(paligemma_layer, expert_layer, rotary_emb)
+            JointDecoderLayer(paligemma_layer, expert_layer, rotary_emb, attention_backend)
             for paligemma_layer, expert_layer in zip(paligemma_layers, expert_layers, strict=True)
         )
         object.__setattr__(language_model, "layers", [layer.paligemma_layer for layer in self.joint_layers])
@@ -104,8 +192,11 @@ class JointPaliGemmaWithExpertModel(PaliGemmaWithExpertModel):
             getattr(self.gemma_expert.model, "gradient_checkpointing", False) and self.training
         ) or (getattr(self, "gradient_checkpointing", False) and self.training)
 
-        for joint_layer in self.joint_layers:
-            if use_gradient_checkpointing:
+        for layer_index, joint_layer in enumerate(self.joint_layers):
+            checkpoint_layer = (
+                use_gradient_checkpointing and layer_index % self.checkpoint_interval == 0
+            )
+            if checkpoint_layer:
                 prefix, suffix = torch.utils.checkpoint.checkpoint(
                     joint_layer,
                     prefix,
@@ -223,6 +314,8 @@ class SNVLACore(nn.Module):
             action_expert_config,
             use_adarms=[False, True],
             precision=config.dtype,
+            checkpoint_interval=config.gradient_checkpointing_interval,
+            attention_backend=config.attention_backend,
         )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
@@ -270,10 +363,10 @@ class SNVLACore(nn.Module):
         action_loss_raw,
         diffusion_loss_masks,
         txt_loss_raw,
-        language_loss_masks,
+        text_loss_weights,
     ):
         action_loss = (action_loss_raw * diffusion_loss_masks.view(-1, 1, 1)).mean()
-        valid_loss_mask = language_loss_masks[:, 1:].float()
+        valid_loss_mask = text_loss_weights.float()
         weighted_loss = txt_loss_raw * valid_loss_mask
         total_weight = valid_loss_mask.sum().clamp(min=1)
         txt_loss = weighted_loss.sum() / total_weight
@@ -372,11 +465,13 @@ class SNVLACore(nn.Module):
         # Text Loss (L_narration)
         language_seq_len = language_tokens.shape[1]
         language_out = prefix_out[:, -language_seq_len:, :]
-        txt_logits = self.paligemma_with_expert.paligemma.lm_head(language_out)
-
-        # ターゲットとロジットをシフト
-        txt_targets = language_tokens[:, 1:]
-        txt_logits = txt_logits[:, :-1]
+        text_hidden, txt_targets, text_loss_weights = select_text_loss_inputs(
+            language_out,
+            language_tokens,
+            language_loss_masks,
+            self.config.max_text_loss_tokens,
+        )
+        txt_logits = self.paligemma_with_expert.paligemma.lm_head(text_hidden)
 
         action_loss_raw = F.mse_loss(u_t, v_t, reduction="none")
         txt_loss_raw = F.cross_entropy(
@@ -388,9 +483,9 @@ class SNVLACore(nn.Module):
             action_loss_raw,
             diffusion_loss_masks,
             txt_loss_raw,
-            language_loss_masks,
+            text_loss_weights,
         )
-        valid_loss_mask = language_loss_masks[:, 1:].float()
+        valid_loss_mask = text_loss_weights.float()
 
         is_loss_positive = loss > 0
 

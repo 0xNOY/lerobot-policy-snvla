@@ -77,10 +77,13 @@ class SNVLAConfig(PreTrainedConfig):
     )
 
     gradient_checkpointing: bool = False
+    gradient_checkpointing_interval: int = 1
     compile_model: bool = False
     compile_mode: str = "max-autotune"
     compile_cudagraphs: bool = False
     training_padding_length: int | None = None
+    max_text_loss_tokens: int = 16
+    attention_backend: str = "eager"
 
     freeze_vision_encoder: bool = False
     train_expert_only: bool = False
@@ -117,6 +120,13 @@ class SNVLAConfig(PreTrainedConfig):
                 raise ValueError("training_padding_length must be positive")
             if self.training_padding_length > self.tokenizer_max_length:
                 raise ValueError("training_padding_length cannot exceed tokenizer_max_length")
+
+        if self.max_text_loss_tokens <= 0:
+            raise ValueError("max_text_loss_tokens must be positive")
+        if self.gradient_checkpointing_interval <= 0:
+            raise ValueError("gradient_checkpointing_interval must be positive")
+        if self.attention_backend not in {"eager", "sdpa"}:
+            raise ValueError("attention_backend must be 'eager' or 'sdpa'")
 
         if self.training and self.compile_model and self.training_padding_length is None:
             raise ValueError("training_padding_length is required when compiling the training model")

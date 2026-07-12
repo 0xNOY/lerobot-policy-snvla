@@ -6,6 +6,7 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 import lerobot_policy_snvla
 from lerobot_policy_snvla import SNVLAConfig
 from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
+from lerobot_policy_snvla.modeling_snvla import select_text_loss_inputs
 from lerobot_policy_snvla.processor_snvla import (
     CURRENT_NARRATION,
     OBS_LANGUAGE_TOKEN_AR_MASK,
@@ -137,6 +138,33 @@ def test_processor_step_uses_fixed_training_padding_length(monkeypatch):
     assert observation[OBS_LANGUAGE_ATTENTION_MASK].shape == (1, 256)
     assert observation[OBS_LANGUAGE_TOKEN_AR_MASK].shape == (1, 256)
     assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].shape == (1, 256)
+
+
+def test_select_text_loss_inputs_preserves_weighted_cross_entropy():
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 7, 4)
+    tokens = torch.randint(0, 11, (2, 7))
+    weights = torch.tensor(
+        [[0, 0, 2, 2, 0, 0, 0], [0, 0, 0, 0, 3, 3, 0]], dtype=torch.float32
+    )
+    lm_head = torch.nn.Linear(4, 11, bias=False)
+
+    full_logits = lm_head(hidden[:, :-1])
+    full_raw = torch.nn.functional.cross_entropy(
+        full_logits.transpose(1, 2), tokens[:, 1:], reduction="none"
+    )
+    full_loss = (full_raw * weights[:, 1:]).sum() / weights[:, 1:].sum()
+
+    selected_hidden, selected_targets, selected_weights = select_text_loss_inputs(
+        hidden, tokens, weights, max_tokens=3
+    )
+    selected_logits = lm_head(selected_hidden)
+    selected_raw = torch.nn.functional.cross_entropy(
+        selected_logits.transpose(1, 2), selected_targets, reduction="none"
+    )
+    selected_loss = (selected_raw * selected_weights).sum() / selected_weights.sum()
+
+    torch.testing.assert_close(selected_loss, full_loss)
 
 
 def test_processor_step_tolerates_invalid_previous_narrations_json(monkeypatch):
