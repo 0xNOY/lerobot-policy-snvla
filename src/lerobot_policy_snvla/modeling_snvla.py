@@ -227,19 +227,16 @@ class SNVLACore(nn.Module):
         action_loss = (action_loss_raw * diffusion_loss_masks.view(-1, 1, 1)).mean()
 
         # Text Loss (L_narration)
-        txt_logits = self.paligemma_with_expert.paligemma.lm_head(prefix_out)
         language_seq_len = language_tokens.shape[1]
-        txt_logits = txt_logits[:, -language_seq_len:, :]
+        language_out = prefix_out[:, -language_seq_len:, :]
+        txt_logits = self.paligemma_with_expert.paligemma.lm_head(language_out)
 
         # ターゲットとロジットをシフト
         txt_targets = language_tokens[:, 1:]
         txt_logits = txt_logits[:, :-1]
 
-        if txt_logits.dtype != torch.float32:
-            txt_logits = txt_logits.to(torch.float32)
-
         txt_loss_raw = F.cross_entropy(
-            txt_logits.transpose(1, 2),  # (B, L, V) -> (B, V, L)
+            txt_logits.transpose(1, 2).float(),  # (B, L, V) -> (B, V, L)
             txt_targets,
             reduction="none",
         )
