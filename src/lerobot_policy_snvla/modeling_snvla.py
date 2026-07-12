@@ -8,6 +8,7 @@ from lerobot.policies.pi05.modeling_pi05 import (
     PaliGemmaWithExpertModel,
     PI05Policy,
     PI05Pytorch,
+    clone_past_key_values,
     get_gemma_config,
     make_att_2d_masks,
 )
@@ -83,6 +84,9 @@ class SNVLACore(nn.Module):
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        # transformers 5.xではuse_cache=FalseでもCacheオブジェクトにsuffixキーが追記されるため、
+        # 本家pi05のdenoise_stepと同様にcloneして呼び出し元のキャッシュを保護する
+        past_key_values = clone_past_key_values(past_key_values)
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
