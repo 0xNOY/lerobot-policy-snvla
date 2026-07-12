@@ -55,6 +55,46 @@ def select_text_loss_inputs(language_out, language_tokens, language_loss_masks, 
     return selected_hidden, selected_targets, selected_weights
 
 
+class FusedQKVProjection(nn.Module):
+    """A single GEMM containing a layer's query, key, and value projections."""
+
+    def __init__(self, q_proj: nn.Linear, k_proj: nn.Linear, v_proj: nn.Linear):
+        super().__init__()
+        self.split_sizes = (q_proj.out_features, k_proj.out_features, v_proj.out_features)
+        self.weight = nn.Parameter(torch.cat([q_proj.weight, k_proj.weight, v_proj.weight], dim=0))
+        if q_proj.bias is None:
+            self.bias = None
+        else:
+            self.bias = nn.Parameter(torch.cat([q_proj.bias, k_proj.bias, v_proj.bias], dim=0))
+
+    def forward(self, hidden_states):
+        return F.linear(hidden_states, self.weight, self.bias).split(self.split_sizes, dim=-1)
+
+
+class QKVProjectionView(nn.Module):
+    """Non-owning single-projection view used by standard Gemma inference."""
+
+    def __init__(self, fused: FusedQKVProjection, index: int):
+        super().__init__()
+        object.__setattr__(self, "fused", fused)
+        self.index = index
+        self.start = sum(fused.split_sizes[:index])
+        self.end = self.start + fused.split_sizes[index]
+
+    @property
+    def weight(self):
+        return self.fused.weight[self.start : self.end]
+
+    @property
+    def bias(self):
+        if self.fused.bias is None:
+            return None
+        return self.fused.bias[self.start : self.end]
+
+    def forward(self, hidden_states):
+        return F.linear(hidden_states, self.weight, self.bias)
+
+
 class JointDecoderLayer(nn.Module):
     """One directly callable paired VLM/expert layer for FSDP wrapping."""
 
@@ -64,6 +104,7 @@ class JointDecoderLayer(nn.Module):
         expert_layer: nn.Module,
         rotary_emb: nn.Module,
         attention_backend: str,
+        fuse_qkv: bool,
     ):
         super().__init__()
         self.paligemma_layer = paligemma_layer
@@ -72,27 +113,50 @@ class JointDecoderLayer(nn.Module):
         # same module under every joint layer while retaining the original implementation.
         object.__setattr__(self, "rotary_emb", rotary_emb)
         self.attention_backend = attention_backend
+        self.fuse_qkv = fuse_qkv
+        if fuse_qkv:
+            self.paligemma_qkv = self._fuse_attention_qkv(self.paligemma_layer.self_attn)
+            self.expert_qkv = self._fuse_attention_qkv(self.expert_layer.self_attn)
+
+    @staticmethod
+    def _fuse_attention_qkv(attention):
+        fused = FusedQKVProjection(attention.q_proj, attention.k_proj, attention.v_proj)
+        del attention.q_proj
+        del attention.k_proj
+        del attention.v_proj
+        attention.q_proj = QKVProjectionView(fused, 0)
+        attention.k_proj = QKVProjectionView(fused, 1)
+        attention.v_proj = QKVProjectionView(fused, 2)
+        return fused
 
     def forward(self, prefix, suffix, attention_mask, position_ids, prefix_cond, suffix_cond):
         inputs = [prefix, suffix]
         conditions = [prefix_cond, suffix_cond]
         layers = [self.paligemma_layer, self.expert_layer]
         query_states, key_states, value_states, gates = [], [], [], []
-        for hidden_states, condition, layer in zip(inputs, conditions, layers, strict=True):
+        fused_projections = [
+            getattr(self, "paligemma_qkv", None),
+            getattr(self, "expert_qkv", None),
+        ]
+        for hidden_states, condition, layer, fused_qkv in zip(
+            inputs, conditions, layers, fused_projections, strict=True
+        ):
             normalized, gate = layernorm_forward(
                 layer.input_layernorm, hidden_states, condition
             )
             gates.append(gate)
             hidden_shape = (*normalized.shape[:-1], -1, layer.self_attn.head_dim)
-            query_states.append(
-                layer.self_attn.q_proj(normalized).view(hidden_shape).transpose(1, 2)
-            )
-            key_states.append(
-                layer.self_attn.k_proj(normalized).view(hidden_shape).transpose(1, 2)
-            )
-            value_states.append(
-                layer.self_attn.v_proj(normalized).view(hidden_shape).transpose(1, 2)
-            )
+            if fused_qkv is None:
+                query, key, value = (
+                    layer.self_attn.q_proj(normalized),
+                    layer.self_attn.k_proj(normalized),
+                    layer.self_attn.v_proj(normalized),
+                )
+            else:
+                query, key, value = fused_qkv(normalized)
+            query_states.append(query.view(hidden_shape).transpose(1, 2))
+            key_states.append(key.view(hidden_shape).transpose(1, 2))
+            value_states.append(value.view(hidden_shape).transpose(1, 2))
 
         query_states = torch.cat(query_states, dim=2)
         key_states = torch.cat(key_states, dim=2)
@@ -147,6 +211,7 @@ class JointPaliGemmaWithExpertModel(PaliGemmaWithExpertModel):
     def __init__(self, *args, **kwargs):
         checkpoint_interval = kwargs.pop("checkpoint_interval", 1)
         attention_backend = kwargs.pop("attention_backend", "eager")
+        fuse_qkv = kwargs.pop("fuse_qkv", False)
         super().__init__(*args, **kwargs)
         self.checkpoint_interval = checkpoint_interval
         language_model = self.paligemma.model.language_model
@@ -160,7 +225,9 @@ class JointPaliGemmaWithExpertModel(PaliGemmaWithExpertModel):
         del language_model.layers
         del expert_model.layers
         self.joint_layers = nn.ModuleList(
-            JointDecoderLayer(paligemma_layer, expert_layer, rotary_emb, attention_backend)
+            JointDecoderLayer(
+                paligemma_layer, expert_layer, rotary_emb, attention_backend, fuse_qkv
+            )
             for paligemma_layer, expert_layer in zip(paligemma_layers, expert_layers, strict=True)
         )
         object.__setattr__(language_model, "layers", [layer.paligemma_layer for layer in self.joint_layers])
@@ -316,6 +383,7 @@ class SNVLACore(nn.Module):
             precision=config.dtype,
             checkpoint_interval=config.gradient_checkpointing_interval,
             attention_backend=config.attention_backend,
+            fuse_qkv=config.fuse_qkv,
         )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
@@ -540,6 +608,32 @@ class SNVLAPolicy(PI05Policy):
                 key,
             )
             remapped_state_dict[key] = value
+        if getattr(model_config, "fuse_qkv", False):
+            qkv_parts = {}
+            qkv_pattern = re.compile(
+                r"^(model\.)?paligemma_with_expert\.joint_layers\.(\d+)\."
+                r"(paligemma|expert)_layer\.self_attn\.([qkv])_proj\.(weight|bias)$"
+            )
+            for key in list(remapped_state_dict):
+                match = qkv_pattern.match(key)
+                if match is None:
+                    continue
+                prefix, layer_index, branch, projection, parameter = match.groups()
+                group = (prefix or "", layer_index, branch, parameter)
+                qkv_parts.setdefault(group, {})[projection] = remapped_state_dict.pop(key)
+
+            for (prefix, layer_index, branch, parameter), parts in qkv_parts.items():
+                if set(parts) != {"q", "k", "v"}:
+                    raise ValueError(
+                        f"Incomplete QKV checkpoint group for layer {layer_index} {branch} {parameter}"
+                    )
+                fused_key = (
+                    f"{prefix}paligemma_with_expert.joint_layers.{layer_index}."
+                    f"{branch}_qkv.{parameter}"
+                )
+                remapped_state_dict[fused_key] = torch.cat(
+                    [parts["q"], parts["k"], parts["v"]], dim=0
+                )
         return remapped_state_dict
 
     def __init__(self, config: SNVLAConfig, **kwargs):

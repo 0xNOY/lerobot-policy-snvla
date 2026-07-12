@@ -84,6 +84,7 @@ class SNVLAConfig(PreTrainedConfig):
     training_padding_length: int | None = None
     max_text_loss_tokens: int = 16
     attention_backend: str = "eager"
+    fuse_qkv: bool = False
 
     freeze_vision_encoder: bool = False
     train_expert_only: bool = False

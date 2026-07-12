@@ -6,7 +6,7 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 import lerobot_policy_snvla
 from lerobot_policy_snvla import SNVLAConfig
 from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
-from lerobot_policy_snvla.modeling_snvla import select_text_loss_inputs
+from lerobot_policy_snvla.modeling_snvla import FusedQKVProjection, select_text_loss_inputs
 from lerobot_policy_snvla.processor_snvla import (
     CURRENT_NARRATION,
     OBS_LANGUAGE_TOKEN_AR_MASK,
@@ -165,6 +165,21 @@ def test_select_text_loss_inputs_preserves_weighted_cross_entropy():
     selected_loss = (selected_raw * selected_weights).sum() / selected_weights.sum()
 
     torch.testing.assert_close(selected_loss, full_loss)
+
+
+def test_fused_qkv_projection_matches_individual_linears():
+    torch.manual_seed(0)
+    q_proj = torch.nn.Linear(5, 7, bias=False)
+    k_proj = torch.nn.Linear(5, 3, bias=False)
+    v_proj = torch.nn.Linear(5, 3, bias=False)
+    fused = FusedQKVProjection(q_proj, k_proj, v_proj)
+    hidden = torch.randn(2, 4, 5)
+
+    actual = fused(hidden)
+    expected = (q_proj(hidden), k_proj(hidden), v_proj(hidden))
+
+    for actual_projection, expected_projection in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_projection, expected_projection)
 
 
 def test_processor_step_tolerates_invalid_previous_narrations_json(monkeypatch):
