@@ -230,7 +230,16 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
 
         # Pad sequences to the maximum length in the batch
         lengths = [len(ids) for ids in all_input_ids]
-        max_length = min(max(lengths), self.config.tokenizer_max_length)
+        if self.config.training_padding_length is not None:
+            max_length = self.config.training_padding_length
+            longest = max(lengths)
+            if longest > max_length:
+                raise ValueError(
+                    f"Tokenized training sequence ({longest}) exceeds training_padding_length "
+                    f"({max_length}); increase the fixed padding length to avoid truncating training data"
+                )
+        else:
+            max_length = min(max(lengths), self.config.tokenizer_max_length)
         for i in range(batch_size):
             all_input_ids[i] = all_input_ids[i][:max_length]
             all_attention_masks[i] = all_attention_masks[i][:max_length]

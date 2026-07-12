@@ -79,6 +79,7 @@ class SNVLAConfig(PreTrainedConfig):
     gradient_checkpointing: bool = False
     compile_model: bool = False
     compile_mode: str = "max-autotune"
+    training_padding_length: int | None = None
 
     freeze_vision_encoder: bool = False
     train_expert_only: bool = False
@@ -109,6 +110,15 @@ class SNVLAConfig(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.training_padding_length is not None:
+            if self.training_padding_length <= 0:
+                raise ValueError("training_padding_length must be positive")
+            if self.training_padding_length > self.tokenizer_max_length:
+                raise ValueError("training_padding_length cannot exceed tokenizer_max_length")
+
+        if self.training and self.compile_model and self.training_padding_length is None:
+            raise ValueError("training_padding_length is required when compiling the training model")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
