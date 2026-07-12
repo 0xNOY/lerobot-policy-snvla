@@ -15,6 +15,7 @@ from typing import Callable, Protocol
 
 import numpy as np
 
+from . import collect
 from .collect import BASKET_HALF_EXTENTS, MAX_STEPS_PER_BLOCK, PICK_HEIGHT
 from .events import BasketRegion, EventTracker, NarrationFormat
 from .scripted_expert import T1Expert, get_body_pos
@@ -55,6 +56,44 @@ class Stepper(Protocol):
 
     def narrations(self) -> list[str]: ...
 
+    def metrics(self) -> dict[str, float | str | list]: ...
+
+
+class EpisodeRecorder:
+    """評価ロールアウトを1エピソードずつLeRobotDatasetへ記録する。"""
+
+    def __init__(self, repo_id: str, root: Path | None, camera_hw: int):
+        self.repo_id = repo_id
+        self.root = root
+        self.camera_hw = camera_hw
+        self._dataset = None
+
+    def _get_dataset(self):
+        if self._dataset is None:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+            features = {
+                key: value for key, value in collect._features(self.camera_hw).items() if key != "sim_event"
+            }
+            probability = {"dtype": "float32", "shape": (1,), "names": None}
+            features["prob_bon"] = dict(probability)
+            features["prob_boa"] = dict(probability)
+            self._dataset = LeRobotDataset.create(
+                repo_id=self.repo_id,
+                fps=collect.LIBERO_FPS,
+                features=features,
+                root=self.root,
+                robot_type="panda_libero",
+            )
+        return self._dataset
+
+    def add_frame(self, frame: dict) -> None:
+        self._get_dataset().add_frame(frame)
+
+    def save_episode(self) -> None:
+        if self._dataset is not None:
+            self._dataset.save_episode()
+
 
 class ExpertStepper:
     """スクリプトエキスパートをStepperに適合させる（テスト・較正用）。
@@ -74,6 +113,9 @@ class ExpertStepper:
 
     def narrations(self) -> list[str]:
         return []
+
+    def metrics(self) -> dict[str, float | str | list]:
+        return {}
 
 
 def summarize(results: list[EpisodeResult], n_blocks: int) -> EvalSummary:
@@ -96,6 +138,7 @@ def run_episode(
     task: str,
     category: str = DEFAULT_CATEGORY,
     seed: int = -1,
+    recorder: EpisodeRecorder | None = None,
 ) -> EpisodeResult:
     """1エピソード実行。placedはEventTracker（真値）による計数、successはBDDLゴール。"""
     obs = env.reset()
@@ -115,12 +158,33 @@ def run_episode(
     for frame_idx in range(max_steps):
         tracker.update(frame_idx, {b: get_body_pos(env, b) for b in bodies})
         action = np.asarray(stepper.act(obs, task), dtype=np.float32)
+        metrics = stepper.metrics()
+        if recorder is not None:
+            previous_narrations = (
+                metrics["previous_narrations"]
+                if "previous_narrations" in metrics
+                else stepper.narrations()
+            )
+            recorder.add_frame(
+                {
+                    "action": action,
+                    "observation.state": collect._state8(obs),
+                    **collect._images(obs),
+                    "current_narration": metrics.get("current_narration", ""),
+                    "previous_narrations": json.dumps(previous_narrations),
+                    "prob_bon": np.array([metrics.get("prob_bon", 0.0)], dtype=np.float32),
+                    "prob_boa": np.array([metrics.get("prob_boa", 0.0)], dtype=np.float32),
+                    "task": task,
+                }
+            )
         obs, _reward, _done, _info = env.step(action)
         n_frames = frame_idx + 1
         if env.check_success():
             success = True
             break
     tracker.update(n_frames, {b: get_body_pos(env, b) for b in bodies})
+    if recorder is not None:
+        recorder.save_episode()
     return EpisodeResult(
         seed=seed,
         success=success,
@@ -140,15 +204,24 @@ def evaluate(
     object_name: str | None = None,
     camera_hw: int = 256,
     out_path: Path | None = None,
+    record_root: Path | None = None,
+    record_repo_id: str | None = None,
 ) -> tuple[EvalSummary, list[EpisodeResult]]:
     fmt = NarrationFormat(object_name=object_name or category_display_name(category))
     task = fmt.task_description(n_blocks)
     results: list[EpisodeResult] = []
+    recorder = (
+        EpisodeRecorder(record_repo_id, record_root, camera_hw)
+        if record_root is not None and record_repo_id is not None
+        else None
+    )
     for i in range(n_episodes):
         seed = seed0 + i
         env = make_t1_env(n_blocks=n_blocks, seed=seed, camera_hw=camera_hw, object_category=category)
         try:
-            result = run_episode(env, make_stepper, n_blocks, task, category=category, seed=seed)
+            result = run_episode(
+                env, make_stepper, n_blocks, task, category=category, seed=seed, recorder=recorder
+            )
         finally:
             env.close()
         results.append(result)
@@ -234,11 +307,21 @@ class PolicyStepper:
     def narrations(self) -> list[str]:
         return list(getattr(self.policy, "_previous_narrations", []))
 
+    def metrics(self) -> dict[str, float | str | list]:
+        return dict(getattr(self.policy, "latest_metrics", {}))
+
 
 def build_arg_parser():
     import argparse
 
-    parser = argparse.ArgumentParser(description=__doc__)
+    class RecordArgumentParser(argparse.ArgumentParser):
+        def parse_args(self, args=None, namespace=None):
+            parsed = super().parse_args(args, namespace)
+            if (parsed.record_root is None) != (parsed.record_repo_id is None):
+                self.error("--record-root and --record-repo-id must be specified together")
+            return parsed
+
+    parser = RecordArgumentParser(description=__doc__)
     parser.add_argument(
         "--policy-path", required=True, help="学習済みチェックポイント（pretrained_modelディレクトリ）"
     )
@@ -252,6 +335,8 @@ def build_arg_parser():
     parser.add_argument("--no-narration", action="store_true", help="実況生成を無効化して評価（ablation）")
     parser.add_argument("--n-action-steps", type=int, default=None, help="チェックポイント設定を上書き")
     parser.add_argument("--out", type=Path, default=None, help="結果JSONの出力先")
+    parser.add_argument("--record-root", type=Path, default=None, help="評価データセットの保存先")
+    parser.add_argument("--record-repo-id", default=None, help="評価データセットのrepo ID")
     return parser
 
 
@@ -273,6 +358,8 @@ def main():
         object_name=args.object_name,
         camera_hw=args.camera_hw,
         out_path=args.out,
+        record_root=args.record_root,
+        record_repo_id=args.record_repo_id,
     )
     print(json.dumps(asdict(summary), indent=2))
 

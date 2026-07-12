@@ -38,6 +38,39 @@ def test_build_arg_parser_defaults():
     assert args.device == "cuda"
 
 
+def test_build_arg_parser_accepts_record_options():
+    from pathlib import Path
+
+    from lerobot_policy_snvla.sim.evaluate import build_arg_parser
+
+    args = build_arg_parser().parse_args(
+        [
+            "--policy-path",
+            "outputs/ckpt",
+            "--record-root",
+            "/tmp/eval-records",
+            "--record-repo-id",
+            "local/snvla-eval",
+        ]
+    )
+    assert args.record_root == Path("/tmp/eval-records")
+    assert args.record_repo_id == "local/snvla-eval"
+
+
+@pytest.mark.parametrize(
+    "record_args",
+    [
+        ["--record-root", "/tmp/eval-records"],
+        ["--record-repo-id", "local/snvla-eval"],
+    ],
+)
+def test_build_arg_parser_rejects_only_one_record_option(record_args):
+    from lerobot_policy_snvla.sim.evaluate import build_arg_parser
+
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--policy-path", "outputs/ckpt", *record_args])
+
+
 @pytest.mark.sim
 def test_expert_stepper_succeeds_on_unseen_seed():
     pytest.importorskip("libero", reason="LIBERO not installed (pip install -e '.[sim]')")
@@ -59,3 +92,30 @@ def test_expert_stepper_succeeds_on_unseen_seed():
     assert result.placed == 1
     assert result.n_frames > 0
     assert result.narrations == []
+
+
+@pytest.mark.sim
+def test_expert_stepper_records_lerobot_dataset(tmp_path):
+    pytest.importorskip("libero", reason="LIBERO not installed (pip install -e '.[sim]')")
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    from lerobot_policy_snvla.sim.evaluate import ExpertStepper, evaluate
+
+    repo_id = "local/expert-eval"
+    record_root = tmp_path / "rec"  # LeRobotDataset.createは未作成のrootを要求する
+    summary, results = evaluate(
+        make_stepper=lambda env: ExpertStepper(env, n_blocks=1),
+        n_episodes=1,
+        n_blocks=1,
+        seed0=10_000_123,
+        camera_hw=128,
+        record_root=record_root,
+        record_repo_id=repo_id,
+    )
+
+    dataset = LeRobotDataset(repo_id, root=record_root)
+    assert "current_narration" in dataset.features
+    assert "prob_bon" in dataset.features
+    assert len(dataset) > 0
+    assert results[0].n_frames == len(dataset)
+    assert summary.n_episodes == 1
