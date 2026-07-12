@@ -33,10 +33,11 @@ class NativeBF16FSDPAccelerator(Accelerator):
             )
             os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_root / f"rank_{self.process_index}")
             os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
-            # Compile outside the FSDP wrapper. Compiling the inner policy causes FSDP's
-            # per-step parameter-view refresh to invalidate Dynamo guards every iteration.
-            prepared[0] = torch.compile(
-                prepared[0],
+            # Compile the FSDP/DDP forward in place. Wrapping the distributed module in an
+            # OptimizedModule leaks an `_orig_mod` prefix into checkpoint state-dict names.
+            # Compiling only the bound forward keeps checkpoint serialization unchanged.
+            prepared[0].forward = torch.compile(
+                prepared[0].forward,
                 dynamic=False,
                 options={"triton.cudagraphs": False},
             )
