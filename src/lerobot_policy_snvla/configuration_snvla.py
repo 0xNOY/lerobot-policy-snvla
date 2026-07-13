@@ -62,6 +62,9 @@ class SNVLAConfig(PreTrainedConfig):
     # L = L_text + diffusion_loss_coeff * L_diffusion
     diffusion_loss_coeff: float = 1.0
 
+    state_randomization_text_only_enabled: bool = False
+    state_randomization_text_only_ratio: float = 0.25
+
     # 実況トークンの損失重み（1.0 = 通常、>1.0 = より重要視）
     narration_loss_weight: float = 5.0
 
@@ -124,6 +127,8 @@ class SNVLAConfig(PreTrainedConfig):
 
         if self.max_text_loss_tokens <= 0:
             raise ValueError("max_text_loss_tokens must be positive")
+        if not 0.0 <= self.state_randomization_text_only_ratio <= 1.0:
+            raise ValueError("state_randomization_text_only_ratio must be between 0.0 and 1.0")
         if self.gradient_checkpointing_interval <= 0:
             raise ValueError("gradient_checkpointing_interval must be positive")
         if self.attention_backend not in {"eager", "sdpa"}:

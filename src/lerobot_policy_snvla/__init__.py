@@ -8,7 +8,13 @@ except ImportError as exc:
     raise ImportError("lerobot is not installed. Please install lerobot to use SN-VLA.") from exc
 
 from .configuration_snvla import SNVLAConfig
-from .constants import CURRENT_NARRATION, PREVIOUS_NARRATIONS
+from .constants import (
+    CURRENT_NARRATION,
+    DIFFUSION_LOSS_MASK,
+    NARRATION_TARGET_MASK,
+    PREVIOUS_NARRATIONS,
+    STATE_RANDOMIZED_TEXT_ONLY_MASK,
+)
 from .modeling_snvla import SNVLAPolicy
 from .processor_snvla import make_snvla_pre_post_processors
 
@@ -23,10 +29,15 @@ def _patch_batch_converters() -> None:
 
     def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
         data = original_extract(batch)
-        if CURRENT_NARRATION in batch:
-            data[CURRENT_NARRATION] = batch[CURRENT_NARRATION]
-        if PREVIOUS_NARRATIONS in batch:
-            data[PREVIOUS_NARRATIONS] = batch[PREVIOUS_NARRATIONS]
+        for key in (
+            CURRENT_NARRATION,
+            PREVIOUS_NARRATIONS,
+            DIFFUSION_LOSS_MASK,
+            STATE_RANDOMIZED_TEXT_ONLY_MASK,
+            NARRATION_TARGET_MASK,
+        ):
+            if key in batch:
+                data[key] = batch[key]
         return data
 
     _extract_complementary_data._snvla_patched = True

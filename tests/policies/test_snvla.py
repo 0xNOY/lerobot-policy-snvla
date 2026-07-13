@@ -1,11 +1,19 @@
+import dataclasses
+
 import lerobot.policies.factory as policy_factory
+import pytest
 import torch
-from lerobot.processor import TransitionKey, batch_to_transition
+from lerobot.processor import TransitionKey, batch_to_transition, transition_to_batch
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
 import lerobot_policy_snvla
 from lerobot_policy_snvla import SNVLAConfig
 from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
+from lerobot_policy_snvla.constants import (
+    DIFFUSION_LOSS_MASK,
+    NARRATION_TARGET_MASK,
+    STATE_RANDOMIZED_TEXT_ONLY_MASK,
+)
 from lerobot_policy_snvla.modeling_snvla import FusedQKVProjection, select_text_loss_inputs
 from lerobot_policy_snvla.processor_snvla import (
     CURRENT_NARRATION,
@@ -22,10 +30,14 @@ class DummyTokenizer:
     eos_token = "<eos>"
     pad_token_id = 0
 
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
     def convert_ids_to_tokens(self, token_id: int) -> str:
         return f"<tok{token_id}>"
 
     def __call__(self, text: str, **_) -> dict[str, list[int]]:
+        self.texts.append(text)
         ids = [min(ord(char), 255) for char in text]
         return {"input_ids": ids, "attention_mask": [1] * len(ids)}
 
@@ -47,6 +59,28 @@ def make_test_config() -> SNVLAConfig:
         compile_model=False,
         device="cpu",
     )
+
+
+def make_dummy_processor(monkeypatch, cfg: SNVLAConfig) -> SNVLAPrepareTrainingTokenizerProcessorStep:
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    tokenizer = DummyTokenizer()
+    monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: tokenizer)
+    processor = SNVLAPrepareTrainingTokenizerProcessorStep(config=cfg)
+    processor.tokenizer = tokenizer
+    return processor
+
+
+def make_training_transition(batch_size: int, with_narration: list[bool]):
+    return {
+        TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(batch_size, 6)},
+        TransitionKey.ACTION: torch.zeros(batch_size, 6),
+        TransitionKey.COMPLEMENTARY_DATA: {
+            TASK_KEY: ["pick up the red block"] * batch_size,
+            CURRENT_NARRATION: ["approaching the block" if enabled else "" for enabled in with_narration],
+            PREVIOUS_NARRATIONS: ["[]"] * batch_size,
+        },
+    }
 
 
 def test_snvla_registers_with_lerobot_factory():
@@ -76,6 +110,38 @@ def test_snvla_narration_columns_are_complementary_data():
     assert complementary_data[TASK_KEY] == ["pick up the red block"]
     assert complementary_data[CURRENT_NARRATION] == ["approaching the block"]
     assert complementary_data[PREVIOUS_NARRATIONS] == ["[]"]
+
+
+def test_state_randomization_config_defaults_and_validation():
+    cfg = make_test_config()
+
+    assert cfg.state_randomization_text_only_enabled is False
+    assert cfg.state_randomization_text_only_ratio == pytest.approx(0.25)
+    with pytest.raises(ValueError, match="state_randomization_text_only_ratio"):
+        dataclasses.replace(cfg, state_randomization_text_only_ratio=1.01)
+
+
+def test_snvla_training_masks_are_complementary_data():
+    batch = {
+        "diffusion_loss_mask": torch.tensor([[0.0], [1.0]]),
+        "state_randomized_text_only_mask": torch.tensor([True, False]),
+        "narration_target_mask": torch.tensor([False, True]),
+        "observation.language.mode_mask": torch.tensor([[True, False], [False, True]]),
+    }
+
+    transition = batch_to_transition(batch)
+    complementary = transition[TransitionKey.COMPLEMENTARY_DATA]
+
+    assert complementary["diffusion_loss_mask"].shape == (2, 1)
+    assert complementary["state_randomized_text_only_mask"].tolist() == [True, False]
+    assert complementary["narration_target_mask"].tolist() == [False, True]
+    torch.testing.assert_close(
+        transition[TransitionKey.OBSERVATION]["observation.language.mode_mask"],
+        batch["observation.language.mode_mask"],
+    )
+    converted_batch = transition_to_batch(transition)
+    for key, value in batch.items():
+        torch.testing.assert_close(converted_batch[key], value)
 
 
 def test_snvla_pre_post_processors_are_created_before_pi05_fallback():
@@ -113,6 +179,72 @@ def test_processor_step_tokenizes_narration_without_external_download(monkeypatc
     assert observation[OBS_LANGUAGE_TOKEN_AR_MASK].dtype is torch.bool
     assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].dtype is torch.float32
     assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].sum() > 0
+
+
+def test_processor_randomizes_prompt_state_and_disables_only_action_loss(monkeypatch):
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    cfg = make_test_config()
+    cfg.state_randomization_text_only_enabled = True
+    cfg.state_randomization_text_only_ratio = 1.0
+    processor = make_dummy_processor(monkeypatch, cfg)
+    transition = make_training_transition(batch_size=2, with_narration=[True, False])
+    original_state = transition[TransitionKey.OBSERVATION][OBS_STATE].clone()
+    sampled_states: list[torch.Tensor] = []
+
+    monkeypatch.setattr(processor_snvla.torch, "rand", lambda size: torch.zeros(size))
+
+    def fake_uniform_(tensor: torch.Tensor, low: float, high: float) -> torch.Tensor:
+        values = torch.linspace(low, high, tensor.numel(), dtype=tensor.dtype).reshape_as(tensor)
+        tensor.copy_(values)
+        sampled_states.append(tensor.clone())
+        return tensor
+
+    monkeypatch.setattr(torch.Tensor, "uniform_", fake_uniform_)
+
+    result = processor(transition)
+    observation = result[TransitionKey.OBSERVATION]
+    complementary = result[TransitionKey.COMPLEMENTARY_DATA]
+
+    assert complementary[DIFFUSION_LOSS_MASK].tolist() == [0.0, 0.0]
+    assert complementary[STATE_RANDOMIZED_TEXT_ONLY_MASK].tolist() == [True, True]
+    assert complementary[NARRATION_TARGET_MASK].tolist() == [True, False]
+    assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].sum(dim=1).gt(0).all()
+    assert observation["observation.language.mode_mask"].sum(dim=1).tolist() == [1, 1]
+    torch.testing.assert_close(transition[TransitionKey.OBSERVATION][OBS_STATE], original_state)
+    assert len(sampled_states) == 1
+    assert sampled_states[0].min() >= -1.0
+    assert sampled_states[0].max() <= 1.0
+
+    contexts = [processor.tokenizer.texts[0], processor.tokenizer.texts[2]]
+    assert all("State: 127 127 127 127 127 127;" not in context for context in contexts)
+    context_lengths = [len(context) for context in contexts]
+    for row, context_length in enumerate(context_lengths):
+        assert observation["observation.language.mode_mask"][row, context_length]
+
+
+@pytest.mark.parametrize(
+    ("ratio", "expected_mask"),
+    [
+        (0.0, [False, False]),
+        (1.0, [True, True]),
+    ],
+)
+def test_randomization_ratio_selects_expected_samples(monkeypatch, ratio, expected_mask):
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    cfg = make_test_config()
+    cfg.state_randomization_text_only_enabled = True
+    cfg.state_randomization_text_only_ratio = ratio
+    processor = make_dummy_processor(monkeypatch, cfg)
+    transition = make_training_transition(batch_size=2, with_narration=[True, False])
+
+    monkeypatch.setattr(processor_snvla.torch, "rand", lambda size: torch.full((size,), 0.5))
+    result = processor(transition)
+    complementary = result[TransitionKey.COMPLEMENTARY_DATA]
+
+    assert complementary[STATE_RANDOMIZED_TEXT_ONLY_MASK].tolist() == expected_mask
+    assert complementary[DIFFUSION_LOSS_MASK].tolist() == [float(not value) for value in expected_mask]
 
 
 def test_processor_step_uses_fixed_training_padding_length(monkeypatch):

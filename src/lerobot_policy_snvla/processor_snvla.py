@@ -34,9 +34,13 @@ from .compat import EnvTransition, FeatureType, PipelineFeatureType, PolicyFeatu
 from .configuration_snvla import SNVLAConfig
 from .constants import (
     CURRENT_NARRATION,
+    DIFFUSION_LOSS_MASK,
+    NARRATION_TARGET_MASK,
+    OBS_LANGUAGE_MODE_MASK,
     OBS_LANGUAGE_TOKEN_AR_MASK,
     OBS_LANGUAGE_TOKEN_LOSS_MASK,
     PREVIOUS_NARRATIONS,
+    STATE_RANDOMIZED_TEXT_ONLY_MASK,
 )
 
 # 学習データセットが提供するキー
@@ -152,16 +156,40 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
             logging.warning(f"'{PREVIOUS_NARRATIONS}' (ground-truth) not found.")
             previous_narrations_list = [""] * state.shape[0]
 
+        batch_size = state.shape[0]
+        complementary = transition[TransitionKey.COMPLEMENTARY_DATA]
+        randomized_mask = torch.zeros(batch_size, dtype=torch.bool)
+        if self.config.state_randomization_text_only_enabled:
+            randomized_mask = (
+                torch.rand(batch_size) < self.config.state_randomization_text_only_ratio
+            )
+
+        base_diffusion_mask = complementary.get(DIFFUSION_LOSS_MASK)
+        if base_diffusion_mask is None:
+            base_diffusion_mask = torch.ones(batch_size, dtype=torch.float32)
+        else:
+            base_diffusion_mask = torch.as_tensor(base_diffusion_mask, dtype=torch.float32).view(
+                batch_size
+            )
+        complementary[DIFFUSION_LOSS_MASK] = base_diffusion_mask * (~randomized_mask).float()
+        complementary[STATE_RANDOMIZED_TEXT_ONLY_MASK] = randomized_mask
+
+        prompt_states = state
+        if randomized_mask.any():
+            randomized_states = torch.empty_like(state).uniform_(-1.0, 1.0)
+            prompt_states = torch.where(randomized_mask[:, None], randomized_states, state)
+
         # Discretize states for the entire batch
-        discretized_states = discretize_state(state, max_dim=self.config.max_state_dim)
+        discretized_states = discretize_state(prompt_states, max_dim=self.config.max_state_dim)
 
         # Process each item in the batch
         all_input_ids = []
         all_attention_masks = []
         all_ar_masks = []
         all_loss_masks = []
+        all_mode_masks = []
+        narration_target_mask = []
 
-        batch_size = state.shape[0]
         for i in range(batch_size):
             # Get data for this batch item
             task = tasks[i] if isinstance(tasks, list) else tasks
@@ -191,6 +219,7 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
             else:
                 # 行動生成モード
                 target_str = f"{self.begin_of_action_token}"
+            narration_target_mask.append(bool(current_narration_clean))
 
             context_tokens = self.tokenizer(
                 context_str,
@@ -222,11 +251,15 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
                 suffix_loss_mask = [1.0] * len(target_tokens["input_ids"])
 
             token_loss_mask = prefix_loss_mask + suffix_loss_mask
+            mode_mask = [False] * len(context_tokens["input_ids"]) + [True] + [False] * (
+                len(target_tokens["input_ids"]) - 1
+            )
 
             all_input_ids.append(input_ids)
             all_attention_masks.append(attention_mask)
             all_ar_masks.append(token_ar_mask)
             all_loss_masks.append(token_loss_mask)
+            all_mode_masks.append(mode_mask)
 
         # Pad sequences to the maximum length in the batch
         lengths = [len(ids) for ids in all_input_ids]
@@ -245,6 +278,7 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
             all_attention_masks[i] = all_attention_masks[i][:max_length]
             all_ar_masks[i] = all_ar_masks[i][:max_length]
             all_loss_masks[i] = all_loss_masks[i][:max_length]
+            all_mode_masks[i] = all_mode_masks[i][:max_length]
 
             pad_length = max_length - len(all_input_ids[i])
             if pad_length > 0:
@@ -252,6 +286,7 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
                 all_attention_masks[i] += [0] * pad_length
                 all_ar_masks[i] += [0] * pad_length
                 all_loss_masks[i] += [0.0] * pad_length
+                all_mode_masks[i] += [False] * pad_length
 
         # Convert to tensors and stack
         obs = transition.get(TransitionKey.OBSERVATION, {})
@@ -259,6 +294,8 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
         obs[OBS_LANGUAGE_ATTENTION_MASK] = torch.tensor(all_attention_masks, dtype=torch.bool)
         obs[OBS_LANGUAGE_TOKEN_AR_MASK] = torch.tensor(all_ar_masks, dtype=torch.bool)
         obs[OBS_LANGUAGE_TOKEN_LOSS_MASK] = torch.tensor(all_loss_masks, dtype=torch.float32)
+        obs[OBS_LANGUAGE_MODE_MASK] = torch.tensor(all_mode_masks, dtype=torch.bool)
+        complementary[NARRATION_TARGET_MASK] = torch.tensor(narration_target_mask, dtype=torch.bool)
 
         transition[TransitionKey.OBSERVATION] = obs
         return transition
@@ -278,6 +315,9 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
             type=FeatureType.STATE, shape=(max_len,)
         )
         features["observation"][OBS_LANGUAGE_TOKEN_LOSS_MASK] = PolicyFeature(
+            type=FeatureType.STATE, shape=(max_len,)
+        )
+        features["observation"][OBS_LANGUAGE_MODE_MASK] = PolicyFeature(
             type=FeatureType.STATE, shape=(max_len,)
         )
         return features
