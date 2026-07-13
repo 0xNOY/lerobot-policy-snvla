@@ -28,11 +28,41 @@ from tqdm import tqdm
 
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor.rename_processor import rename_stats
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.utils import init_logging
+
+
+def action_chunk_metrics(
+    predicted: Tensor, target: Tensor, is_pad: Tensor
+) -> dict[str, float]:
+    """Compute aligned action errors while excluding padded timesteps."""
+    if predicted.ndim != 2 or target.ndim != 2:
+        raise ValueError(
+            f"predicted and target must have shape (T, D), got {predicted.shape} and {target.shape}"
+        )
+    if predicted.shape != target.shape:
+        raise ValueError(
+            f"predicted and target must have identical shapes, got {predicted.shape} and {target.shape}"
+        )
+    if is_pad.ndim != 1 or is_pad.shape[0] != predicted.shape[0]:
+        raise ValueError(
+            f"is_pad must have shape ({predicted.shape[0]},), got {is_pad.shape}"
+        )
+
+    valid = ~is_pad.to(device=predicted.device, dtype=torch.bool)
+    if not valid.any():
+        raise ValueError("action chunk contains no unpadded timesteps")
+
+    error = predicted[valid].float() - target.to(predicted.device)[valid].float()
+    absolute_error = error.abs()
+    return {
+        "mse": float(error.square().mean().item()),
+        "mae": float(absolute_error.mean().item()),
+        "max_abs_error": float(absolute_error.max().item()),
+    }
 
 
 @dataclass
@@ -97,10 +127,14 @@ class SNVLADebugger:
 
         # Load dataset
         self.logger.info(f"Loading dataset: {config.dataset.repo_id}")
+        dataset_meta = LeRobotDatasetMetadata(config.dataset.repo_id, root=config.dataset.root)
         self.dataset = LeRobotDataset(
             config.dataset.repo_id,
             root=config.dataset.root,
             episodes=[config.dataset.episode_idx],
+            delta_timestamps={
+                ACTION: [i / dataset_meta.fps for i in range(config.policy.chunk_size)]
+            },
         )
         self.logger.info(
             f"Dataset loaded: {len(self.dataset)} frames in episode {config.dataset.episode_idx}"
@@ -226,8 +260,10 @@ class SNVLADebugger:
             else:
                 batch[key] = [value] if not isinstance(value, list) else value
 
-        # Ground truth action
-        gt_action = data[ACTION].cpu().numpy().tolist()
+        # Ground truth action chunk and episode-boundary padding mask
+        target_action_tensor = data[ACTION]
+        action_is_pad = data["action_is_pad"]
+        gt_action = target_action_tensor.float().cpu().numpy().tolist()
 
         # Run preprocessor
         start_time = time.time()
@@ -286,23 +322,29 @@ class SNVLADebugger:
         if not is_narration:
             current_pos_id = last_token_idx.view(-1, 1)
 
-        self.policy._act(kv_cache, prefix_pad_masks, bsize, current_pos_id)
+        original_n_action_steps = self.policy.config.n_action_steps
+        self.policy.config.n_action_steps = self.policy.config.chunk_size
+        try:
+            self.policy._act(kv_cache, prefix_pad_masks, bsize, current_pos_id)
+        finally:
+            self.policy.config.n_action_steps = original_n_action_steps
         action_time = time.time() - start_time
 
-        # Get predicted action
-        pred_action_tensor = self.policy._action_queue.popleft()
+        # Get the full predicted action chunk rather than a single queued action.
+        pred_action_tensor = torch.cat(
+            [self.policy._action_queue.popleft() for _ in range(self.policy.config.chunk_size)],
+            dim=0,
+        )
         # Unnormalize the action
         pred_action_unnormalized = self.postprocessor(pred_action_tensor)
-        pred_action = pred_action_unnormalized.cpu().numpy().tolist()
+        pred_action = pred_action_unnormalized.float().cpu().numpy().tolist()
 
-        # Compute action error
-        action_error = {
-            "mse": float(((torch.tensor(gt_action) - torch.tensor(pred_action)) ** 2).mean().item()),
-            "mae": float(torch.abs(torch.tensor(gt_action) - torch.tensor(pred_action)).mean().item()),
-            "max_abs_error": float(
-                torch.abs(torch.tensor(gt_action) - torch.tensor(pred_action)).max().item()
-            ),
-        }
+        # Compute exact time-aligned error, excluding repeated episode-boundary padding.
+        action_error = action_chunk_metrics(
+            pred_action_unnormalized,
+            target_action_tensor,
+            action_is_pad,
+        )
 
         # Prepare frame statistics
         frame_stats = {
