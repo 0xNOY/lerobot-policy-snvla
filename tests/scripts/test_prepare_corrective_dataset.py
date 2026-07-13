@@ -673,6 +673,7 @@ def _prepare_validation_mixture(
     *,
     corrective_pattern: tuple[str, ...] = ("policy", "expert", "expert"),
     task: str = "Put 1 object into the basket.",
+    corrective_task: str | None = None,
 ) -> tuple[Path, dict]:
     from lerobot_policy_snvla.scripts.prepare_corrective_dataset import prepare_dataset
 
@@ -685,7 +686,7 @@ def _prepare_validation_mixture(
         "local/corrective",
         episodes=1,
         corrective=True,
-        task=task,
+        task=corrective_task or task,
         controller_patterns=[corrective_pattern],
     )
     manifest = prepare_dataset(
@@ -771,6 +772,19 @@ def test_validate_only_rejects_truncated_multi_object_episode(tmp_path):
     )
 
     with pytest.raises(ValueError, match="expected 2 picked/placed pairs"):
+        _validate_only(root)
+
+
+def test_validate_only_rejects_manifest_count_hiding_truncated_multi_object_episode(tmp_path):
+    root, manifest = _prepare_validation_mixture(
+        tmp_path, corrective_task="Put 2 objects into the basket."
+    )
+    episode_id = manifest["episode_kinds"].index("corrective")
+    manifest["episode_object_counts"][episode_id] = 1
+    manifest_path = root / "meta" / "corrective_mixture_manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="manifest object count.*declared object count"):
         _validate_only(root)
 
 

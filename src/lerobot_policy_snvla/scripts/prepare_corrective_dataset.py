@@ -186,30 +186,36 @@ def _episode_records(sources: list[tuple[str, Path, Any]]) -> list[tuple[str, An
     return records
 
 
-def _declared_object_count(source: Any, episode_id: int, task: str) -> int:
-    """Read the task's declared object count without inferring it from observed events."""
+def _extract_declared_object_count(
+    task: str, narrations: Iterable[Any], *, episode_label: str
+) -> int:
+    """Read a declared object count without inferring it from observed events."""
     declarations: set[int] = set()
     task_match = re.fullmatch(r"Put ([1-9]\d*) .+ into the basket\.", task.strip())
     if task_match:
         declarations.add(int(task_match.group(1)))
 
-    start = int(source.meta.episodes["dataset_from_index"][episode_id])
-    stop = int(source.meta.episodes["dataset_to_index"][episode_id])
-    narrations = source.hf_dataset["current_narration"][start:stop]
     for narration in narrations:
         declarations.update(
             int(match.group(1))
             for match in re.finditer(r"\b[1-9]\d* of ([1-9]\d*)\b", narration or "")
         )
     if not declarations:
-        raise ValueError(
-            f"source episode {episode_id} has no authoritative object count in task or narration"
-        )
+        raise ValueError(f"{episode_label} has no authoritative object count in task or narration")
     if len(declarations) != 1:
-        raise ValueError(
-            f"source episode {episode_id} has inconsistent object counts: {sorted(declarations)}"
-        )
+        raise ValueError(f"{episode_label} has inconsistent object counts: {sorted(declarations)}")
     return declarations.pop()
+
+
+def _declared_object_count(source: Any, episode_id: int, task: str) -> int:
+    """Read a source episode's declared object count."""
+    start = int(source.meta.episodes["dataset_from_index"][episode_id])
+    stop = int(source.meta.episodes["dataset_to_index"][episode_id])
+    return _extract_declared_object_count(
+        task,
+        source.hf_dataset["current_narration"][start:stop],
+        episode_label=f"source episode {episode_id}",
+    )
 
 
 def _stratified_episode_order(
@@ -653,11 +659,21 @@ def validate_dataset(
         raise ValueError("manifest episode object counts are invalid")
     for episode_id in range(dataset.num_episodes):
         frames = list(_episode_frames(dataset, episode_id))
+        declared_object_count = _extract_declared_object_count(
+            frames[0]["task"] if frames else "",
+            (frame["current_narration"] for frame in frames),
+            episode_label=f"destination episode {episode_id}",
+        )
+        if episode_object_counts[episode_id] != declared_object_count:
+            raise ValueError(
+                f"episode {episode_id} manifest object count {episode_object_counts[episode_id]} "
+                f"does not match declared object count {declared_object_count}"
+            )
         validate_episode_frames(
             frames,
             episode_id=episode_id,
             episode_kind=episode_kinds[episode_id],
-            expected_object_count=episode_object_counts[episode_id],
+            expected_object_count=declared_object_count,
         )
         actual_episode_kinds.append(
             "corrective" if any(frame["controller_source"] == "policy" for frame in frames) else "success"
