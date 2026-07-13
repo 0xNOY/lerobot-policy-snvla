@@ -9,14 +9,16 @@
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
 
 import numpy as np
 
 from . import collect
 from .collect import BASKET_HALF_EXTENTS, MAX_STEPS_PER_BLOCK, PICK_HEIGHT
+from .eval_metrics import NarrationAudit
 from .events import BasketRegion, EventTracker, NarrationFormat
 from .scripted_expert import T1Expert, get_body_pos
 from .t1_count_blocks import (
@@ -38,6 +40,10 @@ class EpisodeResult:
     n_frames: int
     wall_time_s: float
     narrations: list[str] = field(default_factory=list)
+    false_pick_done: int = 0
+    false_place_done: int = 0
+    false_task_completed: int = 0
+    min_eef_object_distance: float = 0.0
 
 
 @dataclass
@@ -47,6 +53,10 @@ class EvalSummary:
     success_rate: float
     mean_placed: float
     mean_count_error: float
+    total_false_pick_done: int = 0
+    total_false_place_done: int = 0
+    total_false_task_completed: int = 0
+    mean_min_eef_object_distance: float = 0.0
 
 
 class Stepper(Protocol):
@@ -76,8 +86,12 @@ class EpisodeRecorder:
                 key: value for key, value in collect._features(self.camera_hw).items() if key != "sim_event"
             }
             probability = {"dtype": "float32", "shape": (1,), "names": None}
+            truth_count = {"dtype": "int64", "shape": (1,), "names": None}
             features["prob_bon"] = dict(probability)
             features["prob_boa"] = dict(probability)
+            features["eef_object_distance"] = dict(probability)
+            features["truth_picked"] = dict(truth_count)
+            features["truth_placed"] = dict(truth_count)
             self._dataset = LeRobotDataset.create(
                 repo_id=self.repo_id,
                 fps=collect.LIBERO_FPS,
@@ -121,14 +135,59 @@ class ExpertStepper:
 def summarize(results: list[EpisodeResult], n_blocks: int) -> EvalSummary:
     n = len(results)
     if n == 0:
-        return EvalSummary(0, n_blocks, 0.0, 0.0, 0.0)
+        return EvalSummary(
+            n_episodes=0,
+            n_blocks=n_blocks,
+            success_rate=0.0,
+            mean_placed=0.0,
+            mean_count_error=0.0,
+        )
     return EvalSummary(
         n_episodes=n,
         n_blocks=n_blocks,
         success_rate=sum(r.success for r in results) / n,
         mean_placed=sum(r.placed for r in results) / n,
         mean_count_error=sum(abs(r.placed - n_blocks) for r in results) / n,
+        total_false_pick_done=sum(r.false_pick_done for r in results),
+        total_false_place_done=sum(r.false_place_done for r in results),
+        total_false_task_completed=sum(r.false_task_completed for r in results),
+        mean_min_eef_object_distance=sum(r.min_eef_object_distance for r in results) / n,
     )
+
+
+def _distance_to_unpicked_object(
+    obs, positions: dict[str, np.ndarray], picked_objects: set[str]
+) -> float | None:
+    candidates = [position for name, position in positions.items() if name not in picked_objects]
+    if not candidates:
+        return None
+    eef = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
+    return min(float(np.linalg.norm(eef - position)) for position in candidates)
+
+
+def _observe_new_narrations(
+    audit: NarrationAudit,
+    history: list[str],
+    audited_history: list[str],
+    metrics: dict[str, float | str | list],
+    last_metric_fragment: str,
+    picked: int,
+    placed: int,
+    n_blocks: int,
+) -> str:
+    """Audit append-only history plus a metrics-only fragment at most once."""
+    if history[: len(audited_history)] == audited_history:
+        for fragment in history[len(audited_history) :]:
+            audit.observe(fragment, picked, placed, n_blocks)
+            audited_history.append(fragment)
+
+    current = metrics.get("current_narration", "")
+    if not isinstance(current, str) or not current:
+        return last_metric_fragment
+    if (not history or current != history[-1]) and current != last_metric_fragment:
+        audit.observe(current, picked, placed, n_blocks)
+        audited_history.append(current)
+    return current
 
 
 def run_episode(
@@ -155,16 +214,38 @@ def run_episode(
     t0 = time.perf_counter()
     success = False
     n_frames = 0
+    audit = NarrationAudit()
+    audited_history: list[str] = []
+    last_metric_fragment = ""
+    min_eef_object_distance: float | None = None
     for frame_idx in range(max_steps):
-        tracker.update(frame_idx, {b: get_body_pos(env, b) for b in bodies})
+        positions = {b: get_body_pos(env, b) for b in bodies}
+        tracker.update(frame_idx, positions)
+        picked = tracker.count("picked")
+        placed = tracker.count("placed")
+        picked_objects = {event.object_name for event in tracker.events if event.kind == "picked"}
+        eef_object_distance = _distance_to_unpicked_object(obs, positions, picked_objects)
+        if eef_object_distance is not None:
+            min_eef_object_distance = (
+                eef_object_distance
+                if min_eef_object_distance is None
+                else min(min_eef_object_distance, eef_object_distance)
+            )
         action = np.asarray(stepper.act(obs, task), dtype=np.float32)
         metrics = stepper.metrics()
+        narration_history = stepper.narrations()
+        last_metric_fragment = _observe_new_narrations(
+            audit,
+            narration_history,
+            audited_history,
+            metrics,
+            last_metric_fragment,
+            picked,
+            placed,
+            n_blocks,
+        )
         if recorder is not None:
-            previous_narrations = (
-                metrics["previous_narrations"]
-                if "previous_narrations" in metrics
-                else stepper.narrations()
-            )
+            previous_narrations = metrics.get("previous_narrations", narration_history)
             recorder.add_frame(
                 {
                     "action": action,
@@ -174,6 +255,12 @@ def run_episode(
                     "previous_narrations": json.dumps(previous_narrations),
                     "prob_bon": np.array([metrics.get("prob_bon", 0.0)], dtype=np.float32),
                     "prob_boa": np.array([metrics.get("prob_boa", 0.0)], dtype=np.float32),
+                    "eef_object_distance": np.array(
+                        [eef_object_distance if eef_object_distance is not None else 0.0],
+                        dtype=np.float32,
+                    ),
+                    "truth_picked": np.array([picked], dtype=np.int64),
+                    "truth_placed": np.array([placed], dtype=np.int64),
                     "task": task,
                 }
             )
@@ -192,6 +279,12 @@ def run_episode(
         n_frames=n_frames,
         wall_time_s=time.perf_counter() - t0,
         narrations=stepper.narrations(),
+        false_pick_done=audit.false_pick_done,
+        false_place_done=audit.false_place_done,
+        false_task_completed=audit.false_task_completed,
+        min_eef_object_distance=(
+            min_eef_object_distance if min_eef_object_distance is not None else 0.0
+        ),
     )
 
 
