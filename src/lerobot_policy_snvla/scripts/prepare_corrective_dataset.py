@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -185,6 +186,32 @@ def _episode_records(sources: list[tuple[str, Path, Any]]) -> list[tuple[str, An
     return records
 
 
+def _declared_object_count(source: Any, episode_id: int, task: str) -> int:
+    """Read the task's declared object count without inferring it from observed events."""
+    declarations: set[int] = set()
+    task_match = re.fullmatch(r"Put ([1-9]\d*) .+ into the basket\.", task.strip())
+    if task_match:
+        declarations.add(int(task_match.group(1)))
+
+    start = int(source.meta.episodes["dataset_from_index"][episode_id])
+    stop = int(source.meta.episodes["dataset_to_index"][episode_id])
+    narrations = source.hf_dataset["current_narration"][start:stop]
+    for narration in narrations:
+        declarations.update(
+            int(match.group(1))
+            for match in re.finditer(r"\b[1-9]\d* of ([1-9]\d*)\b", narration or "")
+        )
+    if not declarations:
+        raise ValueError(
+            f"source episode {episode_id} has no authoritative object count in task or narration"
+        )
+    if len(declarations) != 1:
+        raise ValueError(
+            f"source episode {episode_id} has inconsistent object counts: {sorted(declarations)}"
+        )
+    return declarations.pop()
+
+
 def _stratified_episode_order(
     records: list[tuple[str, Any, int, str]], eval_split: float = 0.1
 ) -> list[tuple[str, Any, int, str]]:
@@ -313,6 +340,10 @@ def prepare_dataset(
     prepared = LeRobotDataset(dst_repo_id, root=dst_root)
     train_ids, eval_ids = episode_holdout_partition(prepared, eval_split=0.1)
     episode_kinds = [record[0] for record in ordered_records]
+    episode_object_counts = [
+        _declared_object_count(source, episode_id, task)
+        for _kind, source, episode_id, task in ordered_records
+    ]
 
     def split_composition(episode_ids: Iterable[int]) -> dict[str, int]:
         ids = list(episode_ids)
@@ -332,6 +363,7 @@ def prepare_dataset(
         "total_episodes": prepared.num_episodes,
         "total_frames": prepared.meta.total_frames,
         "episode_kinds": episode_kinds,
+        "episode_object_counts": episode_object_counts,
         "sources": [
             {
                 "kind": kind,
@@ -369,9 +401,15 @@ def _parse_narration_history(value: Any, *, episode_id: int, frame_id: int) -> l
     return history
 
 
-def validate_episode_frames(frames: Iterable[Mapping[str, Any]], *, episode_id: int) -> None:
+def validate_episode_frames(
+    frames: Iterable[Mapping[str, Any]],
+    *,
+    episode_id: int,
+    episode_kind: str | None = None,
+    expected_object_count: int | None = None,
+) -> None:
     """Validate training metadata and forward-only oracle events in one episode."""
-    expected_kind = "picked"
+    expected_event_kind = "picked"
     expected_ordinal = 1
     previous_event_frame = -1
     observed_event = False
@@ -380,6 +418,8 @@ def validate_episode_frames(frames: Iterable[Mapping[str, Any]], *, episode_id: 
     last_event_position = -1
     last_placed_position = -1
     completion_positions: list[int] = []
+    controllers: list[str] = []
+    picked_object_names: dict[int, str] = {}
     for frame_id, frame in enumerate(frames):
         task = frame.get("task")
         if not isinstance(task, str) or not task.strip():
@@ -400,6 +440,7 @@ def validate_episode_frames(frames: Iterable[Mapping[str, Any]], *, episode_id: 
             raise ValueError(
                 f"episode {episode_id} frame {frame_id} mask is inconsistent with controller_source"
             )
+        controllers.append(controller_source)
         _parse_narration_history(
             frame.get("previous_narrations"), episode_id=episode_id, frame_id=frame_id
         )
@@ -417,7 +458,7 @@ def validate_episode_frames(frames: Iterable[Mapping[str, Any]], *, episode_id: 
                 raise ValueError(f"episode {episode_id} frame {frame_id} event JSON must be an object")
             kind = event.get("kind")
             ordinal = event.get("ordinal")
-            if kind != expected_kind or ordinal != expected_ordinal:
+            if kind != expected_event_kind or ordinal != expected_ordinal:
                 raise ValueError(
                     f"episode {episode_id} event ordering is not picked/placed forward-only"
                 )
@@ -425,15 +466,25 @@ def validate_episode_frames(frames: Iterable[Mapping[str, Any]], *, episode_id: 
             if not isinstance(event_frame, int) or event_frame < previous_event_frame:
                 raise ValueError(f"episode {episode_id} event frame ordering moves backward")
             previous_event_frame = event_frame
+            object_name = event.get("object_name")
+            if not isinstance(object_name, str) or not object_name:
+                raise ValueError(f"episode {episode_id} event has an invalid object_name")
             observed_event = True
             event_this_frame = True
             last_event_position = frame_id
             if kind == "picked":
-                expected_kind = "placed"
+                if object_name in picked_object_names.values():
+                    raise ValueError(f"episode {episode_id} picks the same object more than once")
+                picked_object_names[expected_ordinal] = object_name
+                expected_event_kind = "placed"
             else:
+                if picked_object_names[expected_ordinal] != object_name:
+                    raise ValueError(
+                        f"episode {episode_id} picked/placed pair {expected_ordinal} names differ"
+                    )
                 observed_placed = True
                 last_placed_position = frame_id
-                expected_kind = "picked"
+                expected_event_kind = "picked"
                 expected_ordinal += 1
 
         narration = frame.get("current_narration") or ""
@@ -452,10 +503,38 @@ def validate_episode_frames(frames: Iterable[Mapping[str, Any]], *, episode_id: 
         previous_narration = narration
     if not observed_event:
         raise ValueError(f"episode {episode_id} has no oracle events")
-    if expected_kind == "placed":
+    if expected_event_kind == "placed":
         raise ValueError(f"episode {episode_id} has an incomplete picked/placed event pair")
-    if any(position < max(last_event_position, last_placed_position) for position in completion_positions):
-        raise ValueError(f"episode {episode_id} completes before the final placed event")
+    observed_pair_count = expected_ordinal - 1
+    if expected_object_count is not None and observed_pair_count != expected_object_count:
+        raise ValueError(
+            f"episode {episode_id} expected {expected_object_count} picked/placed pairs, "
+            f"found {observed_pair_count}"
+        )
+    if not completion_positions:
+        raise ValueError(f"episode {episode_id} is missing the Task completed marker")
+    if any(position <= max(last_event_position, last_placed_position) for position in completion_positions):
+        raise ValueError(
+            f"episode {episode_id} completion must occur after the final placed event"
+        )
+    if episode_kind == "success" and any(controller != "expert" for controller in controllers):
+        raise ValueError(
+            f"success episode {episode_id} must use expert controller and mask 1 throughout; "
+            "manifest episode provenance does not match dataset frames"
+        )
+    if episode_kind == "corrective":
+        try:
+            first_expert = controllers.index("expert")
+        except ValueError as exc:
+            raise ValueError(
+                f"corrective episode {episode_id} must have a nonempty policy prefix and expert suffix"
+            ) from exc
+        if first_expert == 0 or any(
+            controller != "policy" for controller in controllers[:first_expert]
+        ) or any(controller != "expert" for controller in controllers[first_expert:]):
+            raise ValueError(
+                f"corrective episode {episode_id} must have a nonempty policy prefix and expert suffix"
+            )
 
 
 def _episode_frames(dataset: Any, episode_id: int) -> Iterable[dict[str, Any]]:
@@ -558,9 +637,28 @@ def validate_dataset(
 
     mask_enabled = 0
     actual_episode_kinds: list[str] = []
+    episode_kinds = manifest.get("episode_kinds")
+    if (
+        not isinstance(episode_kinds, list)
+        or len(episode_kinds) != dataset.num_episodes
+        or any(kind not in {"success", "corrective"} for kind in episode_kinds)
+    ):
+        raise ValueError("manifest episode provenance is invalid")
+    episode_object_counts = manifest.get("episode_object_counts")
+    if (
+        not isinstance(episode_object_counts, list)
+        or len(episode_object_counts) != dataset.num_episodes
+        or any(not isinstance(count, int) or count < 1 for count in episode_object_counts)
+    ):
+        raise ValueError("manifest episode object counts are invalid")
     for episode_id in range(dataset.num_episodes):
         frames = list(_episode_frames(dataset, episode_id))
-        validate_episode_frames(frames, episode_id=episode_id)
+        validate_episode_frames(
+            frames,
+            episode_id=episode_id,
+            episode_kind=episode_kinds[episode_id],
+            expected_object_count=episode_object_counts[episode_id],
+        )
         actual_episode_kinds.append(
             "corrective" if any(frame["controller_source"] == "policy" for frame in frames) else "success"
         )

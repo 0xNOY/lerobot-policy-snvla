@@ -58,10 +58,10 @@ def _make_source(
     *,
     episodes: int,
     corrective: bool,
-    task: str = "put object in basket",
+    task: str = "Put 1 object into the basket.",
     features: dict | None = None,
     robot_type: str = "panda_libero",
-    controller_patterns: list[tuple[str, str]] | None = None,
+    controller_patterns: list[tuple[str, ...]] | None = None,
 ) -> None:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -79,13 +79,21 @@ def _make_source(
         fps=20,
         features=source_features,
         robot_type=robot_type,
-        use_videos=False,
+        use_videos=any(feature["dtype"] == "video" for feature in source_features.values()),
     )
     for episode in range(episodes):
         history: list[str] = []
-        for frame_index, (kind, narration) in enumerate(
-            (("picked", " (done)\n"), ("placed", "Task completed.\n"))
-        ):
+        frame_count = len(controller_patterns[episode]) if controller_patterns is not None else 3
+        for frame_index in range(frame_count):
+            placement_frame = frame_count - 2 if frame_count >= 3 else frame_count - 1
+            kind = "picked" if frame_index == 0 else "placed" if frame_index == placement_frame else ""
+            narration = (
+                " (done)\n"
+                if frame_index in {0, placement_frame}
+                else "Task completed.\n"
+                if frame_index == frame_count - 1
+                else ""
+            )
             frame = {
                 "action": np.full(
                     source_features["action"]["shape"], episode + frame_index, dtype=np.float32
@@ -93,13 +101,17 @@ def _make_source(
                 "observation.state": np.array([frame_index, episode], dtype=np.float32),
                 "current_narration": narration,
                 "previous_narrations": json.dumps(history),
-                "sim_event": json.dumps(
-                    {"kind": kind, "object_name": "obj", "frame": frame_index, "ordinal": 1}
+                "sim_event": (
+                    json.dumps(
+                        {"kind": kind, "object_name": "obj", "frame": frame_index, "ordinal": 1}
+                    )
+                    if kind
+                    else ""
                 ),
                 "task": task,
             }
             for feature_name, feature in source_features.items():
-                if feature["dtype"] == "image":
+                if feature["dtype"] in {"image", "video"}:
                     frame[feature_name] = np.full(
                         feature["shape"], episode + frame_index, dtype=np.uint8
                     )
@@ -127,6 +139,26 @@ def _tree_hashes(root: Path) -> dict[str, str]:
     }
 
 
+def _rewrite_episode_columns(root: Path, episode_id: int, **updates: list) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    parquet_path = next((root / "data").rglob("*.parquet"))
+    table = pq.read_table(parquet_path)
+    episode_indices = table.column("episode_index").to_pylist()
+    positions = [index for index, value in enumerate(episode_indices) if value == episode_id]
+    for name, episode_values in updates.items():
+        assert len(episode_values) == len(positions)
+        values = table.column(name).to_pylist()
+        for position, value in zip(positions, episode_values, strict=True):
+            values[position] = value
+        field = table.schema.field(name)
+        table = table.set_column(
+            table.schema.get_field_index(name), name, pa.array(values, type=field.type)
+        )
+    pq.write_table(table, parquet_path)
+
+
 def test_prepare_dataset_creates_valid_immutable_common_schema_mixture(tmp_path):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -151,30 +183,34 @@ def test_prepare_dataset_creates_valid_immutable_common_schema_mixture(tmp_path)
     assert {root: _tree_hashes(root) for root in before} == before
     dataset = LeRobotDataset("local/mixture", root=destination_root)
     assert dataset.num_episodes == 10
-    assert dataset.hf_dataset["episode_index"] == [episode for episode in range(10) for _ in range(2)]
+    assert dataset.hf_dataset["episode_index"] == [episode for episode in range(10) for _ in range(3)]
     assert dataset.features["diffusion_loss_mask"]["dtype"] == "float32"
     assert dataset.features["controller_source"]["dtype"] == "string"
     assert [float(value) for value in dataset.hf_dataset["diffusion_loss_mask"]] == [
-        *([1.0] * 16),
+        *([1.0] * 24),
         0.0,
+        1.0,
+        1.0,
         1.0,
         1.0,
         1.0,
     ]
     assert dataset.hf_dataset["controller_source"] == [
-        *(["expert"] * 16),
+        *(["expert"] * 24),
         "policy",
+        "expert",
+        "expert",
         "expert",
         "expert",
         "expert",
     ]
     assert dataset.hf_dataset["current_narration"][-2:] == [" (done)\n", "Task completed.\n"]
-    assert json.loads(dataset.hf_dataset["sim_event"][-1])["kind"] == "placed"
+    assert json.loads(dataset.hf_dataset["sim_event"][-2])["kind"] == "placed"
 
     manifest_path = destination_root / "meta" / "corrective_mixture_manifest.json"
     assert json.loads(manifest_path.read_text()) == manifest
     assert manifest["composition"] == {"success_episodes": 9, "corrective_episodes": 1}
-    assert manifest["total_frames"] == 20
+    assert manifest["total_frames"] == 30
     assert manifest["sources"][0]["info_sha256"] == hashlib.sha256(
         (success_root / "meta" / "info.json").read_bytes()
     ).hexdigest()
@@ -263,6 +299,54 @@ def test_prepare_dataset_preserves_image_feature_storage_and_pixels(tmp_path):
     dataset = LeRobotDataset("local/mixture", root=destination_root)
     assert dataset.features["observation.images.image"]["dtype"] == "image"
     assert np.isclose(float(dataset[1]["observation.images.image"].mean()), 1 / 255)
+
+
+def test_prepare_dataset_round_trips_real_encoded_video(tmp_path):
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    from lerobot_policy_snvla.scripts.prepare_corrective_dataset import prepare_dataset
+
+    video_features = {
+        **BASE_FEATURES,
+        "observation.images.image": {
+            "dtype": "video",
+            "shape": (64, 64, 3),
+            "names": ["height", "width", "channels"],
+        },
+    }
+    success_root = tmp_path / "success"
+    corrective_root = tmp_path / "corrective"
+    destination_root = tmp_path / "mixture"
+    _make_source(
+        success_root,
+        "local/success",
+        episodes=1,
+        corrective=False,
+        features=video_features,
+    )
+    _make_source(
+        corrective_root,
+        "local/corrective",
+        episodes=1,
+        corrective=True,
+        features=video_features,
+    )
+
+    prepare_dataset(
+        success_roots=[success_root],
+        corrective_roots=[corrective_root],
+        dst_root=destination_root,
+        dst_repo_id="local/mixture",
+        expected_success_episodes=1,
+        expected_corrective_episodes=1,
+    )
+
+    dataset = LeRobotDataset("local/mixture", root=destination_root)
+    assert dataset.features["observation.images.image"]["dtype"] == "video"
+    assert list((destination_root / "videos").rglob("*.mp4"))
+    assert np.isclose(
+        float(dataset[1]["observation.images.image"].mean()), 1 / 255, atol=1 / 255
+    )
 
 
 def test_prepare_dataset_rejects_destination_nested_in_source(tmp_path):
@@ -515,6 +599,14 @@ def test_validate_episode_frames_rejects_completion_before_final_placement():
             ],
             episode_id=0,
         )
+    with pytest.raises(ValueError, match="after the final placed event"):
+        validate_episode_frames(
+            [
+                frame("picked", 1, 0),
+                frame("placed", 1, 1, "Task completed.\n"),
+            ],
+            episode_id=0,
+        )
 
 
 def test_validate_dataset_and_validate_only_cli_check_manifest_composition(tmp_path):
@@ -545,7 +637,7 @@ def test_validate_dataset_and_validate_only_cli_check_manifest_composition(tmp_p
     )
 
     assert summary["total_episodes"] == 10
-    assert summary["total_frames"] == 20
+    assert summary["total_frames"] == 30
     assert summary["eval_episodes"] == 1
     assert main(
         [
@@ -574,6 +666,112 @@ def test_validate_dataset_and_validate_only_cli_check_manifest_composition(tmp_p
             expected_success_episodes=9,
             expected_corrective_episodes=1,
         )
+
+
+def _prepare_validation_mixture(
+    tmp_path: Path,
+    *,
+    corrective_pattern: tuple[str, ...] = ("policy", "expert", "expert"),
+    task: str = "Put 1 object into the basket.",
+) -> tuple[Path, dict]:
+    from lerobot_policy_snvla.scripts.prepare_corrective_dataset import prepare_dataset
+
+    success_root = tmp_path / "success"
+    corrective_root = tmp_path / "corrective"
+    destination_root = tmp_path / "mixture"
+    _make_source(success_root, "local/success", episodes=9, corrective=False, task=task)
+    _make_source(
+        corrective_root,
+        "local/corrective",
+        episodes=1,
+        corrective=True,
+        task=task,
+        controller_patterns=[corrective_pattern],
+    )
+    manifest = prepare_dataset(
+        success_roots=[success_root],
+        corrective_roots=[corrective_root],
+        dst_root=destination_root,
+        dst_repo_id="local/mixture",
+        expected_success_episodes=9,
+        expected_corrective_episodes=1,
+    )
+    return destination_root, manifest
+
+
+def _validate_only(root: Path) -> int:
+    from lerobot_policy_snvla.scripts.prepare_corrective_dataset import main
+
+    return main(
+        [
+            "--validate-only",
+            "--dst-root",
+            str(root),
+            "--expected-success-episodes",
+            "9",
+            "--expected-corrective-episodes",
+            "1",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "controllers",
+    [
+        ("policy", "policy", "policy"),
+        ("expert", "policy", "policy"),
+        ("policy", "expert", "policy"),
+    ],
+    ids=["all-policy", "expert-to-policy", "policy-expert-policy"],
+)
+def test_validate_only_requires_one_policy_to_expert_transition_in_corrective_episode(
+    tmp_path, controllers
+):
+    root, manifest = _prepare_validation_mixture(
+        tmp_path, corrective_pattern=("policy", "expert", "expert")
+    )
+    episode_id = manifest["episode_kinds"].index("corrective")
+    _rewrite_episode_columns(
+        root,
+        episode_id,
+        controller_source=list(controllers),
+        diffusion_loss_mask=[0.0 if controller == "policy" else 1.0 for controller in controllers],
+    )
+
+    with pytest.raises(ValueError, match="corrective episode.*policy.*expert"):
+        _validate_only(root)
+
+
+def test_validate_only_requires_success_episode_to_remain_expert_mask_one(tmp_path):
+    root, manifest = _prepare_validation_mixture(tmp_path)
+    episode_id = manifest["episode_kinds"].index("success")
+    _rewrite_episode_columns(
+        root,
+        episode_id,
+        controller_source=["policy", "expert", "expert"],
+        diffusion_loss_mask=[0.0, 1.0, 1.0],
+    )
+
+    with pytest.raises(ValueError, match="success episode.*expert.*mask 1"):
+        _validate_only(root)
+
+
+def test_validate_only_requires_task_completed_marker(tmp_path):
+    root, manifest = _prepare_validation_mixture(tmp_path)
+    episode_id = manifest["episode_kinds"].index("corrective")
+    _rewrite_episode_columns(root, episode_id, current_narration=[" (done)\n", " (done)\n", ""])
+
+    with pytest.raises(ValueError, match="Task completed"):
+        _validate_only(root)
+
+
+def test_validate_only_rejects_truncated_multi_object_episode(tmp_path):
+    root, _manifest = _prepare_validation_mixture(
+        tmp_path, task="Put 2 objects into the basket."
+    )
+
+    with pytest.raises(ValueError, match="expected 2 picked/placed pairs"):
+        _validate_only(root)
 
 
 def test_pyproject_registers_prepare_corrective_dataset_cli():
