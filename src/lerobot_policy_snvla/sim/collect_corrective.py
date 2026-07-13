@@ -17,7 +17,7 @@ from . import collect
 from .collect import BASKET_HALF_EXTENTS, LIBERO_FPS, MAX_STEPS_PER_BLOCK, PICK_HEIGHT
 from .evaluate import PolicyStepper
 from .events import BasketRegion, EventTracker, NarrationFormat
-from .scripted_expert import Phase, T1Expert, get_body_pos
+from .scripted_expert import Phase, PickPlaceStateMachine, T1Expert, get_body_pos
 from .t1_count_blocks import (
     BASKET_BODY,
     DEFAULT_CATEGORY,
@@ -120,6 +120,8 @@ def _resume_expert_from_tracker(expert, tracker) -> None:
     expert.bodies = [body for body, _offset in remaining]
     expert._offsets = [offset for _body, offset in remaining]
     expert._idx = 0
+    if hasattr(expert, "_sm"):
+        expert._sm = PickPlaceStateMachine(expert._sm.cfg)
 
 
 def _run_corrective_episode(
@@ -166,6 +168,11 @@ def _run_corrective_episode(
             if event.kind == "picked" and controller_source == "policy":
                 place_started = max(place_started, event.ordinal)
                 pending.append((fmt.place_narration(event.ordinal, n_blocks), ""))
+            if event.kind == "placed" and controller_source == "policy":
+                next_ordinal = event.ordinal + 1
+                if next_ordinal <= n_blocks and next_ordinal > pick_started:
+                    pick_started = next_ordinal
+                    pending.append((fmt.pick_narration(next_ordinal, n_blocks), ""))
             if event.kind == "placed" and event.ordinal == n_blocks:
                 pending.append((fmt.task_completed_fragment, ""))
 

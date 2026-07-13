@@ -148,6 +148,78 @@ def test_policy_completion_is_emitted_only_after_tracker_confirmation(monkeypatc
     assert "Task completed." not in stream
 
 
+def test_policy_prefix_starts_next_pick_after_nonfinal_placement(monkeypatch):
+    from lerobot_policy_snvla.sim.collect_corrective import _run_corrective_episode
+    from lerobot_policy_snvla.sim.events import Event, NarrationFormat
+
+    _patch_observation(monkeypatch)
+    fmt = NarrationFormat(object_name="object")
+    frames, _, _ = _run_corrective_episode(
+        FakeEnv(success_after=20),
+        FakePolicy(),
+        lambda: FakeExpert(),
+        n_blocks=2,
+        task_str="task",
+        fmt=fmt,
+        category="object",
+        seed=0,
+        policy_steps_min=6,
+        policy_steps_max=6,
+        event_tracker=FakeTracker(
+            [Event("picked", "obj_1", 1, 1), Event("placed", "obj_1", 3, 1)]
+        ),
+        body_names=["obj_1", "obj_2"],
+        body_positions=lambda _env, names: {name: np.zeros(3) for name in names},
+    )
+
+    assert [frame["current_narration"] for frame in frames[:5]] == [
+        fmt.pick_narration(1, 2),
+        fmt.done_fragment,
+        fmt.place_narration(1, 2),
+        fmt.done_fragment,
+        fmt.pick_narration(2, 2),
+    ]
+    assert all(frame["controller_source"] == "policy" for frame in frames[:5])
+
+
+def test_resume_expert_drops_placed_work_and_resets_recovery_state():
+    from lerobot_policy_snvla.sim.collect_corrective import _resume_expert_from_tracker
+    from lerobot_policy_snvla.sim.events import Event
+    from lerobot_policy_snvla.sim.scripted_expert import (
+        ExpertConfig,
+        Phase,
+        PickPlaceStateMachine,
+    )
+
+    config = ExpertConfig()
+    stale_state = PickPlaceStateMachine(config)
+    stale_state.phase = Phase.RELEASE
+    stale_state._counter = 4
+    stale_state._lift_target = np.ones(3)
+    stale_state._phase_steps = 9
+    offsets = [np.full(3, value) for value in range(3)]
+    expert = SimpleNamespace(
+        bodies=["obj_1", "obj_2", "obj_3"],
+        _offsets=offsets,
+        _idx=2,
+        _sm=stale_state,
+    )
+    tracker = FakeTracker()
+    tracker.events = [Event("placed", "obj_2", 7, 1)]
+
+    _resume_expert_from_tracker(expert, tracker)
+
+    assert expert.bodies == ["obj_1", "obj_3"]
+    assert expert._offsets == [offsets[0], offsets[2]]
+    assert expert._idx == 0
+    assert expert._sm is not stale_state
+    assert expert._sm.cfg is config
+    assert expert._sm.phase is Phase.HOVER
+    assert expert._sm._counter == 0
+    assert expert._sm._lift_target is None
+    assert expert._sm._phase_steps == 0
+
+
 @pytest.mark.parametrize("seed", range(64))
 def test_intervention_rng_uses_inclusive_bounds(monkeypatch, seed):
     from lerobot_policy_snvla.sim.collect_corrective import _run_corrective_episode
