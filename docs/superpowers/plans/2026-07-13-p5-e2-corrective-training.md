@@ -716,6 +716,9 @@ rsync -a --exclude .venv --exclude .git --exclude outputs --exclude '__pycache__
   ~/Workspaces/lerobot-policy-snvla/ dgx:~/Workspaces/lerobot-policy-snvla/
 rsync -a ~/datasets/t1_n3_v4_corrective_mix_aug/ \
   dgx:~/datasets/t1_n3_v4_corrective_mix_aug/
+ssh dgx 'mkdir -p ~/Workspaces/lerobot-policy-snvla/outputs/eval'
+rsync -a outputs/eval/p5e2_horizon_selection.json \
+  dgx:~/Workspaces/lerobot-policy-snvla/outputs/eval/p5e2_horizon_selection.json
 ```
 
 Verify DGX dataset metadata reports 600 episodes and dimensions 32/32.
@@ -741,7 +744,7 @@ SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_c
   --dataset.root=$HOME/datasets/t1_n3_v4_corrective_mix_aug \
   --dataset.eval_split=0.1 --eval_steps=50 \
   --policy.type=snvla \
-  --policy.pretrained_path=$HOME/models/eval_ckpts/snvla_t1_aug_p2_015000/pretrained_model \
+  --policy.pretrained_path=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v3_aug_p2/015000/pretrained_model \
   --policy.push_to_hub=false --policy.compile_model=true --policy.compile_cudagraphs=true \
   --policy.training_padding_length=256 --policy.max_text_loss_tokens=16 \
   --policy.attention_backend=sdpa --policy.fuse_qkv=true \
