@@ -12,6 +12,7 @@ def _result(
     success: bool,
     placed: int,
     *,
+    picked: int = 0,
     false_pick_done: int = 0,
     false_place_done: int = 0,
     false_task_completed: int = 0,
@@ -24,6 +25,7 @@ def _result(
         n_frames=100,
         wall_time_s=1.0,
         narrations=[],
+        picked=picked,
         false_pick_done=false_pick_done,
         false_place_done=false_place_done,
         false_task_completed=false_task_completed,
@@ -39,6 +41,7 @@ def test_summarize_empty():
         success_rate=0.0,
         mean_placed=0.0,
         mean_count_error=0.0,
+        mean_picked=0.0,
         total_false_pick_done=0,
         total_false_place_done=0,
         total_false_task_completed=0,
@@ -48,15 +51,16 @@ def test_summarize_empty():
 
 def test_summarize_mixed_results():
     results = [
-        _result(True, 3, false_pick_done=1, min_eef_object_distance=0.1),
-        _result(False, 1, false_place_done=2, min_eef_object_distance=0.2),
-        _result(False, 4, false_task_completed=3, min_eef_object_distance=0.3),
-        _result(True, 3, false_pick_done=4, min_eef_object_distance=0.4),
+        _result(True, 3, picked=3, false_pick_done=1, min_eef_object_distance=0.1),
+        _result(False, 1, picked=2, false_place_done=2, min_eef_object_distance=0.2),
+        _result(False, 4, picked=4, false_task_completed=3, min_eef_object_distance=0.3),
+        _result(True, 3, picked=3, false_pick_done=4, min_eef_object_distance=0.4),
     ]
     summary = summarize(results, n_blocks=3)
     assert summary.n_episodes == 4
     assert summary.success_rate == pytest.approx(0.5)
     assert summary.mean_placed == pytest.approx(11 / 4)
+    assert summary.mean_picked == pytest.approx(3.0)
     # count_error = |placed - n_blocks| の平均 = (0 + 2 + 1 + 0) / 4
     assert summary.mean_count_error == pytest.approx(0.75)
     assert summary.total_false_pick_done == 5
@@ -66,8 +70,26 @@ def test_summarize_mixed_results():
 
 
 def test_episode_result_metrics_are_strict_json_compatible():
-    result = _result(False, 0, min_eef_object_distance=0.0)
-    json.dumps(asdict(result), allow_nan=False)
+    result = _result(False, 0, picked=2, min_eef_object_distance=0.0)
+    payload = asdict(result)
+    assert payload["picked"] == 2
+    json.dumps(payload, allow_nan=False)
+
+
+def test_picked_metrics_preserve_legacy_positional_dataclass_construction():
+    result = EpisodeResult(0, False, 1, 100, 1.0, [], 2, 3, 4, 0.5)
+    summary = EvalSummary(1, 3, 0.0, 1.0, 2.0, 2, 3, 4, 0.5)
+
+    assert result.false_pick_done == 2
+    assert result.false_place_done == 3
+    assert result.false_task_completed == 4
+    assert result.min_eef_object_distance == pytest.approx(0.5)
+    assert result.picked == 0
+    assert summary.total_false_pick_done == 2
+    assert summary.total_false_place_done == 3
+    assert summary.total_false_task_completed == 4
+    assert summary.mean_min_eef_object_distance == pytest.approx(0.5)
+    assert summary.mean_picked == 0.0
 
 
 def test_run_episode_audits_only_new_metrics_fragment_and_records_truth(monkeypatch):
@@ -124,6 +146,7 @@ def test_run_episode_audits_only_new_metrics_fragment_and_records_truth(monkeypa
         "chocolate_pudding_1_main": np.array([2.0, 0.0, 0.0]),
     }
     monkeypatch.setattr(evaluate_module, "get_body_pos", lambda _env, body: positions[body])
+    monkeypatch.setattr(evaluate_module, "PICK_HEIGHT", 0.0)
     monkeypatch.setattr(evaluate_module.collect, "_state8", lambda _obs: np.zeros(8, np.float32))
     monkeypatch.setattr(evaluate_module.collect, "_images", lambda _obs: {})
     recorder = FakeRecorder()
@@ -139,6 +162,7 @@ def test_run_episode_audits_only_new_metrics_fragment_and_records_truth(monkeypa
     assert result.false_pick_done == 1
     assert result.false_place_done == 0
     assert result.false_task_completed == 0
+    assert result.picked == 1
     assert result.min_eef_object_distance == pytest.approx(1.0)
     assert recorder.saved
     assert [frame["eef_object_distance"].dtype for frame in recorder.frames] == [
@@ -148,6 +172,37 @@ def test_run_episode_audits_only_new_metrics_fragment_and_records_truth(monkeypa
     assert all(frame["truth_picked"].dtype == np.int64 for frame in recorder.frames)
     assert all(frame["truth_placed"].dtype == np.int64 for frame in recorder.frames)
     assert [int(frame["truth_picked"][0]) for frame in recorder.frames] == [0, 0]
+
+
+def test_evaluate_serializes_and_logs_physical_picked_count(tmp_path, monkeypatch, caplog):
+    from lerobot_policy_snvla.sim import evaluate as evaluate_module
+
+    class FakeEnv:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(evaluate_module, "make_t1_env", lambda **_kwargs: FakeEnv())
+    monkeypatch.setattr(
+        evaluate_module,
+        "run_episode",
+        lambda *_args, **_kwargs: _result(False, 1, picked=2),
+    )
+    out_path = tmp_path / "evaluation.json"
+
+    with caplog.at_level("INFO"):
+        summary, results = evaluate_module.evaluate(
+            make_stepper=lambda _env: None,
+            n_episodes=1,
+            n_blocks=3,
+            out_path=out_path,
+        )
+
+    payload = json.loads(out_path.read_text())
+    assert results[0].picked == 2
+    assert summary.mean_picked == pytest.approx(2.0)
+    assert payload["episodes"][0]["picked"] == 2
+    assert payload["summary"]["mean_picked"] == pytest.approx(2.0)
+    assert "picked=2" in caplog.text
 
 
 def test_metrics_only_fragment_is_not_reaudited_when_history_catches_up():

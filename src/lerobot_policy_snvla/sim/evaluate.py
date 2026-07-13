@@ -44,6 +44,7 @@ class EpisodeResult:
     false_place_done: int = 0
     false_task_completed: int = 0
     min_eef_object_distance: float = 0.0
+    picked: int = 0
 
 
 @dataclass
@@ -57,6 +58,7 @@ class EvalSummary:
     total_false_place_done: int = 0
     total_false_task_completed: int = 0
     mean_min_eef_object_distance: float = 0.0
+    mean_picked: float = 0.0
 
 
 class Stepper(Protocol):
@@ -141,6 +143,7 @@ def summarize(results: list[EpisodeResult], n_blocks: int) -> EvalSummary:
             success_rate=0.0,
             mean_placed=0.0,
             mean_count_error=0.0,
+            mean_picked=0.0,
         )
     return EvalSummary(
         n_episodes=n,
@@ -148,6 +151,7 @@ def summarize(results: list[EpisodeResult], n_blocks: int) -> EvalSummary:
         success_rate=sum(r.success for r in results) / n,
         mean_placed=sum(r.placed for r in results) / n,
         mean_count_error=sum(abs(r.placed - n_blocks) for r in results) / n,
+        mean_picked=sum(r.picked for r in results) / n,
         total_false_pick_done=sum(r.false_pick_done for r in results),
         total_false_place_done=sum(r.false_place_done for r in results),
         total_false_task_completed=sum(r.false_task_completed for r in results),
@@ -279,6 +283,7 @@ def run_episode(
         n_frames=n_frames,
         wall_time_s=time.perf_counter() - t0,
         narrations=stepper.narrations(),
+        picked=tracker.count("picked"),
         false_pick_done=audit.false_pick_done,
         false_place_done=audit.false_place_done,
         false_task_completed=audit.false_task_completed,
@@ -319,11 +324,12 @@ def evaluate(
             env.close()
         results.append(result)
         logging.info(
-            "episode %d/%d seed=%d success=%s placed=%d frames=%d (%.1fs)",
+            "episode %d/%d seed=%d success=%s picked=%d placed=%d frames=%d (%.1fs)",
             i + 1,
             n_episodes,
             seed,
             result.success,
+            result.picked,
             result.placed,
             result.n_frames,
             result.wall_time_s,
