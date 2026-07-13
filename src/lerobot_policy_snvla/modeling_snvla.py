@@ -25,6 +25,11 @@ from transformers import AutoTokenizer
 from transformers.models.gemma import modeling_gemma
 
 from .configuration_snvla import SNVLAConfig
+from .constants import (
+    NARRATION_TARGET_MASK,
+    OBS_LANGUAGE_MODE_MASK,
+    STATE_RANDOMIZED_TEXT_ONLY_MASK,
+)
 from .processor_snvla import (
     OBS_LANGUAGE_TOKEN_AR_MASK,
     OBS_LANGUAGE_TOKEN_LOSS_MASK,
@@ -53,6 +58,63 @@ def select_text_loss_inputs(language_out, language_tokens, language_loss_masks, 
     selected_weights = candidate_weights.gather(1, safe_positions)
     selected_weights = selected_weights * (selected_positions != sentinel)
     return selected_hidden, selected_targets, selected_weights
+
+
+def reduce_training_losses(
+    action_loss_raw,
+    diffusion_loss_masks,
+    txt_loss_raw,
+    text_loss_weights,
+    diffusion_loss_coeff,
+):
+    """Reduce action loss over active samples and text loss over weighted tokens."""
+    per_sample_action = action_loss_raw.mean(dim=(1, 2))
+    active = diffusion_loss_masks.to(
+        device=per_sample_action.device, dtype=per_sample_action.dtype
+    ).view(-1)
+    action_loss = (per_sample_action * active).sum() / active.sum().clamp(min=1.0)
+
+    valid_loss_mask = text_loss_weights.to(device=txt_loss_raw.device, dtype=txt_loss_raw.dtype)
+    txt_loss = (txt_loss_raw * valid_loss_mask).sum() / valid_loss_mask.sum().clamp(min=1.0)
+    loss = txt_loss + diffusion_loss_coeff * action_loss
+    return loss, action_loss, txt_loss
+
+
+def _weighted_group_mean(raw_loss, weights, sample_mask):
+    weights = weights.to(device=raw_loss.device, dtype=raw_loss.dtype)
+    sample_mask = sample_mask.to(device=raw_loss.device, dtype=raw_loss.dtype).view(
+        raw_loss.shape[0], *([1] * (raw_loss.ndim - 1))
+    )
+    grouped_weights = weights * sample_mask
+    return (raw_loss * grouped_weights).sum() / grouped_weights.sum().clamp(min=1.0)
+
+
+def compute_grouped_text_metrics(
+    txt_loss_raw,
+    text_loss_weights,
+    mode_loss_raw,
+    mode_loss_weights,
+    narration_target_mask,
+    state_randomized_text_only_mask,
+):
+    """Compute detached scalar text and mode losses for training subgroups."""
+    all_samples = torch.ones_like(narration_target_mask, dtype=torch.bool)
+    metrics = {
+        "mode_loss": _weighted_group_mean(mode_loss_raw, mode_loss_weights, all_samples),
+        "mode_loss_narration": _weighted_group_mean(
+            mode_loss_raw, mode_loss_weights, narration_target_mask
+        ),
+        "mode_loss_action": _weighted_group_mean(
+            mode_loss_raw, mode_loss_weights, ~narration_target_mask.bool()
+        ),
+        "text_loss_randomized": _weighted_group_mean(
+            txt_loss_raw, text_loss_weights, state_randomized_text_only_mask
+        ),
+        "text_loss_regular": _weighted_group_mean(
+            txt_loss_raw, text_loss_weights, ~state_randomized_text_only_mask.bool()
+        ),
+    }
+    return {name: value.detach() for name, value in metrics.items()}
 
 
 class FusedQKVProjection(nn.Module):
@@ -433,13 +495,13 @@ class SNVLACore(nn.Module):
         txt_loss_raw,
         text_loss_weights,
     ):
-        action_loss = (action_loss_raw * diffusion_loss_masks.view(-1, 1, 1)).mean()
-        valid_loss_mask = text_loss_weights.float()
-        weighted_loss = txt_loss_raw * valid_loss_mask
-        total_weight = valid_loss_mask.sum().clamp(min=1)
-        txt_loss = weighted_loss.sum() / total_weight
-        loss = txt_loss + self.diffusion_loss_coeff * action_loss
-        return loss, action_loss, txt_loss
+        return reduce_training_losses(
+            action_loss_raw,
+            diffusion_loss_masks,
+            txt_loss_raw,
+            text_loss_weights,
+            self.diffusion_loss_coeff,
+        )
 
     def forward(
         self,
@@ -451,6 +513,9 @@ class SNVLACore(nn.Module):
         actions,
         language_loss_masks,
         diffusion_loss_masks,
+        language_mode_masks=None,
+        narration_target_masks=None,
+        state_randomized_text_only_masks=None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         device = self.device
 
@@ -459,6 +524,23 @@ class SNVLACore(nn.Module):
         language_attention_masks = language_attention_masks.to(device)
         language_loss_masks = language_loss_masks.to(device)
         diffusion_loss_masks = diffusion_loss_masks.to(device)
+        if language_mode_masks is None:
+            language_mode_masks = torch.zeros_like(language_tokens, dtype=torch.bool)
+        else:
+            language_mode_masks = language_mode_masks.to(device=device, dtype=torch.bool)
+        batch_size = language_tokens.shape[0]
+        if narration_target_masks is None:
+            narration_target_masks = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        else:
+            narration_target_masks = narration_target_masks.to(device=device, dtype=torch.bool).view(-1)
+        if state_randomized_text_only_masks is None:
+            state_randomized_text_only_masks = torch.zeros(
+                batch_size, device=device, dtype=torch.bool
+            )
+        else:
+            state_randomized_text_only_masks = state_randomized_text_only_masks.to(
+                device=device, dtype=torch.bool
+            ).view(-1)
 
         if self.config.training_padding_length is not None:
             target_length = self.config.training_padding_length
@@ -478,6 +560,7 @@ class SNVLACore(nn.Module):
                     language_attention_masks, (0, pad_length), value=False
                 )
                 language_loss_masks = F.pad(language_loss_masks, (0, pad_length), value=0.0)
+                language_mode_masks = F.pad(language_mode_masks, (0, pad_length), value=False)
 
         if actions.device != device:
             actions = actions.to(device)
@@ -540,11 +623,23 @@ class SNVLACore(nn.Module):
             self.config.max_text_loss_tokens,
         )
         txt_logits = self.paligemma_with_expert.paligemma.lm_head(text_hidden)
+        mode_hidden, mode_targets, mode_loss_weights = select_text_loss_inputs(
+            language_out,
+            language_tokens,
+            language_mode_masks.float(),
+            max_tokens=1,
+        )
+        mode_logits = self.paligemma_with_expert.paligemma.lm_head(mode_hidden)
 
         action_loss_raw = F.mse_loss(u_t, v_t, reduction="none")
         txt_loss_raw = F.cross_entropy(
             txt_logits.transpose(1, 2).float(),
             txt_targets,
+            reduction="none",
+        )
+        mode_loss_raw = F.cross_entropy(
+            mode_logits.transpose(1, 2).float(),
+            mode_targets,
             reduction="none",
         )
         loss, action_loss, txt_loss = self._reduce_training_losses(
@@ -570,6 +665,21 @@ class SNVLACore(nn.Module):
         valid_weight_sum = (valid_loss_mask * valid_mask_bool.float()).sum()
         ave_text_loss_weight = valid_weight_sum / safe_count
 
+        grouped_metrics = compute_grouped_text_metrics(
+            txt_loss_raw,
+            text_loss_weights,
+            mode_loss_raw,
+            mode_loss_weights,
+            narration_target_masks,
+            state_randomized_text_only_masks,
+        )
+        active_action_fraction = diffusion_loss_masks.float().sum() / max(
+            diffusion_loss_masks.numel(), 1
+        )
+        state_randomized_fraction = state_randomized_text_only_masks.float().sum() / max(
+            state_randomized_text_only_masks.numel(), 1
+        )
+
         info = {
             "loss": loss.detach(),
             "text_loss": txt_loss.detach(),
@@ -577,6 +687,9 @@ class SNVLACore(nn.Module):
             "text_loss_ratio": txt_loss_ratio.detach(),
             "action_loss_ratio": action_loss_ratio.detach(),
             "ave_text_loss_weight": ave_text_loss_weight.detach(),
+            "active_action_fraction": active_action_fraction.detach(),
+            "state_randomized_fraction": state_randomized_fraction.detach(),
+            **grouped_metrics,
         }
         return loss, info
 
@@ -986,11 +1099,22 @@ class SNVLAPolicy(PI05Policy):
         language_attention_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         language_ar_masks = batch[OBS_LANGUAGE_TOKEN_AR_MASK]
         language_loss_masks = batch[OBS_LANGUAGE_TOKEN_LOSS_MASK]
+        language_mode_masks = batch.get(
+            OBS_LANGUAGE_MODE_MASK, torch.zeros_like(language_tokens, dtype=torch.bool)
+        )
 
         actions = self.prepare_action(batch)
 
         # 拡散損失マスク (データセットから来ると仮定)
         diffusion_loss_masks = batch.get("diffusion_loss_mask", torch.ones_like(actions[:, 0, 0]))
+        narration_target_masks = batch.get(
+            NARRATION_TARGET_MASK,
+            torch.zeros(actions.shape[0], device=actions.device, dtype=torch.bool),
+        )
+        state_randomized_text_only_masks = batch.get(
+            STATE_RANDOMIZED_TEXT_ONLY_MASK,
+            torch.zeros(actions.shape[0], device=actions.device, dtype=torch.bool),
+        )
 
         return self.model.forward(
             images=images,
@@ -1001,6 +1125,9 @@ class SNVLAPolicy(PI05Policy):
             actions=actions,
             language_loss_masks=language_loss_masks,
             diffusion_loss_masks=diffusion_loss_masks,
+            language_mode_masks=language_mode_masks,
+            narration_target_masks=narration_target_masks,
+            state_randomized_text_only_masks=state_randomized_text_only_masks,
         )
 
     @classmethod

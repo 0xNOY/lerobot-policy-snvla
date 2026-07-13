@@ -1,4 +1,5 @@
 import dataclasses
+from types import SimpleNamespace
 
 import lerobot.policies.factory as policy_factory
 import pytest
@@ -14,7 +15,13 @@ from lerobot_policy_snvla.constants import (
     NARRATION_TARGET_MASK,
     STATE_RANDOMIZED_TEXT_ONLY_MASK,
 )
-from lerobot_policy_snvla.modeling_snvla import FusedQKVProjection, select_text_loss_inputs
+from lerobot_policy_snvla.modeling_snvla import (
+    FusedQKVProjection,
+    SNVLAPolicy,
+    compute_grouped_text_metrics,
+    reduce_training_losses,
+    select_text_loss_inputs,
+)
 from lerobot_policy_snvla.processor_snvla import (
     CURRENT_NARRATION,
     OBS_LANGUAGE_TOKEN_AR_MASK,
@@ -297,6 +304,126 @@ def test_select_text_loss_inputs_preserves_weighted_cross_entropy():
     selected_loss = (selected_raw * selected_weights).sum() / selected_weights.sum()
 
     torch.testing.assert_close(selected_loss, full_loss)
+
+
+def test_reduce_training_losses_normalizes_over_active_action_samples():
+    action_raw = torch.tensor([[[4.0]], [[100.0]]])
+    diffusion_mask = torch.tensor([1.0, 0.0])
+    text_raw = torch.tensor([[2.0], [6.0]])
+    text_weights = torch.ones_like(text_raw)
+
+    total, action, text = reduce_training_losses(
+        action_raw,
+        diffusion_mask,
+        text_raw,
+        text_weights,
+        diffusion_loss_coeff=1.0,
+    )
+
+    assert action == pytest.approx(4.0)
+    assert text == pytest.approx(4.0)
+    assert total == pytest.approx(8.0)
+
+
+def test_reduce_training_losses_all_action_samples_masked_is_finite_zero():
+    action_raw = torch.tensor([[[4.0]], [[100.0]]])
+    diffusion_mask = torch.zeros(2)
+    text_raw = torch.tensor([[2.0], [6.0]])
+    text_weights = torch.ones_like(text_raw)
+
+    _, action, _ = reduce_training_losses(
+        action_raw,
+        diffusion_mask,
+        text_raw,
+        text_weights,
+        diffusion_loss_coeff=1.0,
+    )
+
+    assert torch.isfinite(action)
+    assert action == pytest.approx(0.0)
+
+
+def test_compute_grouped_text_metrics_uses_each_groups_nonzero_weights():
+    text_raw = torch.tensor(
+        [[2.0, 100.0], [100.0, 4.0], [6.0, 100.0], [100.0, 8.0]],
+        requires_grad=True,
+    )
+    text_weights = torch.tensor([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0], [0.0, 4.0]])
+    mode_raw = torch.tensor([[1.0], [3.0], [5.0], [7.0]], requires_grad=True)
+    mode_weights = torch.ones_like(mode_raw)
+    narration_targets = torch.tensor([True, False, True, False])
+    randomized_samples = torch.tensor([True, True, False, False])
+
+    metrics = compute_grouped_text_metrics(
+        text_raw,
+        text_weights,
+        mode_raw,
+        mode_weights,
+        narration_targets,
+        randomized_samples,
+    )
+
+    assert metrics["mode_loss"] == pytest.approx(4.0)
+    assert metrics["mode_loss_narration"] == pytest.approx(3.0)
+    assert metrics["mode_loss_action"] == pytest.approx(5.0)
+    assert metrics["text_loss_randomized"] == pytest.approx(10.0 / 3.0)
+    assert metrics["text_loss_regular"] == pytest.approx(50.0 / 7.0)
+    assert all(metric.ndim == 0 for metric in metrics.values())
+    assert all(not metric.requires_grad for metric in metrics.values())
+
+
+def test_compute_grouped_text_metrics_empty_groups_are_finite_zero():
+    metrics = compute_grouped_text_metrics(
+        torch.tensor([[2.0]]),
+        torch.tensor([[1.0]]),
+        torch.tensor([[3.0]]),
+        torch.tensor([[1.0]]),
+        torch.tensor([True]),
+        torch.tensor([False]),
+    )
+
+    for key in ("mode_loss_action", "text_loss_randomized"):
+        assert torch.isfinite(metrics[key])
+        assert metrics[key] == pytest.approx(0.0)
+
+
+def test_policy_forward_passes_task_one_training_masks_to_core():
+    captured = {}
+
+    class CapturingCore:
+        def forward(self, **kwargs):
+            captured.update(kwargs)
+            return torch.tensor(0.0), {}
+
+    actions = torch.zeros(2, 1, 1)
+    policy = SimpleNamespace(
+        model=CapturingCore(),
+        _preprocess_images=lambda _: ([torch.zeros(2, 1)], [torch.ones(2, 1)]),
+        prepare_action=lambda _: actions,
+    )
+    batch = {
+        OBS_LANGUAGE_TOKENS: torch.ones(2, 3, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 3, dtype=torch.bool),
+        OBS_LANGUAGE_TOKEN_AR_MASK: torch.ones(2, 3, dtype=torch.bool),
+        OBS_LANGUAGE_TOKEN_LOSS_MASK: torch.ones(2, 3),
+        "observation.language.mode_mask": torch.tensor(
+            [[False, True, False], [False, True, False]]
+        ),
+        DIFFUSION_LOSS_MASK: torch.tensor([0.0, 1.0]),
+        NARRATION_TARGET_MASK: torch.tensor([True, False]),
+        STATE_RANDOMIZED_TEXT_ONLY_MASK: torch.tensor([True, False]),
+    }
+
+    SNVLAPolicy.forward(policy, batch)
+
+    assert "language_mode_masks" in captured
+    assert "narration_target_masks" in captured
+    assert "state_randomized_text_only_masks" in captured
+    torch.testing.assert_close(captured["language_mode_masks"], batch["observation.language.mode_mask"])
+    torch.testing.assert_close(captured["narration_target_masks"], batch[NARRATION_TARGET_MASK])
+    torch.testing.assert_close(
+        captured["state_randomized_text_only_masks"], batch[STATE_RANDOMIZED_TEXT_ONLY_MASK]
+    )
 
 
 def test_fused_qkv_projection_matches_individual_linears():
