@@ -1,6 +1,22 @@
-# P5-E2 Corrective Training Implementation Plan
+# P5-E2 Corrective Training Implementation Plan — CANCELED BY USER
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> [!CAUTION]
+> **CANCELED BY USER on 2026-07-14. DO NOT EXECUTE ANY TASK, COMMAND, COLLECTOR, MIXER,
+> DATA PREPARATION, OR TRAINING IN THIS DOCUMENT.** The corrective pilot was retained only as
+> diagnosis evidence and was never used for training. The corrective collector and dataset mixer
+> were removed in commit `5ba60a8`.
+
+The active plan is
+[`2026-07-14-p5-e2-success-only-state-dropout.md`](./2026-07-14-p5-e2-success-only-state-dropout.md).
+It replaces corrective collection/mixing with 200 successful demonstrations and deterministic
+language state-dropout. The content below remains only as an audit trail of the abandoned proposal.
+Every checkbox is marked canceled; none indicates pending work.
+
+<details>
+<summary>Archived canceled proposal (history only; do not execute)</summary>
+
+> **ARCHIVED:** The former agent-execution instruction is canceled. The steps below are retained
+> solely to explain the discarded design and must not be treated as an executable plan.
 
 **Goal:** 物体へ到達できないaction policyと物理進捗なしの実況ハルシネーションを、短いreceding horizon、500成功デモ、100 corrective episode、25% state-randomized text-only学習で修正する。
 
@@ -38,7 +54,7 @@
 - Produces batch keys `diffusion_loss_mask`, `state_randomized_text_only_mask`, `observation.language.mode_mask`, and `narration_target_mask`.
 - Extends the existing LeRobot converter patch so all four non-observation keys survive `batch_to_transition` and `transition_to_batch`.
 
-- [ ] **Step 1: Add failing config and converter tests**
+- [x] **CANCELED BY USER:** **Step 1: Add failing config and converter tests**
 
 Add tests that require default-off behavior, ratio validation, and preservation of the new keys:
 
@@ -65,7 +81,7 @@ def test_snvla_training_masks_are_complementary_data():
     assert complementary["narration_target_mask"].tolist() == [False, True]
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **CANCELED BY USER:** **Step 2: Run the tests and verify RED**
 
 Run:
 
@@ -75,7 +91,7 @@ Run:
 
 Expected: FAIL because the config fields and converter keys do not exist.
 
-- [ ] **Step 3: Add config fields, constants, and converter propagation**
+- [x] **CANCELED BY USER:** **Step 3: Add config fields, constants, and converter propagation**
 
 Add the fields to `SNVLAConfig`, validate `0.0 <= ratio <= 1.0`, and extend `_patch_batch_converters()` to copy:
 
@@ -95,7 +111,7 @@ for key in (
         data[key] = batch[key]
 ```
 
-- [ ] **Step 4: Add failing processor behavior tests**
+- [x] **CANCELED BY USER:** **Step 4: Add failing processor behavior tests**
 
 Use `monkeypatch` on `torch.rand` and `torch.empty(...).uniform_` through a small injectable helper. Require:
 
@@ -119,7 +135,7 @@ def test_processor_randomizes_prompt_state_and_disables_only_action_loss(monkeyp
 
 Also add parameterized ratio `0.0/1.0` tests and assert captured randomized state values are inside `[-1, 1]`.
 
-- [ ] **Step 5: Run the processor tests and verify RED**
+- [x] **CANCELED BY USER:** **Step 5: Run the processor tests and verify RED**
 
 Run:
 
@@ -129,7 +145,7 @@ Run:
 
 Expected: FAIL because the tokenizer processor does not sample a text-only mask.
 
-- [ ] **Step 6: Implement prompt-only state randomization**
+- [x] **CANCELED BY USER:** **Step 6: Implement prompt-only state randomization**
 
 In `SNVLAPrepareTrainingTokenizerProcessorStep.__call__`:
 
@@ -151,7 +167,7 @@ Generate `randomized_states = torch.empty_like(state).uniform_(-1.0, 1.0)` only 
 
 Build `narration_target_mask` from non-empty `current_narration`, and mark the first target token in `observation.language.mode_mask`.
 
-- [ ] **Step 7: Verify Task 1 and commit**
+- [x] **CANCELED BY USER:** **Step 7: Verify Task 1 and commit**
 
 Run:
 
@@ -181,7 +197,7 @@ git commit -m "feat(train): add state-randomized text-only samples"
 - Consumes Task 1 batch masks.
 - Produces scalar output metrics `text_loss`, `action_loss`, `text_loss_ratio`, `action_loss_ratio`, `active_action_fraction`, `state_randomized_fraction`, `mode_loss`, `mode_loss_narration`, `mode_loss_action`, `text_loss_randomized`, and `text_loss_regular`.
 
-- [ ] **Step 1: Add failing masked-reduction tests**
+- [x] **CANCELED BY USER:** **Step 1: Add failing masked-reduction tests**
 
 Test that disabling half a batch removes it without halving the remaining action loss:
 
@@ -203,7 +219,7 @@ def test_reduce_training_losses_normalizes_over_active_action_samples():
 
 Add a test where all action samples are masked and require finite zero action loss.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **CANCELED BY USER:** **Step 2: Run and verify RED**
 
 Run:
 
@@ -213,7 +229,7 @@ Run:
 
 Expected: FAIL because the current implementation uses `.mean()` across masked samples.
 
-- [ ] **Step 3: Implement active-sample normalization**
+- [x] **CANCELED BY USER:** **Step 3: Implement active-sample normalization**
 
 Compute per-sample mean action loss, then divide by `diffusion_loss_masks.sum().clamp(min=1)`:
 
@@ -225,11 +241,11 @@ action_loss = (per_sample_action * active).sum() / active.sum().clamp(min=1.0)
 
 Keep text loss normalized by text weights. Extract the reduction into a module-level pure helper so CPU tests do not instantiate the 4B model.
 
-- [ ] **Step 4: Add failing grouped-metric tests**
+- [x] **CANCELED BY USER:** **Step 4: Add failing grouped-metric tests**
 
 Create a pure `compute_grouped_text_metrics(...)` test using two narration/action targets and two randomized/regular samples. Assert each group uses only its own non-zero weights and an empty group returns finite zero.
 
-- [ ] **Step 5: Run and verify RED**
+- [x] **CANCELED BY USER:** **Step 5: Run and verify RED**
 
 Run:
 
@@ -239,11 +255,11 @@ Run:
 
 Expected: FAIL because the grouped metric helper does not exist.
 
-- [ ] **Step 6: Implement scalar grouped metrics**
+- [x] **CANCELED BY USER:** **Step 6: Implement scalar grouped metrics**
 
 Pass the Task 1 masks from `SNVLAPolicy.forward` to `SNVLACore.forward`. Compute mode CE only at `language.mode_mask`, split it with `narration_target_mask`, and split text CE with `state_randomized_text_only_mask`. Detach every returned metric so W&B logging does not retain graphs.
 
-- [ ] **Step 7: Verify Task 2 and commit**
+- [x] **CANCELED BY USER:** **Step 7: Verify Task 2 and commit**
 
 Run:
 
@@ -272,7 +288,7 @@ git commit -m "fix(train): normalize masked action loss and expose metrics"
 - Produces `require_wandb_cli_args(argv: Sequence[str]) -> None` guarded by environment variable `SNVLA_REQUIRE_WANDB=1`.
 - Existing LeRobot W&B logger remains the only network logging implementation.
 
-- [ ] **Step 1: Add failing metric registration tests**
+- [x] **CANCELED BY USER:** **Step 1: Add failing metric registration tests**
 
 Use a real `MetricsTracker` and require scalar tensors from `output_dict` to become mean-reduced meters while non-scalars are ignored.
 
@@ -285,7 +301,7 @@ def test_record_output_metrics_adds_scalar_average_meters():
     assert "vector" not in tracker.metrics
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **CANCELED BY USER:** **Step 2: Run and verify RED**
 
 Run:
 
@@ -295,15 +311,15 @@ Run:
 
 Expected: FAIL because the helper module functions do not exist.
 
-- [ ] **Step 3: Implement metrics wrapper**
+- [x] **CANCELED BY USER:** **Step 3: Implement metrics wrapper**
 
 Wrap `lerobot.scripts.lerobot_train.update_policy`, call the original, then call `record_output_metrics`. Add new `AverageMeter(name, ":.4f", reduction="mean")` entries before assigning values. This makes existing `logging.info(train_tracker)` and `wandb_log_dict = train_tracker.to_dict()` include the separated metrics without copying LeRobot's training loop.
 
-- [ ] **Step 4: Add and implement mandatory-W&B tests**
+- [x] **CANCELED BY USER:** **Step 4: Add and implement mandatory-W&B tests**
 
 Require `SNVLA_REQUIRE_WANDB=1` to reject missing/false `--wandb.enable` and missing `--wandb.project`, while leaving debug runs unchanged when the environment variable is absent. Accept both `--wandb.enable=true` and `--wandb.enable true` forms.
 
-- [ ] **Step 5: Verify Task 3 and commit**
+- [x] **CANCELED BY USER:** **Step 5: Verify Task 3 and commit**
 
 Run:
 
@@ -331,7 +347,7 @@ git commit -m "feat(train): require wandb and log separated losses"
 - Produces `action_chunk_metrics(predicted, target, is_pad) -> dict[str, float]` for tensors shaped `(T, D)`.
 - Debug dataset loads `ACTION` delta timestamps `0..chunk_size-1` and consumes `action_is_pad`.
 
-- [ ] **Step 1: Add a failing aligned-chunk test**
+- [x] **CANCELED BY USER:** **Step 1: Add a failing aligned-chunk test**
 
 ```python
 def test_action_chunk_metrics_aligns_time_and_ignores_padding():
@@ -344,7 +360,7 @@ def test_action_chunk_metrics_aligns_time_and_ignores_padding():
 
 Add shape-mismatch tests that raise `ValueError` instead of broadcasting.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **CANCELED BY USER:** **Step 2: Run and verify RED**
 
 Run:
 
@@ -354,7 +370,7 @@ Run:
 
 Expected: FAIL because the helper does not exist.
 
-- [ ] **Step 3: Implement aligned dataset loading and metrics**
+- [x] **CANCELED BY USER:** **Step 3: Implement aligned dataset loading and metrics**
 
 Initialize `LeRobotDataset` with:
 
@@ -364,7 +380,7 @@ delta_timestamps={ACTION: [i / dataset_meta.fps for i in range(config.policy.chu
 
 Compare postprocessed prediction `(chunk_size, action_dim)` to the same-shaped target. Convert bf16 to float before NumPy conversion. Use `action_is_pad` to exclude episode-boundary padding.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **CANCELED BY USER:** **Step 4: Verify and commit**
 
 Run:
 
@@ -397,11 +413,11 @@ git commit -m "fix(debug): compare aligned action chunks"
 - Extends `EvalSummary` with totals and mean minimum distance.
 - Extends recorded evaluation frames with `eef_object_distance: float32[1]`, `truth_picked: int64[1]`, and `truth_placed: int64[1]` for post-hoc inspection only.
 
-- [ ] **Step 1: Add failing narration-audit tests**
+- [x] **CANCELED BY USER:** **Step 1: Add failing narration-audit tests**
 
 Feed the canonical stream one fragment at a time. Require pick/place done to be false when the corresponding tracker count has not advanced, and require `Task completed.` to be false while `placed < n_blocks`.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **CANCELED BY USER:** **Step 2: Run and verify RED**
 
 Run:
 
@@ -411,15 +427,15 @@ Run:
 
 Expected: FAIL because `NarrationAudit` does not exist.
 
-- [ ] **Step 3: Implement the pure audit state machine**
+- [x] **CANCELED BY USER:** **Step 3: Implement the pure audit state machine**
 
 Track whether the generated stream currently expects pick-done or place-done based on accepted start fragments. Count false completion but never suppress or alter the model's narration history.
 
-- [ ] **Step 4: Add failing episode metric tests**
+- [x] **CANCELED BY USER:** **Step 4: Add failing episode metric tests**
 
 Extend summary fixtures with known false counts and minimum distances. Add a fake stepper test that exposes one new narration fragment through `metrics()` and a fake environment body-position trace.
 
-- [ ] **Step 5: Run and verify RED**
+- [x] **CANCELED BY USER:** **Step 5: Run and verify RED**
 
 Run:
 
@@ -429,11 +445,11 @@ Run:
 
 Expected: FAIL because `EpisodeResult` and `run_episode` do not expose the new metrics.
 
-- [ ] **Step 6: Integrate read-only truth metrics**
+- [x] **CANCELED BY USER:** **Step 6: Integrate read-only truth metrics**
 
 At each frame, compute the minimum Euclidean distance from `robot0_eef_pos` to any not-yet-picked object body. Compare only newly appended narration fragments against tracker counts. Store metrics in JSON and recorded datasets, but do not pass them to `PolicyStepper`.
 
-- [ ] **Step 7: Verify and commit**
+- [x] **CANCELED BY USER:** **Step 7: Verify and commit**
 
 Run:
 
@@ -464,11 +480,11 @@ git commit -m "feat(eval): measure approach and false narration progress"
 - Produces CLI `snvla-sim-collect-corrective`.
 - Frame schema includes `diffusion_loss_mask: float32[1]`, `controller_source: string`, oracle narration columns, and `sim_event`.
 
-- [ ] **Step 1: Add failing pure transition tests**
+- [x] **CANCELED BY USER:** **Step 1: Add failing pure transition tests**
 
 Use fake policy/expert steppers and a fake event tracker. Assert policy frames have mask 0/source `policy`, expert frames have mask 1/source `expert`, and generated policy narration is never copied into teacher `previous_narrations`.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **CANCELED BY USER:** **Step 2: Run and verify RED**
 
 Run:
 
@@ -478,19 +494,19 @@ Run:
 
 Expected: FAIL because the collector module does not exist.
 
-- [ ] **Step 3: Implement collector core**
+- [x] **CANCELED BY USER:** **Step 3: Implement collector core**
 
 Reuse `_state8`, `_images`, `EventTracker`, `NarrationFormat`, and `T1Expert`. Choose the intervention frame with `np.random.default_rng(seed).integers(min, max + 1)`. Maintain an oracle history independent of `policy_stepper.narrations()`. During the policy prefix emit no completion unless `EventTracker` confirms it; after switching, use the same phase/event ordering as `collect._run_episode`.
 
-- [ ] **Step 4: Add failing pilot gate and CLI tests**
+- [x] **CANCELED BY USER:** **Step 4: Add failing pilot gate and CLI tests**
 
 Require the CLI to reject an existing output root, require a policy path, and return non-zero when fewer than all requested pilot episodes recover successfully.
 
-- [ ] **Step 5: Implement pilot/full modes and recording**
+- [x] **CANCELED BY USER:** **Step 5: Implement pilot/full modes and recording**
 
 Support `--episodes`, `--pilot`, `--seed`, `--policy-steps-min`, `--policy-steps-max`, `--n-action-steps`, and existing recording parameters. In pilot mode save the dataset for inspection but exit non-zero if any episode fails recovery.
 
-- [ ] **Step 6: Run sim pilot integration test**
+- [x] **CANCELED BY USER:** **Step 6: Run sim pilot integration test**
 
 Use an expert-as-policy fake prefix for a one-block, 128px episode and verify dataset schema and success:
 
@@ -498,7 +514,7 @@ Use an expert-as-policy fake prefix for a one-block, 128px episode and verify da
 MUJOCO_GL=egl .venv/bin/python -m pytest tests/sim/test_collect_corrective.py -m sim -v
 ```
 
-- [ ] **Step 7: Verify and commit**
+- [x] **CANCELED BY USER:** **Step 7: Verify and commit**
 
 Run:
 
@@ -528,11 +544,11 @@ git commit -m "feat(sim): collect policy-to-expert corrective episodes"
 - Produces `validate_episode_partition(train_episode_ids, eval_episode_ids) -> None`.
 - Produces CLI `snvla-prepare-corrective-dataset` that combines success and corrective roots without frame-level split leakage.
 
-- [ ] **Step 1: Add failing schema and split tests**
+- [x] **CANCELED BY USER:** **Step 1: Add failing schema and split tests**
 
 Require old success frames to receive `diffusion_loss_mask=[1.0]` and `controller_source="expert"`. Require corrective masks to remain unchanged. Require overlapping episode IDs to raise `ValueError`.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **CANCELED BY USER:** **Step 2: Run and verify RED**
 
 Run:
 
@@ -542,15 +558,15 @@ Run:
 
 Expected: FAIL because the preparation module does not exist.
 
-- [ ] **Step 3: Implement schema normalization and aggregation**
+- [x] **CANCELED BY USER:** **Step 3: Implement schema normalization and aggregation**
 
 Create a new LeRobot dataset rather than editing inputs. Copy frames, renumber episodes through `save_episode`, preserve images/narrations/events, and add the two new features. Write a manifest JSON containing source roots, episode counts, frame counts, and SHA-256 hashes of each source `meta/info.json`.
 
-- [ ] **Step 4: Implement dataset validation command**
+- [x] **CANCELED BY USER:** **Step 4: Implement dataset validation command**
 
 Validate 500 success episodes, 100 corrective episodes, masks in `{0,1}`, no empty task strings, parseable narration JSON, forward-only event ordering, and a 10% episode-level holdout compatible with LeRobot `dataset.eval_split=0.1`.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **CANCELED BY USER:** **Step 5: Verify and commit**
 
 Run:
 
@@ -577,7 +593,7 @@ git commit -m "feat(data): prepare corrective training mixture"
 - Consumes final P5-E2 checkpoint and Tasks 5–6 CLIs.
 - Produces selected `n_action_steps` and a pilot go/no-go decision.
 
-- [ ] **Step 1: Benchmark horizons on collection seeds**
+- [x] **CANCELED BY USER:** **Step 1: Benchmark horizons on collection seeds**
 
 For each value `1 5 10 30`, run three seed-0 episodes without recording, using only local module invocation:
 
@@ -594,11 +610,11 @@ done
 
 Before accepting any run, grep each log for `All keys loaded successfully!` and abort on `Warning: Could not load state dict`.
 
-- [ ] **Step 2: Select the longest stable horizon**
+- [x] **CANCELED BY USER:** **Step 2: Select the longest stable horizon**
 
 Rank by picked count, then minimum object distance, then placed count. Choose the longest horizon within 5% of the best minimum distance when picked counts tie. Record the exact metrics and choice in both the corrective report and `outputs/eval/p5e2_horizon_selection.json` as `{"n_action_steps": N}`; do not guess when metrics conflict.
 
-- [ ] **Step 3: Run the 10-episode corrective pilot**
+- [x] **CANCELED BY USER:** **Step 3: Run the 10-episode corrective pilot**
 
 Use seed band `30_000_000` and a new root:
 
@@ -615,7 +631,7 @@ MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.collect_corrective \
 
 Expected: exit 0, 10/10 expert recoveries, valid narration/event ordering. If not, stop and report the failed seeds and expert phases.
 
-- [ ] **Step 4: Commit the benchmark report**
+- [x] **CANCELED BY USER:** **Step 4: Commit the benchmark report**
 
 ```bash
 git add docs/superpowers/reports/2026-07-13-p5-e2-corrective-report.md
@@ -629,7 +645,7 @@ git commit -m "docs: record corrective horizon and pilot results"
 **Files:**
 - Modify: `docs/superpowers/reports/2026-07-13-p5-e2-corrective-report.md`
 
-- [ ] **Step 1: Collect 450 new successful episodes**
+- [x] **CANCELED BY USER:** **Step 1: Collect 450 new successful episodes**
 
 Use a fresh seed band and 16 CPU workers:
 
@@ -642,7 +658,7 @@ MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.collect \
 
 Expected: 450 saved, all success, narration_ok 450/450.
 
-- [ ] **Step 2: Collect 100 corrective episodes**
+- [x] **CANCELED BY USER:** **Step 2: Collect 100 corrective episodes**
 
 Use the pilot-approved settings and a fresh root:
 
@@ -659,7 +675,7 @@ MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.collect_corrective \
 
 Expected: 100 saved and 100 expert recoveries. Stop on any pilot contract regression.
 
-- [ ] **Step 3: Prepare the 600-episode mixture**
+- [x] **CANCELED BY USER:** **Step 3: Prepare the 600-episode mixture**
 
 Run:
 
@@ -673,7 +689,7 @@ Run:
   --expected-success-episodes 500 --expected-corrective-episodes 100
 ```
 
-- [ ] **Step 4: Apply forward-only augmentation and validate**
+- [x] **CANCELED BY USER:** **Step 4: Apply forward-only augmentation and validate**
 
 Write to a separate root and validate it:
 
@@ -690,7 +706,7 @@ Write to a separate root and validate it:
 
 Verify 600 episodes, parseable histories, no backward propagation, and preserved diffusion masks. Record frame counts and mask fractions in the report.
 
-- [ ] **Step 5: Commit only the report update**
+- [x] **CANCELED BY USER:** **Step 5: Commit only the report update**
 
 ```bash
 git add docs/superpowers/reports/2026-07-13-p5-e2-corrective-report.md
@@ -705,7 +721,7 @@ git commit -m "docs: record corrective dataset construction"
 - Modify: `docs/superpowers/reports/2026-07-13-p5-e2-corrective-report.md`
 - Modify: `docs/superpowers/plans/2026-07-13-p5-e2-handoff.md`
 
-- [ ] **Step 1: Sync code and dataset to DGX**
+- [x] **CANCELED BY USER:** **Step 1: Sync code and dataset to DGX**
 
 Use rsync excluding `.venv`, `.git`, `outputs`, caches, and local evaluation datasets:
 
@@ -722,7 +738,7 @@ rsync -a outputs/eval/p5e2_horizon_selection.json \
 
 Verify DGX dataset metadata reports 600 episodes and dimensions 32/32.
 
-- [ ] **Step 2: Run a 100-step small training gate**
+- [x] **CANCELED BY USER:** **Step 2: Run a 100-step small training gate**
 
 Run this exact small-gate command, initialized from the old final P5-E2 weights with a fresh optimizer:
 
@@ -761,11 +777,11 @@ SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_c
 
 Set `SNVLA_REQUIRE_WANDB=1`, `CUDA_VISIBLE_DEVICES=2,3`, and retain FULL_SHARD, bf16, fixed padding 256, SDPA, fused QKV, checkpoint interval 2. Confirm two `All keys loaded successfully!` lines, W&B run URL, finite separated losses, randomized fraction near 0.25, active action fraction near 0.75 adjusted by corrective policy frames, and no state-dict/OOM/runtime warnings.
 
-- [ ] **Step 3: Run the corrected chunk diagnostic**
+- [x] **CANCELED BY USER:** **Step 3: Run the corrected chunk diagnostic**
 
 Compare the initial checkpoint and small-run checkpoint on the same held-out frames. Require finite aligned MSE/MAE and no broadcasting. If action metric worsens or separated loss is imbalanced, stop before production.
 
-- [ ] **Step 4: Launch production training**
+- [x] **CANCELED BY USER:** **Step 4: Launch production training**
 
 After the small gate passes, choose steps from dataset size so the run covers 10 effective train epochs after the 10% holdout:
 
@@ -775,7 +791,7 @@ steps = ceil(train_frames * 10 / 16)
 
 Set `STEPS` to that integer, `SAVE_FREQ=ceil(STEPS/4)`, and rerun the exact Step 2 command with `--steps="$STEPS"`, `--save_freq="$SAVE_FREQ"`, output directory `outputs/train/snvla_t1_n3_v4_corrective_prod`, and W&B run ID `p5e2-corrective-prod-h${SELECTED_N_ACTION_STEPS}-sr025`. Do not overwrite P5-E2 checkpoints.
 
-- [ ] **Step 5: Monitor and document**
+- [x] **CANCELED BY USER:** **Step 5: Monitor and document**
 
 Record completion reason, final step, separated loss curves, validation metrics, W&B URL, GPU memory, step time, and every checkpoint path in the report and handoff.
 
@@ -788,19 +804,19 @@ Record completion reason, final step, separated loss curves, validation metrics,
 - Modify: `docs/superpowers/reports/2026-07-12-p5-e2-report.md`
 - Modify: `docs/superpowers/plans/2026-07-13-p5-e2-handoff.md`
 
-- [ ] **Step 1: Transfer candidate checkpoints**
+- [x] **CANCELED BY USER:** **Step 1: Transfer candidate checkpoints**
 
 Transfer intermediate and final `pretrained_model` directories to unique local roots. Verify safetensors readability, `max_state_dim/max_action_dim=32/32`, and `All keys loaded successfully!`. Stop immediately on the forbidden warning.
 
-- [ ] **Step 2: Run the collection-seed gate**
+- [x] **CANCELED BY USER:** **Step 2: Run the collection-seed gate**
 
 For each candidate, evaluate seeds 0–2 with the selected horizon. A candidate passes only if every episode has at least one picked event and all three false-completion counters are zero. Do not select solely by final training step.
 
-- [ ] **Step 3: Evaluate passing candidates on unseen seeds**
+- [x] **CANCELED BY USER:** **Step 3: Evaluate passing candidates on unseen seeds**
 
 For the best passing checkpoint, run narration-on and narration-off for 30 episodes each with distinct new record roots and JSON outputs. Preserve both complete LeRobot datasets.
 
-- [ ] **Step 4: Run verification-before-completion**
+- [x] **CANCELED BY USER:** **Step 4: Run verification-before-completion**
 
 Invoke `superpowers:verification-before-completion`, then run:
 
@@ -814,7 +830,7 @@ git status --short
 
 Expected: all tests pass; only intentionally untracked `outputs/` remains.
 
-- [ ] **Step 5: Update reports and commit**
+- [x] **CANCELED BY USER:** **Step 5: Update reports and commit**
 
 Document success/placed/picked, minimum approach distance, false completion counts, narration ablation difference, dataset locations, W&B URL, and checkpoint choice.
 
@@ -823,6 +839,8 @@ git add docs/superpowers/reports/2026-07-13-p5-e2-corrective-report.md docs/supe
 git commit -m "docs: report P5-E2 corrective evaluation"
 ```
 
-- [ ] **Step 6: Finish the branch**
+</details>
+
+- [x] **CANCELED BY USER:** **Step 6: Finish the branch**
 
 Invoke `superpowers:finishing-a-development-branch` and present merge/PR/keep/cleanup options. Do not merge without the user's choice.
