@@ -54,7 +54,7 @@ class SNVLAConfig(PreTrainedConfig):
     eos_token_id: int = PALIGEMMA_SPECIAL_TOKEN_IDS["eos"]
 
     # --- Narration Inference Parameters ---
-    max_narration_length: int = 50
+    max_narration_length: int = 64
     narration_temperature: float = 0.0
     narration_generation_enabled: bool = True
 
@@ -69,7 +69,7 @@ class SNVLAConfig(PreTrainedConfig):
     narration_loss_weight: float = 5.0
 
     # --- Overrides from PI05Config ---
-    tokenizer_max_length: int = 1000
+    tokenizer_max_length: int = 2048
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -81,13 +81,13 @@ class SNVLAConfig(PreTrainedConfig):
 
     gradient_checkpointing: bool = False
     gradient_checkpointing_interval: int = 1
-    compile_model: bool = False
+    compile_model: bool = True
     compile_mode: str = "max-autotune"
-    compile_cudagraphs: bool = False
+    compile_cudagraphs: bool = True
     training_padding_length: int | None = None
     max_text_loss_tokens: int = 16
-    attention_backend: str = "eager"
-    fuse_qkv: bool = False
+    attention_backend: str = "sdpa"
+    fuse_qkv: bool = True
 
     freeze_vision_encoder: bool = False
     train_expert_only: bool = False
