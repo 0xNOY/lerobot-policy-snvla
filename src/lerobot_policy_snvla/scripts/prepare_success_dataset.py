@@ -295,7 +295,7 @@ def _validate_stats_policy(policy: Any) -> None:
     expected_scalars = {
         "name": "retained-numeric-identity-visual",
         "numeric_stats": "recomputed-from-retained-rows",
-        "visual_stats": "omitted",
+        "visual_stats": "zero-count-global-placeholders-no-empirical-stats",
         "visual_normalization": "IDENTITY",
     }
     for key, expected in expected_scalars.items():
@@ -354,7 +354,12 @@ def _validate_trimmed_stats(
         expected_episode_stats.append(compute_episode_stats(arrays, numeric_features))
     expected_global_stats = aggregate_stats(expected_episode_stats)
     global_stats = json.loads(stats_path.read_text())
-    _compare_stats_tree(global_stats, expected_global_stats, "global")
+    if set(global_stats) != set(expected_numeric + expected_visual):
+        raise ValueError("trimmed dataset global stats feature keys are invalid")
+    for key in expected_visual:
+        if global_stats[key] != {"count": [0]}:
+            raise ValueError(f"trimmed dataset global visual stats for {key} must be exactly count=[0]")
+    _compare_stats_tree({key: global_stats[key] for key in expected_numeric}, expected_global_stats, "global")
 
     actual_episode_rows: dict[int, dict[str, Any]] = {}
     visual_prefixes = tuple(f"stats/{key}/" for key in expected_visual)

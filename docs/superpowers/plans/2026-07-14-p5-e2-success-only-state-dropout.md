@@ -488,8 +488,11 @@ Require `saved=150`, `narration_ok=150/150`, and no source-root overwrite.
 The raw merged root is immutable. Trimming precedes augmentation and requires exactly one canonical
 completion frame per raw episode; it retains that frame through offset `+10`, drops later dataset
 rows, and makes independent identical-byte MP4 copies without decoding or remuxing. Numeric,
-action, and state stats are recomputed from retained rows; visual stats are omitted under a
-fail-closed `stats_policy` only because SNVLA uses `VISUAL=IDENTITY`. The trimmed 200 episodes must pass through
+action, and state stats are recomputed from retained rows; visual global stats contain zero-count
+compatibility placeholders (`count=[0]`), not empirical values, under a fail-closed `stats_policy`
+because SNVLA uses `VISUAL=IDENTITY` and ImageNet factory setup fills mean/std in memory. These are
+single-dataset `make_dataset(use_imagenet_stats=True)` sentinels, not generic `aggregate_stats`
+inputs. The trimmed 200 episodes must pass through
 `augment_narrations` exactly once. The pre-augmentation builder validates exact semantic event
 cardinality from `sim_event` transitions and the canonical narration centers. In `--validate-only`
 mode on the augmented result, validate schema, episode/frame identity, event-transition ordering,

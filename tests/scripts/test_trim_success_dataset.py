@@ -6,9 +6,13 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from lerobot.configs.default import DatasetConfig
+from lerobot.configs.train import TrainPipelineConfig
+from lerobot.datasets.factory import IMAGENET_STATS, make_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 import lerobot_policy_snvla.scripts.trim_success_dataset as trim_module
+from lerobot_policy_snvla.configuration_snvla import SNVLAConfig
 from lerobot_policy_snvla.scripts.augment_narrations import (
     apply_updates_to_dataset,
     collect_updates,
@@ -160,12 +164,25 @@ def test_exact_cutoff_metadata_stats_and_video_bytes(tmp_path, monkeypatch):
     expected = np.array([[10, frame] for frame in range(18)] + [[20, frame] for frame in range(12)])
     assert stats["action"]["count"] == [30]
     assert stats["action"]["mean"] == pytest.approx(expected.mean(axis=0))
-    assert "observation.images.image" not in stats
+    assert stats["observation.images.image"] == {"count": [0]}
+    factory_dataset = make_dataset(
+        TrainPipelineConfig(
+            dataset=DatasetConfig(repo_id="test/trimmed", root=str(destination), use_imagenet_stats=True),
+            policy=SNVLAConfig(device="cpu", compile_model=False),
+        )
+    )
+    for key in factory_dataset.meta.camera_keys:
+        assert factory_dataset.meta.stats[key]["count"].tolist() == [0]
+        for stats_type in ("mean", "std"):
+            actual = factory_dataset.meta.stats[key][stats_type]
+            assert tuple(actual.shape) == (3, 1, 1)
+            assert np.isfinite(actual.numpy()).all()
+            np.testing.assert_allclose(actual.numpy(), np.asarray(IMAGENET_STATS[stats_type]))
     assert manifest["stats_policy"] == {
         "version": 1,
         "name": "retained-numeric-identity-visual",
         "numeric_stats": "recomputed-from-retained-rows",
-        "visual_stats": "omitted",
+        "visual_stats": "zero-count-global-placeholders-no-empirical-stats",
         "visual_normalization": "IDENTITY",
         "numeric_features": [
             "action",
@@ -265,12 +282,18 @@ def test_manifest_tampering_and_failure_cleanup(tmp_path, monkeypatch):
         validate_success_dataset(destination, 2)
 
     pq.write_table(original_episode_table, episode_path)
-    stats["observation.images.image"] = {"count": [30]}
-    stats_path.write_text(json.dumps(stats))
-    with pytest.raises(ValueError, match="global stats keys"):
+    missing_visual = json.loads(json.dumps(stats))
+    del missing_visual["observation.images.image"]
+    stats_path.write_text(json.dumps(missing_visual))
+    with pytest.raises(ValueError, match="global stats feature keys"):
         validate_success_dataset(destination, 2)
 
-    del stats["observation.images.image"]
+    nonempty_visual = json.loads(json.dumps(stats))
+    nonempty_visual["observation.images.image"] = {"count": [1]}
+    stats_path.write_text(json.dumps(nonempty_visual))
+    with pytest.raises(ValueError, match=r"global visual stats.*exactly count=\[0\]"):
+        validate_success_dataset(destination, 2)
+
     stats_path.write_text(json.dumps(stats))
     episode_table = original_episode_table.append_column(
         "stats/observation.images.image/count", pa.array([[18], [12]])

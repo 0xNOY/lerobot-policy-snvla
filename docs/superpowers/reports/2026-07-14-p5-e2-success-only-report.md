@@ -1,8 +1,9 @@
 # P5-E2 success-only state-dropout report
 
-**Status:** Tasks 1–7 are complete. The 200-episode success-only dataset was collected, merged,
-trimmed to the canonical completion frame plus 10 following frames, augmented forward-only exactly
-once, validated locally, and transferred and revalidated on DGX. Task 8 training has not started.
+**Status:** Tasks 1–7 are complete. The first Task 8 smoke attempt initialized W&B but failed during
+DGX dataset construction, before checkpoint loading or training, because the pre-fix transferred
+stats lacked visual keys. The zero-count visual-placeholder fix and regenerated trim/augmentation
+artifacts are validated locally but have not been synced to DGX; the smoke has not been retried.
 
 ## Objective and decisions
 
@@ -92,12 +93,12 @@ Partial loading, warning suppression, and `strict=False` are not acceptable subs
 
 ## Known limitations and unexecuted work
 
-- No success-only smoke, ablation, production training, or final evaluation has run. Task 7 used no
-  GPU; Task 8 must use only `CUDA_VISIBLE_DEVICES=2,3` and checkpoint/output roots below
-  `/raid/takenaka/snvla/checkpoints`.
+- One success-only smoke attempt failed before checkpoint loading or training. No successful smoke,
+  ablation, production training, or final evaluation has run. The local compatibility fix and
+  regenerated artifacts are not yet on DGX; retry only after resync and remote validation.
 - The DGX code destination is an rsynced working directory without `.git`, so this report does not
-  claim a DGX branch or commit identity. Exact hashes of the required source files match the local
-  `a9c11b2` tree and are recorded below.
+  claim a DGX branch or commit identity. The hashes below describe the historical pre-fix Task 7
+  transfer, not the current zero-count-placeholder implementation or regenerated local artifacts.
 - The builder's source audit and portable validation have different scopes. Source construction
   checks strict semantic cardinality against raw `sim_event` transitions and canonical narration
   centers. `--validate-only` on an augmented portable dataset checks schema, episode/frame identity,
@@ -152,20 +153,26 @@ created and validated with 200 episodes and 144,170 loader-visible frames, savin
 frames, so every retained length equals `completion_frame_index + 11`. The manifest contains 200
 trim records with record SHA-256
 `c70fa93bbaed4aa9a212e583370a2a453f17d8892acc6fac5cce5543d237cd30`; the complete trim manifest
-SHA-256 is `bf6c19bcec8fabcc35c1a17946c19e65f3ec5da50e180f36b45cb1baa6a5157a`.
-Numeric/action/state statistics were recomputed from retained rows; visual statistics are omitted
-under `retained-numeric-identity-visual` because the policy uses `VISUAL=IDENTITY`. The eight MP4s
-are byte-identical independent copies.
+SHA-256 is `54c0c0c6166d6b6286985d8cd8fea3b9f93ee2c77605a1ffae26d3153700a286`.
+Numeric/action/state statistics were recomputed from retained rows. Each visual feature has a
+zero-count global compatibility placeholder (`count=[0]`), with no empirical visual statistics, under
+`retained-numeric-identity-visual`; SNVLA uses `VISUAL=IDENTITY`, and ImageNet factory setup can
+populate mean/std in memory. This sentinel is specifically for LeRobot's current single-dataset
+`make_dataset(use_imagenet_stats=True)` path; it is not empirical input to generic `aggregate_stats`.
+The eight MP4s are byte-identical independent copies. Local metadata
+loading preserved both visual placeholder dictionaries, and an actual `make_dataset` call with
+`use_imagenet_stats=True` populated camera-key mean/std in memory successfully.
 
 The specified `augment_narrations --window-size 5 --forward-only` command ran exactly once from the
 trim root into `/home/noy/datasets/t1_n3_v5_success200_aug` in 19.609 seconds. The output manifest
 has repo ID `local/t1_n3_v5_success200_aug`, retains the 180/20/50 partitions and full trim/stats
 policies, and has SHA-256
-`2ade48d62577b126bf23120e668fef14c98c80d178d99c0a2628c583b63a4476`.
+`0768fb2e2b7f0cb3fdeb827bb2537b71a831b428a6221bb79d76458a33fc7664`.
 `meta/info.json` SHA-256 is
 `561af3bcc5dd0ff0b551918f6842b0d68b7789f79e715e6fc2e3efc969a579ea`; `meta/stats.json` SHA-256 is
-`e01efbdd74729b2a447f268c9c73d1f2ba2c346b11b13068af47ec5a6e6ba5d8`, identical to the trim
-input. All 187 numeric values across the seven stats keys are finite. LeRobot loaded exactly 200
+`801ddbba8a58b666b70c7bc8c434c3ff194545ac791ae34f86e55059d964c975`, identical to the trim
+input. All 189 stored values across nine feature keys are finite: 187 retained-row numeric-stat
+values plus two visual zero counts. LeRobot loaded exactly 200
 episodes and 144,170 frames with native state/action shapes 8/7. There are two data parquet files
 and eight MP4 files. Portable validation passed in 71.468 seconds, including schema, contiguous
 identity, event ordering, no premature completion narration, video boundaries, and complete asset
@@ -176,6 +183,10 @@ coverage. The augmentation and validation logs are respectively
 `9d32b8df89ba53638fcf37da6343e213d4fb272166f4d425bf39757088a33791`).
 
 ### Non-destructive DGX transfer and validation
+
+> **Historical pre-fix evidence:** this transfer predates the zero-count visual-placeholder fix.
+> It remains useful Task 7 provenance, but its code/dataset hashes are not current and must not be
+> used as evidence that the fixed artifacts are present on DGX.
 
 Pre-transfer DGX checks found `/home/takenaka/datasets/t1_n3_v5_success200_aug` absent, 384 GiB
 free in home, 3.3 TiB free on `/raid`, and an available repo `.venv`. Code rsync used no `--delete`
@@ -200,8 +211,8 @@ validation passed in 90.491 seconds. Independent LeRobot loading and metadata ch
 episodes, 144,170 frames, native state/action 8/7, repo ID, partitions, all 187 finite stats values,
 and all 200 trim records. The planned training maxima are separately confirmed as
 `max_state_dim=32`, `max_action_dim=32`, with `n_action_steps=10`; these configured maxima are not
-the dataset's native dimensions. `/raid/takenaka/snvla/checkpoints` exists and is writable. No GPU,
-training checkpoint, or Task 8 output was used or created.
+the dataset's native dimensions. `/raid/takenaka/snvla/checkpoints` exists and is writable. At this
+historical Task 7 checkpoint, no GPU, training checkpoint, or Task 8 output had been used or created.
 
 Transfer/remote evidence is preserved outside git: code rsync
 `/tmp/p5e2_task7_rsync_code_dgx.log` (SHA-256
@@ -213,10 +224,48 @@ validation `/tmp/p5e2_task7_validate_aug_dgx.log` (SHA-256
 and metadata output `/tmp/p5e2_task7_dgx_identity_metadata_fixed.log` (SHA-256
 `217708b3573c32682c9121defd1bb36d6ed0de83def0d624ad49268ef18309c9`).
 
-## Pending Task 8 — smoke and fixed efficacy gate
+## Task 8 smoke attempt — failed before checkpoint load
 
-1. On DGX GPUs 2,3, run the 100-step W&B smoke at ratio `0.25` using the manifest ablation IDs and
-   output `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_smoke_sr025`. Require exact loader gates,
+The two-rank smoke launched on DGX GPUs 2,3 with run ID
+`p5e2-success200-smoke-h10-sd025`. W&B initialized successfully at
+`https://wandb.ai/0xnoy-tamagawa-university/snvla-p5/runs/p5e2-success200-smoke-h10-sd025`,
+then dataset construction failed in `lerobot.datasets.factory.make_dataset` while applying ImageNet
+stats:
+
+```text
+KeyError: 'observation.images.image'
+```
+
+The failure occurred before policy/checkpoint construction. Consequently the log contains zero
+`All keys loaded successfully!` lines, zero forbidden `Warning: Could not load state dict` lines,
+and zero OOM matches; no checkpoint or `pretrained_model` was created. The failed output root is
+preserved at `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_smoke_sr025`, including its W&B run
+files. The DGX log is `/tmp/p5e2_task8_smoke_sr025.log` with SHA-256
+`51847d15d60e759047dfb400a25ab7b52d2a2957813c0576e97e22ff533f4dae`.
+
+Root cause: trim policy intentionally removed empirical visual stats, but the transferred pre-fix
+`stats.json` omitted both visual feature keys. With `use_imagenet_stats=True`, LeRobot indexes each
+camera dictionary before inserting ImageNet mean/std, so the absent key raised before checkpoint
+load. The local fix uses exact zero-sample placeholders `{"count": [0]}` for both visual features,
+retains no empirical/per-episode visual stats, and validates them fail-closed. An actual local
+`make_dataset(..., use_imagenet_stats=True)` regression passed for both regenerated roots.
+
+The regenerated local artifacts retain 144,170 frames and unchanged action-stat digest
+`348f78f44340fa200ded3183130f2ab97667a1cd7af4a03d26bc044add2e6d6b`. Current hashes are:
+
+| Local fixed artifact | SHA-256 |
+|---|---|
+| trim manifest | `54c0c0c6166d6b6286985d8cd8fea3b9f93ee2c77605a1ffae26d3153700a286` |
+| augmented manifest | `0768fb2e2b7f0cb3fdeb827bb2537b71a831b428a6221bb79d76458a33fc7664` |
+| shared `meta/stats.json` | `801ddbba8a58b666b70c7bc8c434c3ff194545ac791ae34f86e55059d964c975` |
+
+These fixed artifacts and code have not been synced to DGX, and no retry has run.
+
+## Pending Task 8 — resync, smoke retry, and fixed efficacy gate
+
+1. Sync the fixed code and regenerated augmented metadata/data to DGX, verify hashes and portable
+   validation, then run a fresh 100-step W&B smoke on GPUs 2,3 at ratio `0.25` using the manifest IDs.
+   Do not treat the failed W&B run as a successful smoke. Require exact loader gates,
    finite grouped losses, no OOM/runtime warning, and epoch-0 dropout fraction `0.0`.
 2. From the same checkpoint and identical configuration, run ratios `0.0`, `0.25`, and `0.50` for
    exactly `--epochs=3.0`, saving at `--save-every-epochs=3.0`, under the three specified

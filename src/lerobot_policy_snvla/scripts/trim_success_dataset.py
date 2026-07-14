@@ -194,7 +194,12 @@ def _rewrite_staging(
 
     info["total_frames"] = global_index
     info_path.write_text(json.dumps(info, indent=2, sort_keys=True) + "\n")
-    write_stats(aggregate_stats(episode_stats), staging)
+    global_stats = aggregate_stats(episode_stats)
+    write_stats(global_stats, staging)
+    stats_path = staging / "meta/stats.json"
+    serialized_stats = json.loads(stats_path.read_text())
+    serialized_stats.update({key: {"count": [0]} for key in visual_keys})
+    stats_path.write_text(json.dumps(serialized_stats, indent=2, sort_keys=True) + "\n")
 
     manifest_path = staging / MANIFEST_PATH
     if not manifest_path.is_file():
@@ -217,7 +222,7 @@ def _rewrite_staging(
         "version": 1,
         "name": STATS_POLICY_NAME,
         "numeric_stats": "recomputed-from-retained-rows",
-        "visual_stats": "omitted",
+        "visual_stats": "zero-count-global-placeholders-no-empirical-stats",
         "visual_normalization": "IDENTITY",
         "numeric_features": numeric_keys,
         "visual_features": visual_keys,
