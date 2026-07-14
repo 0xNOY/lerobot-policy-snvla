@@ -1,9 +1,10 @@
 # P5-E2 success-only state-dropout report
 
-**Status:** Tasks 1–7 are complete. The first Task 8 smoke attempt initialized W&B but failed during
-DGX dataset construction, before checkpoint loading or training, because the pre-fix transferred
-stats lacked visual keys. The zero-count visual-placeholder fix and regenerated trim/augmentation
-artifacts are validated locally but have not been synced to DGX; the smoke has not been retried.
+**Status:** Tasks 1–7 are complete. Task 8 is not valid: the `sr025` ablation reached step 2670, but
+the pretrained processor silently retained its saved state-dropout-disabled configuration instead
+of the active policy configuration. The run was stopped, produced no checkpoint, and must not be
+used as efficacy evidence. A scoped fail-closed processor-config reconciliation fix is implemented
+locally; no retry is claimed here.
 
 ## Objective and decisions
 
@@ -259,7 +260,44 @@ The regenerated local artifacts retain 144,170 frames and unchanged action-stat 
 | augmented manifest | `0768fb2e2b7f0cb3fdeb827bb2537b71a831b428a6221bb79d76458a33fc7664` |
 | shared `meta/stats.json` | `801ddbba8a58b666b70c7bc8c434c3ff194545ac791ae34f86e55059d964c975` |
 
-These fixed artifacts and code have not been synced to DGX, and no retry has run.
+At the time this first-failure evidence was recorded, the fixed artifacts and code had not yet been
+synced to DGX and no retry had run. The following section records the later, separate ablation
+failure.
+
+## Invalid `sr025` ablation — stale pretrained processor configuration
+
+The later two-rank `sr025` ablation run
+`p5e2-success200-ablation-h10-sd025` reached step 2670 before it was stopped. Although the active
+policy configuration requested state dropout, LeRobot loaded
+`SNVLAPrepareTrainingTokenizerProcessorStep.config` from the P2
+`policy_preprocessor.json`. Its saved configuration had dropout disabled and a stale action horizon.
+LeRobot's standard pretrained-processor overrides updated device, normalization, and rename steps,
+but did not override this custom step. Therefore the observed `sr025` metrics did not represent a
+25% state-dropout experiment and the complete run is invalid.
+
+The stopped output root contains preserved W&B files only; no training checkpoint exists. W&B
+reported `exit_code=255` and `complete=true`, which records process termination rather than a valid
+completed ablation. The run is preserved at
+`https://wandb.ai/0xnoy-tamagawa-university/snvla-p5/runs/p5e2-success200-ablation-h10-sd025`.
+The DGX log is `/tmp/p5e2_task8_ablation_sr025.log` with SHA-256
+`3f5a1a1de9c060b556fbaf655881ba2f9bf37948e8d223bd8483c78507eea164`.
+
+Root cause is addressed in the SNVLA bf16/FSDP entrypoint by merging an authoritative current
+`policy_cfg` override for registry step `snvla_prepare_training_tokenizer_processor_step` while
+preserving all standard overrides. After pipeline construction, the entrypoint fail-closed checks
+dropout enabled/ratio/seed, action horizon, state dimension, tokenizer IDs and limits, fixed
+padding, text-loss cap, and narration loss weight against the active configuration. The patch is
+scoped to SNVLA and is covered by a stale serialized-preprocessor regression plus real
+epoch-annotated batch conversion.
+
+Before any DGX retry, local review also found that the original epoch annotation hook only activated
+for `--epochs`. The 100-step smoke uses `--steps=100`; after enabling the corrected processor config,
+that path would have failed immediately because `training_epoch` was absent. The entrypoint now
+computes the annotation epoch length from the selected dataset, distributed world size, and batch
+size for step-based SNVLA training when state dropout is enabled. It retains the requested
+`steps`/`save_freq`, does not publish requested-epoch metrics, and restores the saved epoch plus
+within-epoch offset on resume. Step-based non-SNVLA and dropout-disabled training retain LeRobot's
+original cycle. This correction has only been verified locally; no DGX retry is claimed.
 
 ## Pending Task 8 — resync, smoke retry, and fixed efficacy gate
 

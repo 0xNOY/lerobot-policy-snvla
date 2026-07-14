@@ -30,9 +30,30 @@ from lerobot_policy_snvla.constants import (
     GROUP_METRIC_NUMERATOR_PREFIX,
     TRAINING_EPOCH,
 )
+from lerobot_policy_snvla.configuration_snvla import SNVLAConfig
+from lerobot_policy_snvla.processor_snvla import SNVLAPrepareTrainingTokenizerProcessorStep
 
 _lerobot_update_policy = lerobot_train.update_policy
 _active_epoch_metrics: "EpochMetricContext | None" = None
+
+_SNVLA_TOKENIZER_STEP = "snvla_prepare_training_tokenizer_processor_step"
+_SNVLA_PROCESSOR_CONFIG_FIELDS = (
+    "training",
+    "state_dropout_enabled",
+    "state_dropout_ratio",
+    "state_dropout_seed",
+    "n_action_steps",
+    "max_state_dim",
+    "max_action_dim",
+    "tokenizer_name",
+    "tokenizer_max_length",
+    "training_padding_length",
+    "max_text_loss_tokens",
+    "narration_loss_weight",
+    "begin_of_narration_token_id",
+    "begin_of_action_token_id",
+    "eos_token_id",
+)
 
 
 @dataclass(frozen=True)
@@ -91,9 +112,7 @@ def record_output_metrics(
     if not output_dict:
         return
 
-    globally_weighted = _record_globally_weighted_metrics(
-        train_metrics, output_dict, accelerator
-    )
+    globally_weighted = _record_globally_weighted_metrics(train_metrics, output_dict, accelerator)
 
     for name, value in output_dict.items():
         if name in globally_weighted:
@@ -226,9 +245,7 @@ def parse_training_duration(argv: Sequence[str]) -> TrainingDuration:
     return TrainingDuration(epochs, save_every_epochs, remaining)
 
 
-def epochs_to_steps(
-    epochs: float, *, num_frames: int, batch_size: int, world_size: int
-) -> int:
+def epochs_to_steps(epochs: float, *, num_frames: int, batch_size: int, world_size: int) -> int:
     """Convert a total epoch target to distributed optimizer steps."""
     if num_frames <= 0:
         raise ValueError("num_frames must be positive")
@@ -268,9 +285,7 @@ def epoch_aware_cycle(
                 continue
             if "index" not in batch:
                 raise KeyError("Raw training batch is missing 'index'")
-            batch[TRAINING_EPOCH] = torch.full_like(
-                torch.as_tensor(batch["index"]), epoch, dtype=torch.long
-            )
+            batch[TRAINING_EPOCH] = torch.full_like(torch.as_tensor(batch["index"]), epoch, dtype=torch.long)
             yielded += 1
             yield batch
         if yielded != expected_steps_per_epoch - offset:
@@ -297,6 +312,28 @@ def _read_resume_step(checkpoint_path: Path | None) -> int:
     return step
 
 
+def _assert_current_snvla_processor_config(preprocessor, policy_cfg: SNVLAConfig) -> None:
+    """Fail closed if a pretrained tokenizer step retained its saved training config."""
+    steps = [
+        step for step in preprocessor.steps if isinstance(step, SNVLAPrepareTrainingTokenizerProcessorStep)
+    ]
+    if len(steps) != 1:
+        raise AssertionError(
+            f"SNVLA preprocessor must contain exactly one training tokenizer step; found {len(steps)}"
+        )
+    processor_cfg = steps[0].config
+    mismatches = [
+        field
+        for field in _SNVLA_PROCESSOR_CONFIG_FIELDS
+        if getattr(processor_cfg, field) != getattr(policy_cfg, field)
+    ]
+    if mismatches:
+        raise AssertionError(
+            "SNVLA training tokenizer config does not match the active policy config: "
+            + ", ".join(mismatches)
+        )
+
+
 def configure_epoch_duration(
     cfg: TrainPipelineConfig,
     duration: TrainingDuration,
@@ -313,9 +350,7 @@ def configure_epoch_duration(
         cfg.save_freq = math.ceil(duration.save_every_epochs * steps_per_epoch)
     initial_step = _read_resume_step(cfg.checkpoint_path) if cfg.resume else 0
     if cfg.steps <= initial_step:
-        raise ValueError(
-            f"Epoch target step {cfg.steps} must be greater than saved step {initial_step}"
-        )
+        raise ValueError(f"Epoch target step {cfg.steps} must be greater than saved step {initial_step}")
     return steps_per_epoch, initial_step
 
 
@@ -352,6 +387,7 @@ def _epoch_training_patches(
     global _active_epoch_metrics
     original_cycle = lerobot_train.cycle
     original_make_datasets = lerobot_train.make_train_eval_datasets
+    original_make_processors = lerobot_train.make_pre_post_processors
     original_sampler_state = lerobot_train.compute_sampler_state
     original_epoch_metrics = _active_epoch_metrics
     initial_step = 0
@@ -379,6 +415,23 @@ def _epoch_training_patches(
                 initial_step=initial_step,
             )
             _log_epoch_duration(duration, inner_cfg, steps_per_epoch, initial_step)
+        elif (
+            steps_per_epoch is None
+            and isinstance(inner_cfg.policy, SNVLAConfig)
+            and inner_cfg.policy.state_dropout_enabled
+        ):
+            steps_per_epoch = epochs_to_steps(
+                1.0,
+                num_frames=dataset.num_frames,
+                batch_size=inner_cfg.batch_size,
+                world_size=accelerator.num_processes,
+            )
+            initial_step = _read_resume_step(inner_cfg.checkpoint_path) if inner_cfg.resume else 0
+            logging.info(
+                "Step-based state-dropout epoch annotation: steps_per_epoch=%s, initial_step=%s",
+                steps_per_epoch,
+                initial_step,
+            )
         return dataset, eval_dataset
 
     def cycle_with_epochs(dataloader):
@@ -397,13 +450,28 @@ def _epoch_training_patches(
         # sampler at frame zero avoids applying LeRobot's resume offset twice.
         return {"epoch": step // steps_per_epoch, "start_index": 0}
 
+    def make_processors_with_current_snvla_config(policy_cfg, *args, **kwargs):
+        if not isinstance(policy_cfg, SNVLAConfig):
+            return original_make_processors(policy_cfg, *args, **kwargs)
+
+        overrides = dict(kwargs.get("preprocessor_overrides") or {})
+        tokenizer_override = dict(overrides.get(_SNVLA_TOKENIZER_STEP) or {})
+        tokenizer_override["config"] = policy_cfg
+        overrides[_SNVLA_TOKENIZER_STEP] = tokenizer_override
+        kwargs["preprocessor_overrides"] = overrides
+        preprocessor, postprocessor = original_make_processors(policy_cfg, *args, **kwargs)
+        _assert_current_snvla_processor_config(preprocessor, policy_cfg)
+        return preprocessor, postprocessor
+
     lerobot_train.make_train_eval_datasets = make_datasets_and_set_duration
+    lerobot_train.make_pre_post_processors = make_processors_with_current_snvla_config
     lerobot_train.cycle = cycle_with_epochs
     lerobot_train.compute_sampler_state = sampler_state_without_batch_offset
     try:
         yield
     finally:
         _active_epoch_metrics = original_epoch_metrics
+        lerobot_train.make_pre_post_processors = original_make_processors
         lerobot_train.compute_sampler_state = original_sampler_state
         lerobot_train.cycle = original_cycle
         lerobot_train.make_train_eval_datasets = original_make_datasets

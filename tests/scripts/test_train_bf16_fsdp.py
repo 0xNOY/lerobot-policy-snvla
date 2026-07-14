@@ -1,14 +1,28 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 from accelerate.data_loader import DataLoaderShard
 from lerobot.datasets import EpisodeAwareSampler
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.logging_utils import MetricsTracker
 from torch.utils.data import Dataset
 
-from lerobot_policy_snvla.constants import TRAINING_EPOCH
+from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
+from lerobot_policy_snvla.configuration_snvla import SNVLAConfig
+from lerobot_policy_snvla.constants import (
+    CURRENT_NARRATION,
+    PREVIOUS_NARRATIONS,
+    STATE_DROPOUT_MASK,
+    TRAINING_EPOCH,
+)
+from lerobot_policy_snvla.processor_snvla import (
+    TASK_KEY,
+    SNVLAPrepareTrainingTokenizerProcessorStep,
+    make_snvla_pre_post_processors,
+)
 from lerobot_policy_snvla.scripts import train_bf16_fsdp
 from lerobot_policy_snvla.scripts.train_bf16_fsdp import (
     TrainingDuration,
@@ -23,6 +37,36 @@ from lerobot_policy_snvla.scripts.train_bf16_fsdp import (
 
 def make_tracker() -> MetricsTracker:
     return MetricsTracker(batch_size=1, num_frames=1, num_episodes=1, metrics={})
+
+
+class DummyTokenizer:
+    bos_token = "<bos>"
+    eos_token = "<eos>"
+    pad_token_id = 0
+
+    def convert_ids_to_tokens(self, token_id):
+        return f"<tok{token_id}>"
+
+    def __call__(self, text, **_):
+        ids = [min(ord(char), 255) for char in text]
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+
+def make_processor_config(**kwargs) -> SNVLAConfig:
+    defaults = {
+        "n_obs_steps": 1,
+        "input_features": {OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,))},
+        "output_features": {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(6,))},
+        "max_state_dim": 6,
+        "max_action_dim": 6,
+        "n_action_steps": 2,
+        "chunk_size": 10,
+        "tokenizer_max_length": 128,
+        "compile_model": False,
+        "device": "cpu",
+    }
+    defaults.update(kwargs)
+    return SNVLAConfig(**defaults)
 
 
 def test_epochs_to_steps_uses_distributed_batches():
@@ -94,6 +138,253 @@ def test_epoch_aware_cycle_aligns_actual_dataloader_shard_absolute_epoch():
     ]
 
 
+def test_step_based_snvla_dropout_annotates_epochs_without_changing_duration(monkeypatch):
+    cfg = SimpleNamespace(
+        policy=make_processor_config(state_dropout_enabled=True),
+        batch_size=2,
+        steps=100,
+        save_freq=50,
+        resume=False,
+        checkpoint_path=None,
+    )
+    monkeypatch.setattr(
+        train_bf16_fsdp.lerobot_train,
+        "make_train_eval_datasets",
+        lambda _: (SimpleNamespace(num_frames=4), None),
+    )
+
+    with train_bf16_fsdp._epoch_training_patches(
+        TrainingDuration(None, None, []), SimpleNamespace(num_processes=1)
+    ):
+        train_bf16_fsdp.lerobot_train.make_train_eval_datasets(cfg)
+        iterator = train_bf16_fsdp.lerobot_train.cycle(ReiterableBatches())
+        batches = [next(iterator) for _ in range(3)]
+
+    assert [batch[TRAINING_EPOCH].tolist() for batch in batches] == [[0], [0], [1]]
+    assert cfg.steps == 100
+    assert cfg.save_freq == 50
+    assert train_bf16_fsdp._active_epoch_metrics is None
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [make_processor_config(state_dropout_enabled=False), SimpleNamespace(type="act")],
+)
+def test_step_based_non_dropout_training_keeps_original_cycle(policy, monkeypatch):
+    marker = object()
+    cfg = SimpleNamespace(
+        policy=policy,
+        batch_size=2,
+        steps=100,
+        save_freq=50,
+        resume=False,
+        checkpoint_path=None,
+    )
+    monkeypatch.setattr(
+        train_bf16_fsdp.lerobot_train,
+        "make_train_eval_datasets",
+        lambda _: (SimpleNamespace(num_frames=4), None),
+    )
+    monkeypatch.setattr(train_bf16_fsdp.lerobot_train, "cycle", lambda _: marker)
+
+    with train_bf16_fsdp._epoch_training_patches(
+        TrainingDuration(None, None, []), SimpleNamespace(num_processes=1)
+    ):
+        train_bf16_fsdp.lerobot_train.make_train_eval_datasets(cfg)
+        result = train_bf16_fsdp.lerobot_train.cycle(ReiterableBatches())
+
+    assert result is marker
+
+
+def test_step_based_snvla_dropout_resume_uses_saved_epoch_and_offset(tmp_path, monkeypatch):
+    state_dir = tmp_path / "training_state"
+    state_dir.mkdir()
+    (state_dir / "training_step.json").write_text(json.dumps({"step": 3}))
+    cfg = SimpleNamespace(
+        policy=make_processor_config(state_dropout_enabled=True),
+        batch_size=2,
+        steps=100,
+        save_freq=50,
+        resume=True,
+        checkpoint_path=tmp_path,
+    )
+    monkeypatch.setattr(
+        train_bf16_fsdp.lerobot_train,
+        "make_train_eval_datasets",
+        lambda _: (SimpleNamespace(num_frames=4), None),
+    )
+
+    with train_bf16_fsdp._epoch_training_patches(
+        TrainingDuration(None, None, []), SimpleNamespace(num_processes=1)
+    ):
+        train_bf16_fsdp.lerobot_train.make_train_eval_datasets(cfg)
+        iterator = train_bf16_fsdp.lerobot_train.cycle(ReiterableBatches())
+        batches = [next(iterator) for _ in range(3)]
+        sampler_state = train_bf16_fsdp.lerobot_train.compute_sampler_state(3, 4, 2, 1)
+
+    assert [batch[TRAINING_EPOCH].tolist() for batch in batches] == [[1], [2], [2]]
+    assert [batch["index"].tolist() for batch in batches] == [[1], [0], [1]]
+    assert sampler_state == {"epoch": 1, "start_index": 0}
+
+
+def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches(tmp_path, monkeypatch):
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
+    stale_cfg = make_processor_config(
+        n_action_steps=2,
+        state_dropout_enabled=False,
+        state_dropout_ratio=0.5,
+        state_dropout_seed=0,
+        narration_loss_weight=2.0,
+    )
+    stale_preprocessor, stale_postprocessor = make_snvla_pre_post_processors(stale_cfg, dataset_stats={})
+    stale_preprocessor.save_pretrained(tmp_path)
+    stale_postprocessor.save_pretrained(tmp_path)
+
+    config_path = tmp_path / "policy_preprocessor.json"
+    saved = json.loads(config_path.read_text())
+    tokenizer_step = next(
+        step
+        for step in saved["steps"]
+        if step.get("registry_name") == "snvla_prepare_training_tokenizer_processor_step"
+    )
+    for field in ("state_dropout_enabled", "state_dropout_ratio", "state_dropout_seed"):
+        tokenizer_step["config"]["config"].pop(field)
+    config_path.write_text(json.dumps(saved))
+
+    active_cfg = replace(
+        stale_cfg,
+        n_action_steps=10,
+        state_dropout_enabled=True,
+        state_dropout_ratio=0.25,
+        state_dropout_seed=83,
+        narration_loss_weight=7.0,
+    )
+    duration = TrainingDuration(None, None, [])
+    accelerator = SimpleNamespace(num_processes=1)
+    with train_bf16_fsdp._epoch_training_patches(duration, accelerator):
+        preprocessor, postprocessor = train_bf16_fsdp.lerobot_train.make_pre_post_processors(
+            active_cfg,
+            pretrained_path=str(tmp_path),
+            preprocessor_overrides={"device_processor": {"device": "cpu"}},
+        )
+
+    tokenizer_processor = next(
+        step
+        for step in preprocessor.steps
+        if type(step).__name__ == "SNVLAPrepareTrainingTokenizerProcessorStep"
+    )
+    assert tokenizer_processor.config.state_dropout_enabled is True
+    assert tokenizer_processor.config.state_dropout_ratio == pytest.approx(0.25)
+    assert tokenizer_processor.config.state_dropout_seed == 83
+    assert tokenizer_processor.config.n_action_steps == 10
+    assert tokenizer_processor.config.narration_loss_weight == pytest.approx(7.0)
+    device_processor = next(
+        step for step in preprocessor.steps if type(step).__name__ == "DeviceProcessorStep"
+    )
+    assert device_processor.device == "cpu"
+
+    raw_batch = {
+        "index": torch.arange(64),
+        OBS_STATE: torch.zeros(64, 6),
+        ACTION: torch.zeros(64, 6),
+        TASK_KEY: ["pick up"] * 64,
+        CURRENT_NARRATION: [""] * 64,
+        PREVIOUS_NARRATIONS: ["[]"] * 64,
+    }
+
+    class SingleBatch:
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            yield {
+                key: value.clone() if isinstance(value, torch.Tensor) else list(value)
+                for key, value in raw_batch.items()
+            }
+
+    batches = epoch_aware_cycle(SingleBatch(), start_step=0, expected_steps_per_epoch=1)
+    epoch_zero = preprocessor(next(batches))
+    epoch_one = preprocessor(next(batches))
+    repeated_epoch_one = preprocessor(
+        next(epoch_aware_cycle(SingleBatch(), start_step=1, expected_steps_per_epoch=1))
+    )
+
+    assert not epoch_zero[STATE_DROPOUT_MASK].any()
+    assert epoch_one[STATE_DROPOUT_MASK].any()
+    torch.testing.assert_close(epoch_one[STATE_DROPOUT_MASK], repeated_epoch_one[STATE_DROPOUT_MASK])
+    assert epoch_one[STATE_DROPOUT_MASK].float().mean().item() == pytest.approx(0.25, abs=0.1)
+
+    reconciled_path = tmp_path / "reconciled"
+    preprocessor.save_pretrained(reconciled_path)
+    postprocessor.save_pretrained(reconciled_path)
+    reloaded, _ = train_bf16_fsdp.lerobot_train.make_pre_post_processors(
+        active_cfg, pretrained_path=str(reconciled_path)
+    )
+    reloaded_cfg = next(
+        step.config for step in reloaded.steps if isinstance(step, SNVLAPrepareTrainingTokenizerProcessorStep)
+    )
+    assert reloaded_cfg.state_dropout_enabled is True
+    assert reloaded_cfg.state_dropout_ratio == pytest.approx(0.25)
+    assert reloaded_cfg.state_dropout_seed == 83
+    assert reloaded_cfg.n_action_steps == 10
+    assert reloaded_cfg.narration_loss_weight == pytest.approx(7.0)
+
+
+def test_snvla_processor_config_assertion_reports_mismatch(monkeypatch):
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
+    active_cfg = make_processor_config(narration_loss_weight=7.0)
+    stale_step = SNVLAPrepareTrainingTokenizerProcessorStep(
+        config=replace(active_cfg, narration_loss_weight=2.0)
+    )
+
+    with pytest.raises(AssertionError, match="narration_loss_weight"):
+        train_bf16_fsdp._assert_current_snvla_processor_config(
+            SimpleNamespace(steps=[stale_step]), active_cfg
+        )
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_snvla_processor_config_assertion_requires_exactly_one_tokenizer_step(count, monkeypatch):
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
+    active_cfg = make_processor_config()
+    steps = [SNVLAPrepareTrainingTokenizerProcessorStep(config=active_cfg) for _ in range(count)]
+
+    with pytest.raises(AssertionError, match=f"found {count}"):
+        train_bf16_fsdp._assert_current_snvla_processor_config(SimpleNamespace(steps=steps), active_cfg)
+
+
+def test_processor_factory_patch_does_not_change_non_snvla(monkeypatch):
+    marker = object()
+    seen = {}
+
+    def fake_factory(policy_cfg, *args, **kwargs):
+        seen.update(policy_cfg=policy_cfg, args=args, kwargs=kwargs)
+        return marker
+
+    monkeypatch.setattr(train_bf16_fsdp.lerobot_train, "make_pre_post_processors", fake_factory)
+    policy_cfg = SimpleNamespace(type="act")
+    overrides = {"device_processor": {"device": "cpu"}}
+    with train_bf16_fsdp._epoch_training_patches(
+        TrainingDuration(None, None, []), SimpleNamespace(num_processes=1)
+    ):
+        result = train_bf16_fsdp.lerobot_train.make_pre_post_processors(
+            policy_cfg, "pretrained", preprocessor_overrides=overrides
+        )
+
+    assert result is marker
+    assert seen == {
+        "policy_cfg": policy_cfg,
+        "args": ("pretrained",),
+        "kwargs": {"preprocessor_overrides": overrides},
+    }
+
+
 @pytest.mark.parametrize("form", [["--epochs=3.0"], ["--epochs", "3.0"]])
 def test_parse_training_duration_supports_equals_and_split_forms(form):
     duration = parse_training_duration([*form, "--batch_size=8"])
@@ -138,9 +429,7 @@ def test_save_every_epochs_requires_epochs_and_is_positive():
 
 
 def test_epoch_aware_cycle_asserts_prepared_dataloader_length():
-    iterator = epoch_aware_cycle(
-        ReiterableBatches(), start_step=0, expected_steps_per_epoch=3
-    )
+    iterator = epoch_aware_cycle(ReiterableBatches(), start_step=0, expected_steps_per_epoch=3)
 
     with pytest.raises(AssertionError, match="Prepared DataLoader length"):
         next(iterator)
@@ -154,13 +443,9 @@ def test_configure_duration_uses_selected_frames_world_size_and_save_interval():
         resume=False,
         checkpoint_path=None,
     )
-    duration = TrainingDuration(
-        epochs=2.5, save_every_epochs=0.5, remaining_argv=[]
-    )
+    duration = TrainingDuration(epochs=2.5, save_every_epochs=0.5, remaining_argv=[])
 
-    steps_per_epoch, initial_step = configure_epoch_duration(
-        cfg, duration, num_frames=101, world_size=2
-    )
+    steps_per_epoch, initial_step = configure_epoch_duration(cfg, duration, num_frames=101, world_size=2)
 
     assert steps_per_epoch == 7
     assert cfg.steps == 18
@@ -258,9 +543,7 @@ def test_remote_main_rejects_float_epochs_before_submission(monkeypatch):
 
 
 def test_update_policy_exposes_exact_epoch_duration_metrics_across_resume(monkeypatch):
-    tracker = MetricsTracker(
-        batch_size=1, num_frames=4, num_episodes=1, metrics={}, initial_step=3
-    )
+    tracker = MetricsTracker(batch_size=1, num_frames=4, num_episodes=1, metrics={}, initial_step=3)
     monkeypatch.setattr(
         train_bf16_fsdp,
         "_lerobot_update_policy",
