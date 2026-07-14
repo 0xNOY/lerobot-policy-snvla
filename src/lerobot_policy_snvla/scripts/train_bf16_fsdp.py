@@ -18,18 +18,69 @@ from accelerate.utils import DistributedDataParallelKwargs
 from lerobot.scripts import lerobot_train
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 
+from lerobot_policy_snvla.constants import (
+    GROUP_METRIC_COUNT_PREFIX,
+    GROUP_METRIC_NUMERATOR_PREFIX,
+)
 
 _lerobot_update_policy = lerobot_train.update_policy
 
 
+def _record_globally_weighted_metrics(
+    train_metrics: MetricsTracker,
+    output_dict: dict[str, Any],
+    accelerator: Accelerator | None,
+) -> set[str]:
+    metric_names = [
+        name.removeprefix(GROUP_METRIC_NUMERATOR_PREFIX)
+        for name in output_dict
+        if name.startswith(GROUP_METRIC_NUMERATOR_PREFIX)
+    ]
+    for name in metric_names:
+        output_dict.pop(name, None)
+        numerator = output_dict.pop(f"{GROUP_METRIC_NUMERATOR_PREFIX}{name}")
+        count_key = f"{GROUP_METRIC_COUNT_PREFIX}{name}"
+        if count_key not in output_dict:
+            raise KeyError(f"Missing distributed metric count for {name}")
+        count = output_dict.pop(count_key)
+        totals = torch.stack([numerator.detach().float(), count.detach().float()])
+        if accelerator is not None:
+            totals = accelerator.reduce(totals, reduction="sum")
+        global_numerator, global_count = totals
+        global_mean = torch.where(
+            global_count > 0,
+            global_numerator / global_count.clamp(min=1.0),
+            torch.zeros_like(global_numerator),
+        )
+        if name not in train_metrics.metrics:
+            train_metrics.metrics[name] = AverageMeter(name, ":.4f", reduction="mean")
+        meter = train_metrics.metrics[name]
+        count_value = global_count.item()
+        if count_value > 0:
+            meter.update(global_mean.item(), n=count_value)
+        else:
+            meter.val = 0.0
+            if meter.count == 0:
+                meter.avg = 0.0
+    return set(metric_names)
+
+
 def record_output_metrics(
-    train_metrics: MetricsTracker, output_dict: dict[str, Any] | None
+    train_metrics: MetricsTracker,
+    output_dict: dict[str, Any] | None,
+    accelerator: Accelerator | None = None,
 ) -> None:
     """Add scalar tensor policy outputs to LeRobot's normal metric tracker."""
     if not output_dict:
         return
 
+    globally_weighted = _record_globally_weighted_metrics(
+        train_metrics, output_dict, accelerator
+    )
+
     for name, value in output_dict.items():
+        if name in globally_weighted:
+            continue
         if not isinstance(value, torch.Tensor) or value.ndim != 0:
             continue
         if name not in train_metrics.metrics:
@@ -40,7 +91,10 @@ def record_output_metrics(
 def update_policy(*args, **kwargs):
     """Delegate optimization to LeRobot and register its scalar policy outputs."""
     train_metrics, output_dict = _lerobot_update_policy(*args, **kwargs)
-    record_output_metrics(train_metrics, output_dict)
+    accelerator = kwargs.get("accelerator")
+    if accelerator is None and len(args) > 5:
+        accelerator = args[5]
+    record_output_metrics(train_metrics, output_dict, accelerator)
     return train_metrics, output_dict
 
 

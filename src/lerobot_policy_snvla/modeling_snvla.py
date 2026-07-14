@@ -14,21 +14,25 @@ from lerobot.policies.pi05.modeling_pi05 import (
     make_att_2d_masks,
 )
 from lerobot.policies.pi_gemma import _gated_residual
+from lerobot.policies.utils import log_model_loading_keys
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
 )
+from safetensors.torch import load_file as load_safetensors_file
 from torch import Tensor, nn
 from transformers import AutoTokenizer
 from transformers.models.gemma import modeling_gemma
 
 from .configuration_snvla import SNVLAConfig
 from .constants import (
+    GROUP_METRIC_COUNT_PREFIX,
+    GROUP_METRIC_NUMERATOR_PREFIX,
     NARRATION_TARGET_MASK,
     OBS_LANGUAGE_MODE_MASK,
-    STATE_RANDOMIZED_TEXT_ONLY_MASK,
+    STATE_DROPOUT_MASK,
 )
 from .processor_snvla import (
     OBS_LANGUAGE_TOKEN_AR_MASK,
@@ -62,17 +66,12 @@ def select_text_loss_inputs(language_out, language_tokens, language_loss_masks, 
 
 def reduce_training_losses(
     action_loss_raw,
-    diffusion_loss_masks,
     txt_loss_raw,
     text_loss_weights,
     diffusion_loss_coeff,
 ):
-    """Reduce action loss over active samples and text loss over weighted tokens."""
-    per_sample_action = action_loss_raw.mean(dim=(1, 2))
-    active = diffusion_loss_masks.to(
-        device=per_sample_action.device, dtype=per_sample_action.dtype
-    ).view(-1)
-    action_loss = (per_sample_action * active).sum() / active.sum().clamp(min=1.0)
+    """Reduce full-batch action loss and text loss over weighted tokens."""
+    action_loss = action_loss_raw.mean()
 
     valid_loss_mask = text_loss_weights.to(device=txt_loss_raw.device, dtype=txt_loss_raw.dtype)
     txt_loss = (txt_loss_raw * valid_loss_mask).sum() / valid_loss_mask.sum().clamp(min=1.0)
@@ -81,12 +80,24 @@ def reduce_training_losses(
 
 
 def _weighted_group_mean(raw_loss, weights, sample_mask):
+    numerator, count = _weighted_group_sum_count(raw_loss, weights, sample_mask)
+    return numerator / count.clamp(min=1.0)
+
+
+def _weighted_group_sum_count(raw_loss, weights, sample_mask):
     weights = weights.to(device=raw_loss.device, dtype=raw_loss.dtype)
     sample_mask = sample_mask.to(device=raw_loss.device, dtype=raw_loss.dtype).view(
         raw_loss.shape[0], *([1] * (raw_loss.ndim - 1))
     )
     grouped_weights = weights * sample_mask
-    return (raw_loss * grouped_weights).sum() / grouped_weights.sum().clamp(min=1.0)
+    return (raw_loss * grouped_weights).sum(), grouped_weights.sum()
+
+
+def _add_group_metric(metrics, name, raw_loss, weights, sample_mask):
+    numerator, count = _weighted_group_sum_count(raw_loss, weights, sample_mask)
+    metrics[name] = numerator / count.clamp(min=1.0)
+    metrics[f"{GROUP_METRIC_NUMERATOR_PREFIX}{name}"] = numerator
+    metrics[f"{GROUP_METRIC_COUNT_PREFIX}{name}"] = count
 
 
 def compute_grouped_text_metrics(
@@ -95,26 +106,135 @@ def compute_grouped_text_metrics(
     mode_loss_raw,
     mode_loss_weights,
     narration_target_mask,
-    state_randomized_text_only_mask,
+    state_dropout_mask,
+    action_loss_raw,
 ):
     """Compute detached scalar text and mode losses for training subgroups."""
     all_samples = torch.ones_like(narration_target_mask, dtype=torch.bool)
     metrics = {
         "mode_loss": _weighted_group_mean(mode_loss_raw, mode_loss_weights, all_samples),
-        "mode_loss_narration": _weighted_group_mean(
-            mode_loss_raw, mode_loss_weights, narration_target_mask
-        ),
-        "mode_loss_action": _weighted_group_mean(
-            mode_loss_raw, mode_loss_weights, ~narration_target_mask.bool()
-        ),
-        "text_loss_randomized": _weighted_group_mean(
-            txt_loss_raw, text_loss_weights, state_randomized_text_only_mask
-        ),
-        "text_loss_regular": _weighted_group_mean(
-            txt_loss_raw, text_loss_weights, ~state_randomized_text_only_mask.bool()
-        ),
     }
+    _add_group_metric(
+        metrics,
+        "mode_loss_narration",
+        mode_loss_raw,
+        mode_loss_weights,
+        narration_target_mask,
+    )
+    _add_group_metric(
+        metrics,
+        "mode_loss_action",
+        mode_loss_raw,
+        mode_loss_weights,
+        ~narration_target_mask.bool(),
+    )
+    for name, raw_loss, weights, sample_mask in (
+        ("text_loss_state_dropped", txt_loss_raw, text_loss_weights, state_dropout_mask),
+        (
+            "text_loss_state_present",
+            txt_loss_raw,
+            text_loss_weights,
+            ~state_dropout_mask.bool(),
+        ),
+        ("mode_loss_state_dropped", mode_loss_raw, mode_loss_weights, state_dropout_mask),
+        (
+            "mode_loss_state_present",
+            mode_loss_raw,
+            mode_loss_weights,
+            ~state_dropout_mask.bool(),
+        ),
+        (
+            "action_loss_state_dropped",
+            action_loss_raw,
+            torch.ones_like(action_loss_raw),
+            state_dropout_mask,
+        ),
+        (
+            "action_loss_state_present",
+            action_loss_raw,
+            torch.ones_like(action_loss_raw),
+            ~state_dropout_mask.bool(),
+        ),
+    ):
+        _add_group_metric(metrics, name, raw_loss, weights, sample_mask)
     return {name: value.detach() for name, value in metrics.items()}
+
+
+def restore_shared_state_dict_aliases(model, state_dict):
+    """Restore only missing checkpoint keys proven to share model tensor storage."""
+    restored = dict(state_dict)
+    alias_groups = {}
+    for key, tensor in model.state_dict().items():
+        if tensor.numel() == 0:
+            continue
+        storage = tensor.untyped_storage()
+        signature = (
+            storage.data_ptr(),
+            storage.nbytes(),
+            tensor.storage_offset(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+        )
+        alias_groups.setdefault(signature, []).append(key)
+
+    for aliases in alias_groups.values():
+        if len(aliases) < 2:
+            continue
+        loaded_aliases = [key for key in aliases if key in restored]
+        if not loaded_aliases:
+            continue
+        source = restored[loaded_aliases[0]]
+        if any(not torch.equal(source, restored[key]) for key in loaded_aliases[1:]):
+            raise ValueError(f"Conflicting checkpoint values for shared aliases: {aliases}")
+        for key in aliases:
+            if key not in restored:
+                restored[key] = source
+    return restored
+
+
+def initialize_state_projection_keys(state_dict, *, max_state_dim=None):
+    """Clone an old action projection into the new state projection keys."""
+    migrated = dict(state_dict)
+    prefixes = {
+        key[: -len("action_in_proj.weight")]
+        for key in migrated
+        if key.endswith("action_in_proj.weight")
+    }
+    state_prefixes = {
+        key[: -len("state_proj.weight")]
+        for key in migrated
+        if key.endswith("state_proj.weight")
+    }
+    if state_prefixes:
+        for prefix in state_prefixes:
+            if f"{prefix}state_proj.bias" not in migrated:
+                raise ValueError(f"Checkpoint has {prefix}state_proj.weight but no state_proj.bias")
+        return migrated
+    if len(prefixes) != 1:
+        raise ValueError(
+            "Cannot initialize state_proj: expected exactly one action_in_proj.weight"
+        )
+    prefix = prefixes.pop()
+    weight_key = f"{prefix}action_in_proj.weight"
+    bias_key = f"{prefix}action_in_proj.bias"
+    if bias_key not in migrated:
+        raise ValueError(f"Cannot initialize state_proj: missing required {bias_key}")
+    weight = migrated[weight_key]
+    bias = migrated[bias_key]
+    if weight.ndim != 2 or bias.ndim != 1 or weight.shape[0] != bias.shape[0]:
+        raise ValueError(
+            "Cannot initialize state_proj: incompatible action_in_proj weight/bias shapes "
+            f"{tuple(weight.shape)} and {tuple(bias.shape)}"
+        )
+    if max_state_dim is not None and weight.shape[1] != max_state_dim:
+        raise ValueError(
+            "Cannot initialize state_proj: action_in_proj input dimension "
+            f"{weight.shape[1]} does not match max_state_dim={max_state_dim}"
+        )
+    migrated[f"{prefix}state_proj.weight"] = weight.clone()
+    migrated[f"{prefix}state_proj.bias"] = bias.clone()
+    return migrated
 
 
 class FusedQKVProjection(nn.Module):
@@ -371,11 +491,23 @@ class SNVLACore(nn.Module):
         embs = self._cast_to_dtype(embs)
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
-        """Override embed_suffix to ensure dtype consistency."""
-        embs, pad_masks, att_masks, adarms_cond = PI05Pytorch.embed_suffix(self, noisy_actions, timestep)
-        # Ensure all outputs are in the correct dtype
-        embs = self._cast_to_dtype(embs)
+    def embed_suffix(self, state, noisy_actions, timestep):
+        """Prepend the real robot state to the PI0.5 action/time suffix."""
+        if state.dtype != self.state_proj.weight.dtype:
+            state = state.to(self.state_proj.weight.dtype)
+        state_emb = self._apply_checkpoint(self.state_proj, state)[:, None, :]
+        action_embs, action_pad_masks, action_att_masks, adarms_cond = (
+            PI05Pytorch.embed_suffix(self, noisy_actions, timestep)
+        )
+        embs = self._cast_to_dtype(torch.cat([state_emb, action_embs], dim=1))
+        state_pad_mask = torch.ones(
+            state.shape[0], 1, dtype=torch.bool, device=state_emb.device
+        )
+        pad_masks = torch.cat([state_pad_mask, action_pad_masks], dim=1)
+        state_att_mask = torch.ones(
+            state.shape[0], 1, dtype=action_att_masks.dtype, device=action_att_masks.device
+        )
+        att_masks = torch.cat([state_att_mask, action_att_masks], dim=1)
         if adarms_cond is not None:
             adarms_cond = self._cast_to_dtype(adarms_cond)
         return embs, pad_masks, att_masks, adarms_cond
@@ -384,6 +516,7 @@ class SNVLACore(nn.Module):
         self,
         prefix_pad_masks,
         past_key_values,
+        state,
         x_t,
         timestep,
     ):
@@ -391,7 +524,9 @@ class SNVLACore(nn.Module):
         Apply one denoising step of the noise `x_t` at a given timestep.
         Override to maintain dtype consistency throughout the computation.
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, timestep
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -449,6 +584,7 @@ class SNVLACore(nn.Module):
         )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
+        self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -491,13 +627,11 @@ class SNVLACore(nn.Module):
     def _reduce_training_losses(
         self,
         action_loss_raw,
-        diffusion_loss_masks,
         txt_loss_raw,
         text_loss_weights,
     ):
         return reduce_training_losses(
             action_loss_raw,
-            diffusion_loss_masks,
             txt_loss_raw,
             text_loss_weights,
             self.diffusion_loss_coeff,
@@ -510,12 +644,12 @@ class SNVLACore(nn.Module):
         language_tokens,
         language_padding_masks,
         language_attention_masks,
+        state,
         actions,
         language_loss_masks,
-        diffusion_loss_masks,
         language_mode_masks=None,
         narration_target_masks=None,
-        state_randomized_text_only_masks=None,
+        state_dropout_masks=None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         device = self.device
 
@@ -523,7 +657,7 @@ class SNVLACore(nn.Module):
         language_padding_masks = language_padding_masks.to(device)
         language_attention_masks = language_attention_masks.to(device)
         language_loss_masks = language_loss_masks.to(device)
-        diffusion_loss_masks = diffusion_loss_masks.to(device)
+        state = self._cast_to_dtype(state.to(device))
         if language_mode_masks is None:
             language_mode_masks = torch.zeros_like(language_tokens, dtype=torch.bool)
         else:
@@ -533,12 +667,12 @@ class SNVLACore(nn.Module):
             narration_target_masks = torch.zeros(batch_size, device=device, dtype=torch.bool)
         else:
             narration_target_masks = narration_target_masks.to(device=device, dtype=torch.bool).view(-1)
-        if state_randomized_text_only_masks is None:
-            state_randomized_text_only_masks = torch.zeros(
+        if state_dropout_masks is None:
+            state_dropout_masks = torch.zeros(
                 batch_size, device=device, dtype=torch.bool
             )
         else:
-            state_randomized_text_only_masks = state_randomized_text_only_masks.to(
+            state_dropout_masks = state_dropout_masks.to(
                 device=device, dtype=torch.bool
             ).view(-1)
 
@@ -585,7 +719,9 @@ class SNVLACore(nn.Module):
         )
 
         prefix_att_masks = prefix_att_masks.clone()
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, time
+        )
 
         # Attention Masks
         prefix_att_masks[:, -language_attention_masks.shape[1] :] = language_attention_masks
@@ -644,7 +780,6 @@ class SNVLACore(nn.Module):
         )
         loss, action_loss, txt_loss = self._reduce_training_losses(
             action_loss_raw,
-            diffusion_loss_masks,
             txt_loss_raw,
             text_loss_weights,
         )
@@ -671,13 +806,14 @@ class SNVLACore(nn.Module):
             mode_loss_raw,
             mode_loss_weights,
             narration_target_masks,
-            state_randomized_text_only_masks,
+            state_dropout_masks,
+            action_loss_raw,
         )
-        active_action_fraction = diffusion_loss_masks.float().sum() / max(
-            diffusion_loss_masks.numel(), 1
+        state_dropout_fraction = state_dropout_masks.float().sum() / max(
+            state_dropout_masks.numel(), 1
         )
-        state_randomized_fraction = state_randomized_text_only_masks.float().sum() / max(
-            state_randomized_text_only_masks.numel(), 1
+        state_dropout_count = torch.tensor(
+            state_dropout_masks.numel(), device=device, dtype=torch.float32
         )
 
         info = {
@@ -687,8 +823,11 @@ class SNVLACore(nn.Module):
             "text_loss_ratio": txt_loss_ratio.detach(),
             "action_loss_ratio": action_loss_ratio.detach(),
             "ave_text_loss_weight": ave_text_loss_weight.detach(),
-            "active_action_fraction": active_action_fraction.detach(),
-            "state_randomized_fraction": state_randomized_fraction.detach(),
+            "state_dropout_fraction": state_dropout_fraction.detach(),
+            f"{GROUP_METRIC_NUMERATOR_PREFIX}state_dropout_fraction": state_dropout_masks.float()
+            .sum()
+            .detach(),
+            f"{GROUP_METRIC_COUNT_PREFIX}state_dropout_fraction": state_dropout_count.detach(),
             **grouped_metrics,
         }
         return loss, info
@@ -700,8 +839,30 @@ class SNVLAPolicy(PI05Policy):
     config_class = SNVLAConfig
     name = "snvla"
 
+    def prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
+        """Pad or truncate the normalized robot state to the expert input width."""
+        state = batch[OBS_STATE][..., : self.config.max_state_dim]
+        if state.shape[-1] < self.config.max_state_dim:
+            state = F.pad(state, (0, self.config.max_state_dim - state.shape[-1]))
+        return state
+
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file, map_location, strict):
+        """Load safetensors after migrating legacy SN-VLA checkpoint keys."""
+        del strict  # SN-VLA checkpoints are always loaded exactly after migration.
+        state_dict = load_safetensors_file(model_file, device=map_location)
+        state_dict = model._fix_pytorch_state_dict_keys(state_dict, model.config)
+        state_dict = restore_shared_state_dict_aliases(model, state_dict)
+        load_result = model.load_state_dict(state_dict, strict=True)
+        log_model_loading_keys(load_result.missing_keys, load_result.unexpected_keys)
+        print("All keys loaded successfully!")
+        return model
+
     def _fix_pytorch_state_dict_keys(self, state_dict, model_config):
         fixed_state_dict = super()._fix_pytorch_state_dict_keys(state_dict, model_config)
+        fixed_state_dict = initialize_state_projection_keys(
+            fixed_state_dict, max_state_dim=model_config.max_state_dim
+        )
         remapped_state_dict = {}
         for key, value in fixed_state_dict.items():
             key = re.sub(
@@ -922,7 +1083,14 @@ class SNVLAPolicy(PI05Policy):
         return new_token.view(-1, 1), new_logits, new_kv_cache, position_ids
 
     @torch.no_grad()
-    def _act(self, kv_cache: Any, prefix_pad_masks: Tensor, bsize: int, current_pos_id: Tensor):
+    def _act(
+        self,
+        kv_cache: Any,
+        prefix_pad_masks: Tensor,
+        state: Tensor,
+        bsize: int,
+        current_pos_id: Tensor,
+    ):
         """Generates an action chunk using the diffusion model."""
 
         # `BEGIN_OF_ACTION` トークンをフォワード
@@ -986,6 +1154,7 @@ class SNVLAPolicy(PI05Policy):
             v_t = self.model.denoise_step(
                 prefix_pad_masks=act_prefix_pad_masks,
                 past_key_values=act_kv_cache,
+                state=state,
                 x_t=x_t,
                 timestep=expanded_time,
             )
@@ -1013,6 +1182,7 @@ class SNVLAPolicy(PI05Policy):
 
         # 観測の準備
         images, img_masks = self._preprocess_images(batch)
+        state = self.prepare_state(batch)
 
         # 動的トークン化
         token_data = self._build_prompt_and_tokenize(batch)
@@ -1086,7 +1256,7 @@ class SNVLAPolicy(PI05Policy):
 
         # 行動生成
         bsize = images[0].shape[0]
-        self._act(kv_cache, prefix_pad_masks, bsize, current_pos_id)
+        self._act(kv_cache, prefix_pad_masks, state, bsize, current_pos_id)
 
         return self._action_queue.popleft()
 
@@ -1104,15 +1274,14 @@ class SNVLAPolicy(PI05Policy):
         )
 
         actions = self.prepare_action(batch)
+        state = self.prepare_state(batch)
 
-        # 拡散損失マスク (データセットから来ると仮定)
-        diffusion_loss_masks = batch.get("diffusion_loss_mask", torch.ones_like(actions[:, 0, 0]))
         narration_target_masks = batch.get(
             NARRATION_TARGET_MASK,
             torch.zeros(actions.shape[0], device=actions.device, dtype=torch.bool),
         )
-        state_randomized_text_only_masks = batch.get(
-            STATE_RANDOMIZED_TEXT_ONLY_MASK,
+        state_dropout_masks = batch.get(
+            STATE_DROPOUT_MASK,
             torch.zeros(actions.shape[0], device=actions.device, dtype=torch.bool),
         )
 
@@ -1122,15 +1291,18 @@ class SNVLAPolicy(PI05Policy):
             language_tokens=language_tokens,
             language_padding_masks=language_attention_masks,
             language_attention_masks=language_ar_masks,
+            state=state,
             actions=actions,
             language_loss_masks=language_loss_masks,
-            diffusion_loss_masks=diffusion_loss_masks,
             language_mode_masks=language_mode_masks,
             narration_target_masks=narration_target_masks,
-            state_randomized_text_only_masks=state_randomized_text_only_masks,
+            state_dropout_masks=state_dropout_masks,
         )
 
     @classmethod
     def from_pretrained(cls, pretrained_name_or_path, **kwargs):
         """Load pretrained model and extract normalization statistics from the preprocessor."""
-        return super().from_pretrained(pretrained_name_or_path, **kwargs)
+        kwargs.pop("strict", None)
+        return super(PI05Policy, cls).from_pretrained(
+            pretrained_name_or_path, strict=True, **kwargs
+        )

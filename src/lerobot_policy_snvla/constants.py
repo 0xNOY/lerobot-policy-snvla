@@ -10,7 +10,7 @@ STATE_DROPOUT_MASK = "state_dropout_mask"
 TRAINING_EPOCH = "training_epoch"
 NARRATION_TARGET_MASK = "narration_target_mask"
 
-# Deprecated compatibility constant; migrate the remaining consumer and remove it in Task 3.
-STATE_RANDOMIZED_TEXT_ONLY_MASK = "state_randomized_text_only_mask"
+GROUP_METRIC_NUMERATOR_PREFIX = "__metric_numerator__/"
+GROUP_METRIC_COUNT_PREFIX = "__metric_count__/"
 
 COMPLEMENTARY_DATA = "complementary_data"

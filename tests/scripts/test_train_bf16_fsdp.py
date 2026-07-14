@@ -41,6 +41,114 @@ def test_record_output_metrics_ignores_non_scalar_values():
     assert tracker.metrics == {}
 
 
+class SimulatedTwoRankAccelerator:
+    def __init__(self, other_rank_numerator: float, other_rank_count: float):
+        self.other_rank = torch.tensor([other_rank_numerator, other_rank_count])
+
+    def reduce(self, tensor, reduction="sum"):
+        assert reduction == "sum"
+        return tensor + self.other_rank.to(tensor)
+
+
+def test_record_output_metrics_uses_global_sums_for_unequal_rank_counts():
+    tracker = make_tracker()
+    output = {
+        "text_loss_state_dropped": torch.tensor(2.0),
+        "__metric_numerator__/text_loss_state_dropped": torch.tensor(2.0),
+        "__metric_count__/text_loss_state_dropped": torch.tensor(1.0),
+    }
+
+    record_output_metrics(
+        tracker,
+        output,
+        SimulatedTwoRankAccelerator(other_rank_numerator=12.0, other_rank_count=3.0),
+    )
+
+    meter = tracker.metrics["text_loss_state_dropped"]
+    assert meter.avg == pytest.approx(3.5)
+    assert meter.count == pytest.approx(4.0)
+    assert output == {}
+
+    next_output = {
+        "text_loss_state_dropped": torch.tensor(10.0),
+        "__metric_numerator__/text_loss_state_dropped": torch.tensor(10.0),
+        "__metric_count__/text_loss_state_dropped": torch.tensor(1.0),
+    }
+    record_output_metrics(
+        tracker,
+        next_output,
+        SimulatedTwoRankAccelerator(other_rank_numerator=0.0, other_rank_count=0.0),
+    )
+    assert meter.avg == pytest.approx(4.8)
+    assert meter.count == pytest.approx(5.0)
+
+
+def test_record_output_metrics_handles_empty_local_and_global_groups():
+    local_empty = {
+        "action_loss_state_present": torch.tensor(0.0),
+        "__metric_numerator__/action_loss_state_present": torch.tensor(0.0),
+        "__metric_count__/action_loss_state_present": torch.tensor(0.0),
+    }
+    tracker = make_tracker()
+    record_output_metrics(
+        tracker,
+        local_empty,
+        SimulatedTwoRankAccelerator(other_rank_numerator=10.0, other_rank_count=2.0),
+    )
+    assert tracker.metrics["action_loss_state_present"].avg == pytest.approx(5.0)
+    assert tracker.metrics["action_loss_state_present"].count == pytest.approx(2.0)
+
+    globally_empty = {
+        "mode_loss_state_dropped": torch.tensor(0.0),
+        "__metric_numerator__/mode_loss_state_dropped": torch.tensor(0.0),
+        "__metric_count__/mode_loss_state_dropped": torch.tensor(0.0),
+    }
+    empty_tracker = make_tracker()
+    record_output_metrics(
+        empty_tracker,
+        globally_empty,
+        SimulatedTwoRankAccelerator(other_rank_numerator=0.0, other_rank_count=0.0),
+    )
+    meter = empty_tracker.metrics["mode_loss_state_dropped"]
+    assert meter.avg == pytest.approx(0.0)
+    assert meter.val == pytest.approx(0.0)
+    assert meter.count == pytest.approx(0.0)
+    assert torch.isfinite(torch.tensor(meter.avg))
+    assert globally_empty == {}
+
+
+def test_record_output_metrics_globally_aggregates_narration_and_action_modes():
+    tracker = make_tracker()
+    narration_output = {
+        "mode_loss_narration": torch.tensor(1.0),
+        "__metric_numerator__/mode_loss_narration": torch.tensor(1.0),
+        "__metric_count__/mode_loss_narration": torch.tensor(1.0),
+    }
+    record_output_metrics(
+        tracker,
+        narration_output,
+        SimulatedTwoRankAccelerator(other_rank_numerator=9.0, other_rank_count=3.0),
+    )
+    assert tracker.metrics["mode_loss_narration"].avg == pytest.approx(2.5)
+    assert tracker.metrics["mode_loss_narration"].count == pytest.approx(4.0)
+
+    action_output = {
+        "mode_loss_action": torch.tensor(0.0),
+        "__metric_numerator__/mode_loss_action": torch.tensor(0.0),
+        "__metric_count__/mode_loss_action": torch.tensor(0.0),
+    }
+    record_output_metrics(
+        tracker,
+        action_output,
+        SimulatedTwoRankAccelerator(other_rank_numerator=0.0, other_rank_count=0.0),
+    )
+    action_meter = tracker.metrics["mode_loss_action"]
+    assert action_meter.avg == pytest.approx(0.0)
+    assert action_meter.count == pytest.approx(0.0)
+    assert torch.isfinite(torch.tensor(action_meter.avg))
+    assert action_output == {}
+
+
 @pytest.mark.parametrize(
     "argv",
     [
