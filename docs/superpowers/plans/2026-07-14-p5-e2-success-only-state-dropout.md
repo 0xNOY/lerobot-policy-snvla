@@ -454,7 +454,7 @@ git commit -m "docs: replace corrective training with success-only plan"
 **Files:**
 - Modify: `docs/superpowers/reports/2026-07-14-p5-e2-success-only-report.md`
 
-- [ ] **Step 1: Collect 150 new successful episodes**
+- [x] **Step 1: Collect 150 new successful episodes**
 
 ```bash
 MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.collect \
@@ -465,7 +465,7 @@ MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.collect \
 
 Require `saved=150`, `narration_ok=150/150`, and no source-root overwrite.
 
-- [ ] **Step 2: Trim the immutable merge, then augment forward-only**
+- [x] **Step 2: Trim the immutable merge, then augment forward-only**
 
 ```bash
 .venv/bin/python -m lerobot_policy_snvla.scripts.trim_success_dataset \
@@ -496,15 +496,15 @@ mode on the augmented result, validate schema, episode/frame identity, event-tra
 and that augmentation did not move completion narration before its corresponding simulator event;
 do not count repeated augmented narration strings as additional events.
 
-- [ ] **Step 3: Transfer code and data to DGX**
+- [x] **Step 3: Transfer code and data to DGX**
 
 Use the handoff's non-destructive rsync rules. Transfer the augmented dataset, manifest, and current
-branch. Verify DGX dataset metadata reports 200 episodes and `max_state_dim/max_action_dim=32/32`.
+source tree. Verify DGX dataset metadata reports 200 episodes and `max_state_dim/max_action_dim=32/32`.
 
-- [ ] **Step 4: Record and commit dataset evidence**
+- [x] **Step 4: Record and commit dataset evidence**
 
-Append roots, hashes, counts, seed band, and validation output to the report. Commit only the report;
-never commit dataset files or `outputs/`.
+Append roots, hashes, counts, seed band, and validation output to the report. Commit only the report
+and this active-plan checkbox update; never commit dataset files or `outputs/`.
 
 ---
 
