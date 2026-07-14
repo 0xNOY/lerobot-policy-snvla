@@ -8,3 +8,4 @@ dist/
 *.egg-info/
 stats_outputs/
 snvla_episode_*_images/
+tmp/
