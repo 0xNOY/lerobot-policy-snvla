@@ -2,7 +2,9 @@
 
 **Status:** Tasks 1–5 were complete at `1aad432`; Task 6 verification ran against that commit and
 its documentation was committed as `e0a86e8`. The 16-epoch update is `80a5b5f`. Tasks 1–6 are
-complete; resume execution at Task 7.
+complete. Task 7 is blocked at its explicit collection stop condition: the fixed collection run
+reported a rejected episode with both task success and narration-stream validation false. No merge,
+augmentation, transfer, or training followed.
 
 ## Objective and decisions
 
@@ -106,17 +108,63 @@ Partial loading, warning suppression, and `strict=False` are not acceptable subs
 - Generated datasets, recordings, JSON under `outputs/`, videos, logs, and model checkpoints are
   untracked artifacts and must never be committed.
 
-## Pending Task 7 — collect, merge, augment, transfer
+## Blocked Task 7 — collect, merge, augment, transfer
 
-1. Collect exactly 150 successes at `~/datasets/t1_n3_v5_success150` with seed `20000000`, three
-   blocks, and 16 workers. Require `saved=150` and `narration_ok=150/150`.
-2. Merge the raw existing `~/datasets/t1_n3_v3` (50) and the new root (150) exactly once into
-   `~/datasets/t1_n3_v5_success200`, requiring 200 episodes and a 50-episode ablation subset.
-3. Run `augment_narrations --window-size 5 --forward-only` exactly once into
-   `~/datasets/t1_n3_v5_success200_aug`.
-4. Run portable `prepare_success_dataset --validate-only --expected-episodes 200`, transfer the
-   current branch/data/manifest, and confirm DGX metadata and dimensions 32/32.
-5. Record roots, hashes, counts, seed band, and validation output here. Commit only this report.
+### Preflight and existing-source validation
+
+The 2026-07-15 JST preflight ran from
+`/home/noy/Workspaces/lerobot-policy-snvla` on branch `feat/p5-e2-sim-eval` at
+`6f17a4a6cd3b9bbcd92376405d283dc9821d8dd1`. The worktree was clean. Local free space was 205 GiB.
+The three new local roots were absent:
+
+- `/home/noy/datasets/t1_n3_v5_success150`
+- `/home/noy/datasets/t1_n3_v5_success200`
+- `/home/noy/datasets/t1_n3_v5_success200_aug`
+
+The existing source `/home/noy/datasets/t1_n3_v3` was audited read-only with
+`validate_success_dataset(..., expected_episodes=50, require_manifest=False)`. It passed strict
+schema, contiguous episode/frame identity, six ordered simulator event transitions per episode,
+canonical narration centers/completion timing, and MP4 pointer/boundary/coverage validation in
+21.490 seconds. Its metadata reports 50 episodes, 38,642 frames, one task, 20 fps, native
+`observation.state` shape `(8,)`, native `action` shape `(7,)`, and two 256×256 video features.
+The source `meta/info.json` SHA-256 is
+`269dee9874ae1b96e9cec87a1aa52e276f4eb5aa8c313b3af044583818c433f3`; the validation log is
+`/tmp/p5e2_task7_source50.log` with SHA-256
+`5f51dd8983d15ab32681f53ea68c20f264dded00b27e45805873a97e0baf4da1`.
+
+SSH alias `dgx` reached `inamura-lab-dgx` as `/home/takenaka`. DGX reported 384 GiB free in home
+and 3.3 TiB free on `/raid`. `/home/takenaka/datasets/t1_n3_v5_success200_aug` was absent.
+`/raid/takenaka/snvla/checkpoints` already existed and was writable. The code destination
+`/home/takenaka/Workspaces/lerobot-policy-snvla` existed but did not contain `.git`, so no remote
+branch/commit identity is claimed. No code or dataset was transferred.
+
+### Collection stop evidence
+
+The required command was started at 2026-07-15 01:40:05 JST with repo ID
+`local/t1_n3_v5_success150`, root `/home/noy/datasets/t1_n3_v5_success150`, requested episode count
+150, three blocks, base seed `20000000`, and 16 workers. Before a completion summary, it emitted:
+
+```text
+WARNING:root:episode rejected (success=False, narration_stream_ok=False)
+```
+
+This is exactly the instructed failure/semantic stop condition. The process was terminated rather
+than silently retrying/filling the rejected result. The log contains one rejection and contains
+neither `saved=150` nor `narration_ok=150/150`; therefore no completed 150-episode seed band or
+collection totals are claimed. The preserved log is
+`/tmp/p5e2_task7_collect_success150.log` (54,536 bytes, 745 lines, SHA-256
+`6e21a6d401a9ac93a14a0f2eded05f1aff7994e82f3ec8cf5cfb567858ee88d6`). Its last modification was
+2026-07-15 01:41:20 JST. After shutdown, the requested collection root was absent, as were both
+merge/augmentation roots.
+
+Because collection did not reach `saved=150` and `narration_ok=150/150`, the 200-episode merge,
+source manifest/audit, forward-only augmentation, portable 200-episode validation, MP4/data asset
+checks, DGX rsync, and DGX validation were not run. Consequently there are no manifest split or
+ablation counts, 200-episode frame total, transfer hashes, or DGX dataset feature results to report.
+The planned training configuration remains `max_state_dim=32`, `max_action_dim=32`, and
+`n_action_steps=10`; these configured maxima must not be confused with the validated existing
+source's native 8/7 state/action feature dimensions. Task 7 remains unchecked and Task 8 must not
+start until the rejection is investigated and the collection disposition is explicitly chosen.
 
 ## Pending Task 8 — smoke and fixed efficacy gate
 
