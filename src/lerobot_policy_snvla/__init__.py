@@ -10,10 +10,10 @@ except ImportError as exc:
 from .configuration_snvla import SNVLAConfig
 from .constants import (
     CURRENT_NARRATION,
-    DIFFUSION_LOSS_MASK,
     NARRATION_TARGET_MASK,
     PREVIOUS_NARRATIONS,
-    STATE_RANDOMIZED_TEXT_ONLY_MASK,
+    STATE_DROPOUT_MASK,
+    TRAINING_EPOCH,
 )
 from .modeling_snvla import SNVLAPolicy
 from .processor_snvla import make_snvla_pre_post_processors
@@ -32,8 +32,8 @@ def _patch_batch_converters() -> None:
         for key in (
             CURRENT_NARRATION,
             PREVIOUS_NARRATIONS,
-            DIFFUSION_LOSS_MASK,
-            STATE_RANDOMIZED_TEXT_ONLY_MASK,
+            STATE_DROPOUT_MASK,
+            TRAINING_EPOCH,
             NARRATION_TARGET_MASK,
         ):
             if key in batch:
