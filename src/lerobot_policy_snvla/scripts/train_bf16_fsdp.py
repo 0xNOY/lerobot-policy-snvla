@@ -6,24 +6,41 @@ mixed-precision mode disabled while retaining bf16 autocast for the forward
 pass.
 """
 
+import json
+import logging
+import math
 import os
 import sys
 from collections.abc import Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from lerobot.scripts import lerobot_train
+from lerobot.configs import parser
+from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 
 from lerobot_policy_snvla.constants import (
     GROUP_METRIC_COUNT_PREFIX,
     GROUP_METRIC_NUMERATOR_PREFIX,
+    TRAINING_EPOCH,
 )
 
 _lerobot_update_policy = lerobot_train.update_policy
+_active_epoch_metrics: "EpochMetricContext | None" = None
+
+
+@dataclass(frozen=True)
+class EpochMetricContext:
+    requested_epochs: float
+    calculated_steps: int
+    steps_per_epoch: int
+    initial_step: int
 
 
 def _record_globally_weighted_metrics(
@@ -94,7 +111,31 @@ def update_policy(*args, **kwargs):
     accelerator = kwargs.get("accelerator")
     if accelerator is None and len(args) > 5:
         accelerator = args[5]
+    if _active_epoch_metrics is not None:
+        if output_dict is None:
+            output_dict = {}
+        current_step = train_metrics.steps + 1
+        output_dict.update(
+            {
+                "requested_epochs": torch.tensor(_active_epoch_metrics.requested_epochs),
+                "calculated_steps": torch.tensor(_active_epoch_metrics.calculated_steps),
+                "steps_per_epoch": torch.tensor(_active_epoch_metrics.steps_per_epoch),
+                "initial_step": torch.tensor(_active_epoch_metrics.initial_step),
+                "effective_epoch_progress": torch.tensor(
+                    current_step / _active_epoch_metrics.steps_per_epoch
+                ),
+            }
+        )
     record_output_metrics(train_metrics, output_dict, accelerator)
+    if _active_epoch_metrics is not None:
+        # W&B merges output_dict over tracker.to_dict(), and the meter is also
+        # kept point-in-time so neither path reports a window average as current
+        # epoch progress.
+        progress = train_metrics.metrics["effective_epoch_progress"]
+        progress.val = output_dict["effective_epoch_progress"].item()
+        progress.avg = progress.val
+        progress.sum = progress.val
+        progress.count = 1
     return train_metrics, output_dict
 
 
@@ -122,6 +163,250 @@ def require_wandb_cli_args(argv: Sequence[str]) -> None:
         raise ValueError("SNVLA_REQUIRE_WANDB=1 requires --wandb.project")
 
 
+@dataclass(frozen=True)
+class TrainingDuration:
+    """SNVLA duration flags removed before Draccus parses the remaining CLI."""
+
+    epochs: float | None
+    save_every_epochs: float | None
+    remaining_argv: list[str]
+
+
+def _positive_finite_float(value: str | None, option: str) -> float:
+    if value is None:
+        raise ValueError(f"{option} requires a value")
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{option} must be a finite positive float") from exc
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError(f"{option} must be a finite positive float")
+    return result
+
+
+def parse_training_duration(argv: Sequence[str]) -> TrainingDuration:
+    """Extract entrypoint-only duration flags without consuming other CLI args."""
+    remaining: list[str] = []
+    values: dict[str, float | None] = {"--epochs": None, "--save-every-epochs": None}
+    explicit_steps = False
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--steps" or argument.startswith("--steps="):
+            explicit_steps = True
+
+        matched = False
+        for option in values:
+            if argument == option:
+                if values[option] is not None:
+                    raise ValueError(f"Duplicate {option} is not allowed")
+                raw_value = argv[index + 1] if index + 1 < len(argv) else None
+                values[option] = _positive_finite_float(raw_value, option)
+                index += 2
+                matched = True
+                break
+            prefix = f"{option}="
+            if argument.startswith(prefix):
+                if values[option] is not None:
+                    raise ValueError(f"Duplicate {option} is not allowed")
+                values[option] = _positive_finite_float(argument[len(prefix) :], option)
+                index += 1
+                matched = True
+                break
+        if not matched:
+            remaining.append(argument)
+            index += 1
+
+    epochs = values["--epochs"]
+    save_every_epochs = values["--save-every-epochs"]
+    if epochs is not None and explicit_steps:
+        raise ValueError("--epochs and an explicit --steps are mutually exclusive")
+    if save_every_epochs is not None and epochs is None:
+        raise ValueError("--save-every-epochs requires --epochs")
+    return TrainingDuration(epochs, save_every_epochs, remaining)
+
+
+def epochs_to_steps(
+    epochs: float, *, num_frames: int, batch_size: int, world_size: int
+) -> int:
+    """Convert a total epoch target to distributed optimizer steps."""
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive")
+    if batch_size <= 0 or world_size <= 0:
+        raise ValueError("batch_size and world_size must be positive")
+    steps_per_epoch = math.ceil(num_frames / (batch_size * world_size))
+    return math.ceil(_positive_finite_float(str(epochs), "epochs") * steps_per_epoch)
+
+
+def epoch_aware_cycle(
+    source,
+    *,
+    start_step: int,
+    expected_steps_per_epoch: int,
+):
+    """Re-iterate a loader each epoch and annotate batches without caching them."""
+    actual_steps_per_epoch = len(source)
+    if actual_steps_per_epoch != expected_steps_per_epoch:
+        raise AssertionError(
+            "Prepared DataLoader length does not match calculated steps_per_epoch: "
+            f"{actual_steps_per_epoch} != {expected_steps_per_epoch}"
+        )
+    if start_step < 0:
+        raise ValueError("start_step must not be negative")
+
+    epoch, offset = divmod(start_step, expected_steps_per_epoch)
+    while True:
+        # Accelerate's DataLoaderShard otherwise starts its private iteration at
+        # zero and calls set_epoch(0), overwriting the sampler's restored epoch.
+        # Setting the public loader epoch before __iter__ keeps sampler shuffle,
+        # annotation, and the one-time batch offset on the same absolute epoch.
+        if hasattr(source, "set_epoch"):
+            source.set_epoch(epoch)
+        yielded = 0
+        for batch_index, batch in enumerate(source):
+            if batch_index < offset:
+                continue
+            if "index" not in batch:
+                raise KeyError("Raw training batch is missing 'index'")
+            batch[TRAINING_EPOCH] = torch.full_like(
+                torch.as_tensor(batch["index"]), epoch, dtype=torch.long
+            )
+            yielded += 1
+            yield batch
+        if yielded != expected_steps_per_epoch - offset:
+            raise AssertionError(
+                "Prepared DataLoader yielded an unexpected number of batches: "
+                f"{yielded} != {expected_steps_per_epoch - offset}"
+            )
+        epoch += 1
+        offset = 0
+
+
+def _read_resume_step(checkpoint_path: Path | None) -> int:
+    if checkpoint_path is None:
+        raise ValueError("Resume config did not resolve a checkpoint path")
+    state_path = checkpoint_path / "training_state" / "training_step.json"
+    try:
+        with state_path.open() as stream:
+            state = json.load(stream)
+        step = state["step"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(f"Malformed resume training state: {state_path}") from exc
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError(f"Malformed resume training step in {state_path}")
+    return step
+
+
+def configure_epoch_duration(
+    cfg: TrainPipelineConfig,
+    duration: TrainingDuration,
+    *,
+    num_frames: int,
+    world_size: int,
+) -> tuple[int | None, int]:
+    """Apply an epoch target after the selected dataset size is known."""
+    if duration.epochs is None:
+        return None, 0
+    steps_per_epoch = math.ceil(num_frames / (cfg.batch_size * world_size))
+    cfg.steps = math.ceil(duration.epochs * steps_per_epoch)
+    if duration.save_every_epochs is not None:
+        cfg.save_freq = math.ceil(duration.save_every_epochs * steps_per_epoch)
+    initial_step = _read_resume_step(cfg.checkpoint_path) if cfg.resume else 0
+    if cfg.steps <= initial_step:
+        raise ValueError(
+            f"Epoch target step {cfg.steps} must be greater than saved step {initial_step}"
+        )
+    return steps_per_epoch, initial_step
+
+
+def _log_epoch_duration(
+    duration: TrainingDuration,
+    cfg: TrainPipelineConfig,
+    steps_per_epoch: int,
+    initial_step: int,
+) -> None:
+    logging.info(
+        "Epoch duration: requested_epochs=%s, calculated_steps=%s, "
+        "steps_per_epoch=%s, initial_step=%s, effective_epoch_progress=%.6g",
+        duration.epochs,
+        cfg.steps,
+        steps_per_epoch,
+        initial_step,
+        initial_step / steps_per_epoch,
+    )
+
+
+@parser.wrap()
+def _parse_train_config(cfg: TrainPipelineConfig) -> TrainPipelineConfig:
+    return cfg
+
+
+@contextmanager
+def _epoch_training_patches(
+    duration: TrainingDuration,
+    accelerator: Accelerator,
+):
+    """Scope LeRobot hooks to this entrypoint, including exceptional exits."""
+    global _active_epoch_metrics
+    original_cycle = lerobot_train.cycle
+    original_make_datasets = lerobot_train.make_train_eval_datasets
+    original_sampler_state = lerobot_train.compute_sampler_state
+    original_epoch_metrics = _active_epoch_metrics
+    initial_step = 0
+    steps_per_epoch: int | None = None
+
+    def make_datasets_and_set_duration(inner_cfg):
+        global _active_epoch_metrics
+        nonlocal initial_step, steps_per_epoch
+        dataset, eval_dataset = original_make_datasets(inner_cfg)
+        if duration.epochs is not None and steps_per_epoch is None:
+            steps_per_epoch, initial_step = configure_epoch_duration(
+                inner_cfg,
+                duration,
+                num_frames=dataset.num_frames,
+                world_size=accelerator.num_processes,
+            )
+            assert steps_per_epoch is not None
+            # Entrypoint patches are process-global by LeRobot design. The CLI
+            # runs one training invocation per process and restores this state
+            # in finally for failures and repeated test calls.
+            _active_epoch_metrics = EpochMetricContext(
+                requested_epochs=duration.epochs,
+                calculated_steps=inner_cfg.steps,
+                steps_per_epoch=steps_per_epoch,
+                initial_step=initial_step,
+            )
+            _log_epoch_duration(duration, inner_cfg, steps_per_epoch, initial_step)
+        return dataset, eval_dataset
+
+    def cycle_with_epochs(dataloader):
+        if steps_per_epoch is None:
+            return original_cycle(dataloader)
+        return epoch_aware_cycle(
+            dataloader,
+            start_step=initial_step,
+            expected_steps_per_epoch=steps_per_epoch,
+        )
+
+    def sampler_state_without_batch_offset(step, num_samples, batch_size, num_processes):
+        if steps_per_epoch is None:
+            return original_sampler_state(step, num_samples, batch_size, num_processes)
+        # epoch_aware_cycle skips the within-epoch batch offset. Starting the
+        # sampler at frame zero avoids applying LeRobot's resume offset twice.
+        return {"epoch": step // steps_per_epoch, "start_index": 0}
+
+    lerobot_train.make_train_eval_datasets = make_datasets_and_set_duration
+    lerobot_train.cycle = cycle_with_epochs
+    lerobot_train.compute_sampler_state = sampler_state_without_batch_offset
+    try:
+        yield
+    finally:
+        _active_epoch_metrics = original_epoch_metrics
+        lerobot_train.compute_sampler_state = original_sampler_state
+        lerobot_train.cycle = original_cycle
+        lerobot_train.make_train_eval_datasets = original_make_datasets
+
+
 class NativeBF16FSDPAccelerator(Accelerator):
     """An Accelerator that does not create fp32 FSDP master parameters."""
 
@@ -132,16 +417,35 @@ class NativeBF16FSDPAccelerator(Accelerator):
             yield
 
 
-def main() -> None:
+def main(accelerator: Accelerator | None = None) -> None:
     require_wandb_cli_args(sys.argv)
-    lerobot_train.register_third_party_plugins()
-    accelerator = NativeBF16FSDPAccelerator(
-        step_scheduler_with_optimizer=False,
-        mixed_precision="no",
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
-    )
-    lerobot_train.update_policy = update_policy
-    lerobot_train.train(accelerator=accelerator)
+    duration = parse_training_duration(sys.argv[1:])
+    original_argv = sys.argv[:]
+    try:
+        sys.argv[1:] = duration.remaining_argv
+        lerobot_train.register_third_party_plugins()
+        cfg = _parse_train_config()
+        if accelerator is None:
+            accelerator = NativeBF16FSDPAccelerator(
+                step_scheduler_with_optimizer=False,
+                mixed_precision="no",
+                kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+            )
+        if duration.epochs is not None and cfg.job.is_remote:
+            raise ValueError(
+                "Float epochs are unsupported for remote jobs because the staged lerobot-train "
+                "command cannot install SNVLA epoch annotation; run this entrypoint locally or "
+                "use explicit --steps"
+            )
+        original_update_policy = lerobot_train.update_policy
+        try:
+            lerobot_train.update_policy = update_policy
+            with _epoch_training_patches(duration, accelerator):
+                lerobot_train.train(cfg, accelerator=accelerator)
+        finally:
+            lerobot_train.update_policy = original_update_policy
+    finally:
+        sys.argv[:] = original_argv
 
 
 if __name__ == "__main__":
