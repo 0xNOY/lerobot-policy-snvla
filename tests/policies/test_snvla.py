@@ -2,6 +2,7 @@ import dataclasses
 from types import SimpleNamespace
 
 import lerobot.policies.factory as policy_factory
+import numpy as np
 import pytest
 import torch
 from lerobot.processor import TransitionKey, batch_to_transition, transition_to_batch
@@ -11,9 +12,10 @@ import lerobot_policy_snvla
 from lerobot_policy_snvla import SNVLAConfig
 from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
 from lerobot_policy_snvla.constants import (
-    DIFFUSION_LOSS_MASK,
     NARRATION_TARGET_MASK,
+    STATE_DROPOUT_MASK,
     STATE_RANDOMIZED_TEXT_ONLY_MASK,
+    TRAINING_EPOCH,
 )
 from lerobot_policy_snvla.modeling_snvla import (
     FusedQKVProjection,
@@ -29,7 +31,9 @@ from lerobot_policy_snvla.processor_snvla import (
     PREVIOUS_NARRATIONS,
     TASK_KEY,
     SNVLAPrepareTrainingTokenizerProcessorStep,
+    make_prefix_prompt,
 )
+from lerobot_policy_snvla.training_schedule import state_dropout_mask
 
 
 class DummyTokenizer:
@@ -68,6 +72,15 @@ def make_test_config() -> SNVLAConfig:
     )
 
 
+def make_dropout_config(ratio: float = 0.25, seed: int = 0) -> SNVLAConfig:
+    return dataclasses.replace(
+        make_test_config(),
+        state_dropout_enabled=True,
+        state_dropout_ratio=ratio,
+        state_dropout_seed=seed,
+    )
+
+
 def make_dummy_processor(monkeypatch, cfg: SNVLAConfig) -> SNVLAPrepareTrainingTokenizerProcessorStep:
     import lerobot_policy_snvla.processor_snvla as processor_snvla
 
@@ -91,7 +104,7 @@ def make_training_transition(batch_size: int, with_narration: list[bool]):
 
 
 def test_snvla_registers_with_lerobot_factory():
-    cfg = policy_factory.make_policy_config("snvla", device="cpu")
+    cfg = policy_factory.make_policy_config("snvla", device="cpu", compile_model=False)
 
     assert isinstance(cfg, SNVLAConfig)
     assert cfg.type == "snvla"
@@ -119,19 +132,20 @@ def test_snvla_narration_columns_are_complementary_data():
     assert complementary_data[PREVIOUS_NARRATIONS] == ["[]"]
 
 
-def test_state_randomization_config_defaults_and_validation():
+def test_state_dropout_config_defaults_and_validation():
     cfg = make_test_config()
 
-    assert cfg.state_randomization_text_only_enabled is False
-    assert cfg.state_randomization_text_only_ratio == pytest.approx(0.25)
-    with pytest.raises(ValueError, match="state_randomization_text_only_ratio"):
-        dataclasses.replace(cfg, state_randomization_text_only_ratio=1.01)
+    assert cfg.state_dropout_enabled is False
+    assert cfg.state_dropout_ratio == pytest.approx(0.25)
+    assert cfg.state_dropout_seed == 0
+    for invalid_ratio in (-0.01, 0.51):
+        with pytest.raises(ValueError, match="state_dropout_ratio"):
+            dataclasses.replace(cfg, state_dropout_ratio=invalid_ratio)
 
 
 def test_snvla_training_masks_are_complementary_data():
     batch = {
-        "diffusion_loss_mask": torch.tensor([[0.0], [1.0]]),
-        "state_randomized_text_only_mask": torch.tensor([True, False]),
+        "state_dropout_mask": torch.tensor([False, True]),
         "narration_target_mask": torch.tensor([False, True]),
         "observation.language.mode_mask": torch.tensor([[True, False], [False, True]]),
     }
@@ -139,8 +153,7 @@ def test_snvla_training_masks_are_complementary_data():
     transition = batch_to_transition(batch)
     complementary = transition[TransitionKey.COMPLEMENTARY_DATA]
 
-    assert complementary["diffusion_loss_mask"].shape == (2, 1)
-    assert complementary["state_randomized_text_only_mask"].tolist() == [True, False]
+    assert complementary["state_dropout_mask"].tolist() == [False, True]
     assert complementary["narration_target_mask"].tolist() == [False, True]
     torch.testing.assert_close(
         transition[TransitionKey.OBSERVATION]["observation.language.mode_mask"],
@@ -188,70 +201,109 @@ def test_processor_step_tokenizes_narration_without_external_download(monkeypatc
     assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].sum() > 0
 
 
-def test_processor_randomizes_prompt_state_and_disables_only_action_loss(monkeypatch):
+def test_state_dropout_schedule_is_deterministic_and_never_consecutive():
+    frame_ids = torch.arange(256)
+    masks = [state_dropout_mask(frame_ids, epoch, ratio=0.5, seed=7) for epoch in range(6)]
+
+    assert not masks[0].any()
+    for previous, current in zip(masks[:-1], masks[1:], strict=True):
+        assert not (previous & current).any()
+    assert torch.equal(masks[3], state_dropout_mask(frame_ids, 3, ratio=0.5, seed=7))
+
+
+def test_state_dropout_schedule_is_rank_independent():
+    frame_ids = torch.arange(257)
+    full_mask = state_dropout_mask(frame_ids, epoch=4, ratio=0.25, seed=19)
+    rank_masks = [
+        state_dropout_mask(frame_ids[rank::3], epoch=4, ratio=0.25, seed=19)
+        for rank in range(3)
+    ]
+    reconstructed = torch.empty_like(full_mask)
+    for rank, rank_mask in enumerate(rank_masks):
+        reconstructed[rank::3] = rank_mask
+
+    torch.testing.assert_close(reconstructed, full_mask)
+
+
+@pytest.mark.parametrize("epoch", [True, 1.0, 1 + 0j, torch.tensor(1)])
+def test_state_dropout_schedule_rejects_non_integer_scalar_epochs(epoch):
+    with pytest.raises(TypeError, match="epoch must be an integer scalar"):
+        state_dropout_mask(torch.tensor([11]), epoch=epoch, ratio=0.5, seed=0)
+
+
+def test_state_dropout_schedule_accepts_numpy_integer_epoch():
+    actual = state_dropout_mask(torch.tensor([11]), epoch=np.int64(1), ratio=0.5, seed=0)
+    expected = state_dropout_mask(torch.tensor([11]), epoch=1, ratio=0.5, seed=0)
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("with_narration", [False, True])
+def test_processor_omits_state_line_but_keeps_all_training(monkeypatch, with_narration):
     import lerobot_policy_snvla.processor_snvla as processor_snvla
 
-    cfg = make_test_config()
-    cfg.state_randomization_text_only_enabled = True
-    cfg.state_randomization_text_only_ratio = 1.0
-    processor = make_dummy_processor(monkeypatch, cfg)
-    transition = make_training_transition(batch_size=2, with_narration=[True, False])
+    processor = make_dummy_processor(monkeypatch, make_dropout_config(ratio=0.5, seed=0))
+    transition = make_training_transition(batch_size=1, with_narration=[with_narration])
+    transition[TransitionKey.COMPLEMENTARY_DATA]["index"] = torch.tensor([11])
+    transition[TransitionKey.COMPLEMENTARY_DATA][TRAINING_EPOCH] = torch.tensor([1])
     original_state = transition[TransitionKey.OBSERVATION][OBS_STATE].clone()
-    sampled_states: list[torch.Tensor] = []
+    original_action = transition[TransitionKey.ACTION].clone()
+    schedule_call = {}
 
-    monkeypatch.setattr(processor_snvla.torch, "rand", lambda size: torch.zeros(size))
+    def capture_schedule(frame_ids, epoch, ratio, seed):
+        schedule_call.update(frame_ids=frame_ids.clone(), epoch=epoch, ratio=ratio, seed=seed)
+        return torch.tensor([True])
 
-    def fake_uniform_(tensor: torch.Tensor, low: float, high: float) -> torch.Tensor:
-        values = torch.linspace(low, high, tensor.numel(), dtype=tensor.dtype).reshape_as(tensor)
-        tensor.copy_(values)
-        sampled_states.append(tensor.clone())
-        return tensor
-
-    monkeypatch.setattr(torch.Tensor, "uniform_", fake_uniform_)
+    monkeypatch.setattr(processor_snvla, "state_dropout_mask", capture_schedule)
 
     result = processor(transition)
     observation = result[TransitionKey.OBSERVATION]
     complementary = result[TransitionKey.COMPLEMENTARY_DATA]
 
-    assert complementary[DIFFUSION_LOSS_MASK].tolist() == [0.0, 0.0]
-    assert complementary[STATE_RANDOMIZED_TEXT_ONLY_MASK].tolist() == [True, True]
-    assert complementary[NARRATION_TARGET_MASK].tolist() == [True, False]
-    assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].sum(dim=1).gt(0).all()
-    assert observation["observation.language.mode_mask"].sum(dim=1).tolist() == [1, 1]
-    torch.testing.assert_close(transition[TransitionKey.OBSERVATION][OBS_STATE], original_state)
-    assert len(sampled_states) == 1
-    assert sampled_states[0].min() >= -1.0
-    assert sampled_states[0].max() <= 1.0
+    assert "State:" not in processor.tokenizer.texts[0]
+    assert complementary[STATE_DROPOUT_MASK].tolist() == [True]
+    assert complementary[NARRATION_TARGET_MASK].tolist() == [with_narration]
+    assert "diffusion_loss_mask" not in complementary
+    assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].sum() > 0
+    assert observation["observation.language.mode_mask"].sum() == 1
+    torch.testing.assert_close(schedule_call["frame_ids"], torch.tensor([11]))
+    assert schedule_call["epoch"] == 1
+    assert schedule_call["ratio"] == pytest.approx(0.5)
+    assert schedule_call["seed"] == 0
+    torch.testing.assert_close(observation[OBS_STATE], original_state)
+    torch.testing.assert_close(result[TransitionKey.ACTION], original_action)
 
-    contexts = [processor.tokenizer.texts[0], processor.tokenizer.texts[2]]
-    assert all("State: 127 127 127 127 127 127;" not in context for context in contexts)
-    context_lengths = [len(context) for context in contexts]
-    for row, context_length in enumerate(context_lengths):
-        assert observation["observation.language.mode_mask"][row, context_length]
+
+def test_processor_keeps_state_line_at_epoch_zero(monkeypatch):
+    processor = make_dummy_processor(monkeypatch, make_dropout_config(ratio=0.5, seed=0))
+    transition = make_training_transition(batch_size=1, with_narration=[False])
+    transition[TransitionKey.COMPLEMENTARY_DATA]["index"] = torch.tensor([11])
+    transition[TransitionKey.COMPLEMENTARY_DATA][TRAINING_EPOCH] = torch.tensor([0])
+
+    result = processor(transition)
+
+    assert "State:" in processor.tokenizer.texts[0]
+    assert result[TransitionKey.COMPLEMENTARY_DATA][STATE_DROPOUT_MASK].tolist() == [False]
 
 
 @pytest.mark.parametrize(
-    ("ratio", "expected_mask"),
-    [
-        (0.0, [False, False]),
-        (1.0, [True, True]),
-    ],
+    "training_epoch",
+    [torch.tensor([1.0]), torch.tensor([True]), torch.tensor([1 + 0j])],
 )
-def test_randomization_ratio_selects_expected_samples(monkeypatch, ratio, expected_mask):
-    import lerobot_policy_snvla.processor_snvla as processor_snvla
+def test_processor_rejects_non_integer_training_epoch_metadata(monkeypatch, training_epoch):
+    processor = make_dummy_processor(monkeypatch, make_dropout_config(ratio=0.5, seed=0))
+    transition = make_training_transition(batch_size=1, with_narration=[False])
+    transition[TransitionKey.COMPLEMENTARY_DATA]["index"] = torch.tensor([11])
+    transition[TransitionKey.COMPLEMENTARY_DATA][TRAINING_EPOCH] = training_epoch
 
-    cfg = make_test_config()
-    cfg.state_randomization_text_only_enabled = True
-    cfg.state_randomization_text_only_ratio = ratio
-    processor = make_dummy_processor(monkeypatch, cfg)
-    transition = make_training_transition(batch_size=2, with_narration=[True, False])
+    with pytest.raises(TypeError, match="training_epoch.*integer"):
+        processor(transition)
 
-    monkeypatch.setattr(processor_snvla.torch, "rand", lambda size: torch.full((size,), 0.5))
-    result = processor(transition)
-    complementary = result[TransitionKey.COMPLEMENTARY_DATA]
 
-    assert complementary[STATE_RANDOMIZED_TEXT_ONLY_MASK].tolist() == expected_mask
-    assert complementary[DIFFUSION_LOSS_MASK].tolist() == [float(not value) for value in expected_mask]
+def test_inference_prefix_keeps_state_line():
+    prompt = make_prefix_prompt("pick up", [], "1 2 3", "<bos>")
+
+    assert "State: 1 2 3;" in prompt
 
 
 def test_processor_step_uses_fixed_training_padding_length(monkeypatch):
@@ -409,7 +461,7 @@ def test_policy_forward_passes_task_one_training_masks_to_core():
         "observation.language.mode_mask": torch.tensor(
             [[False, True, False], [False, True, False]]
         ),
-        DIFFUSION_LOSS_MASK: torch.tensor([0.0, 1.0]),
+        "diffusion_loss_mask": torch.tensor([0.0, 1.0]),
         NARRATION_TARGET_MASK: torch.tensor([True, False]),
         STATE_RANDOMIZED_TEXT_ONLY_MASK: torch.tensor([True, False]),
     }

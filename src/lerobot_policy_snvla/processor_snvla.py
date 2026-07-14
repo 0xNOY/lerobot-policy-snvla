@@ -34,14 +34,15 @@ from .compat import EnvTransition, FeatureType, PipelineFeatureType, PolicyFeatu
 from .configuration_snvla import SNVLAConfig
 from .constants import (
     CURRENT_NARRATION,
-    DIFFUSION_LOSS_MASK,
     NARRATION_TARGET_MASK,
     OBS_LANGUAGE_MODE_MASK,
     OBS_LANGUAGE_TOKEN_AR_MASK,
     OBS_LANGUAGE_TOKEN_LOSS_MASK,
     PREVIOUS_NARRATIONS,
-    STATE_RANDOMIZED_TEXT_ONLY_MASK,
+    STATE_DROPOUT_MASK,
+    TRAINING_EPOCH,
 )
+from .training_schedule import state_dropout_mask
 
 # 学習データセットが提供するキー
 TASK_KEY = "task"
@@ -75,14 +76,18 @@ def parse_previous_narrations(value: Any) -> list[str]:
 def make_prefix_prompt(
     task: str,
     previous_narrations: list[str],
-    state_str: str,
+    state_str: str | None,
     bos_token_str: str,
     session_separator: str = "\n\n",
 ) -> str:
     """Constructs the prefix prompt for SN-VLA."""
     narration_history = "".join(previous_narrations)
 
-    return f"{bos_token_str}Task: {task.strip()}{session_separator}State: {state_str};{session_separator}Progress: {narration_history}"
+    state_section = "" if state_str is None else f"State: {state_str};{session_separator}"
+    return (
+        f"{bos_token_str}Task: {task.strip()}{session_separator}"
+        f"{state_section}Progress: {narration_history}"
+    )
 
 
 @ProcessorStepRegistry.register(name="snvla_prepare_training_tokenizer_processor_step")
@@ -158,29 +163,35 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
 
         batch_size = state.shape[0]
         complementary = transition[TransitionKey.COMPLEMENTARY_DATA]
-        randomized_mask = torch.zeros(batch_size, dtype=torch.bool)
-        if self.config.state_randomization_text_only_enabled:
-            randomized_mask = (
-                torch.rand(batch_size) < self.config.state_randomization_text_only_ratio
+        dropout_mask = torch.zeros(batch_size, dtype=torch.bool)
+        if self.config.state_dropout_enabled:
+            frame_ids = complementary.get("index")
+            if frame_ids is None:
+                raise ValueError("'index' not found in complementary data for state dropout.")
+            training_epochs = complementary.get(TRAINING_EPOCH)
+            if training_epochs is None:
+                raise ValueError(
+                    f"'{TRAINING_EPOCH}' not found in complementary data for state dropout."
+                )
+            training_epochs = torch.as_tensor(training_epochs).reshape(-1)
+            if (
+                training_epochs.is_floating_point()
+                or training_epochs.is_complex()
+                or training_epochs.dtype == torch.bool
+            ):
+                raise TypeError(f"'{TRAINING_EPOCH}' must contain integer values.")
+            if training_epochs.numel() == 0 or not torch.all(training_epochs == training_epochs[0]):
+                raise ValueError(f"'{TRAINING_EPOCH}' must contain one epoch value per batch.")
+            dropout_mask = state_dropout_mask(
+                torch.as_tensor(frame_ids).reshape(batch_size),
+                epoch=training_epochs[0].item(),
+                ratio=self.config.state_dropout_ratio,
+                seed=self.config.state_dropout_seed,
             )
-
-        base_diffusion_mask = complementary.get(DIFFUSION_LOSS_MASK)
-        if base_diffusion_mask is None:
-            base_diffusion_mask = torch.ones(batch_size, dtype=torch.float32)
-        else:
-            base_diffusion_mask = torch.as_tensor(base_diffusion_mask, dtype=torch.float32).view(
-                batch_size
-            )
-        complementary[DIFFUSION_LOSS_MASK] = base_diffusion_mask * (~randomized_mask).float()
-        complementary[STATE_RANDOMIZED_TEXT_ONLY_MASK] = randomized_mask
-
-        prompt_states = state
-        if randomized_mask.any():
-            randomized_states = torch.empty_like(state).uniform_(-1.0, 1.0)
-            prompt_states = torch.where(randomized_mask[:, None], randomized_states, state)
+        complementary[STATE_DROPOUT_MASK] = dropout_mask
 
         # Discretize states for the entire batch
-        discretized_states = discretize_state(prompt_states, max_dim=self.config.max_state_dim)
+        discretized_states = discretize_state(state, max_dim=self.config.max_state_dim)
 
         # Process each item in the batch
         all_input_ids = []
@@ -203,7 +214,7 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
             )
 
             # Prepare state string for this item
-            state_str = " ".join(map(str, discretized_states[i]))
+            state_str = None if dropout_mask[i] else " ".join(map(str, discretized_states[i]))
 
             previous_narrations = parse_previous_narrations(previous_narrations_json_str)
 

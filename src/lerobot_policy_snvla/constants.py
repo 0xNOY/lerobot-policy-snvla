@@ -10,8 +10,7 @@ STATE_DROPOUT_MASK = "state_dropout_mask"
 TRAINING_EPOCH = "training_epoch"
 NARRATION_TARGET_MASK = "narration_target_mask"
 
-# Deprecated compatibility constants; migrate consumers and remove these aliases in Tasks 2/3.
-DIFFUSION_LOSS_MASK = "diffusion_loss_mask"
+# Deprecated compatibility constant; migrate the remaining consumer and remove it in Task 3.
 STATE_RANDOMIZED_TEXT_ONLY_MASK = "state_randomized_text_only_mask"
 
 COMPLEMENTARY_DATA = "complementary_data"
