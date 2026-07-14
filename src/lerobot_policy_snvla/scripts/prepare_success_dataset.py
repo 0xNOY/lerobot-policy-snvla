@@ -17,8 +17,10 @@ from typing import Any, Sequence
 import numpy as np
 import pyarrow.parquet as pq
 
+from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.datasets.dataset_tools import aggregate_datasets
 from lerobot.datasets.video_utils import decode_video_frames, get_video_duration_in_s
+from lerobot.utils.utils import flatten_dict
 
 CORRECTIVE_FEATURES = {
     "diffusion_loss_mask",
@@ -78,9 +80,7 @@ def _event_transitions(values: Sequence[str]) -> list[tuple[int, dict[str, Any]]
         if not isinstance(event, dict):
             raise ValueError(f"sim_event at frame {frame_index} is not an object")
         if "frame" in event and event["frame"] != frame_index:
-            raise ValueError(
-                f"sim_event frame {event['frame']!r} does not match frame_index {frame_index}"
-            )
+            raise ValueError(f"sim_event frame {event['frame']!r} does not match frame_index {frame_index}")
         transitions.append((frame_index, event))
     return transitions
 
@@ -103,7 +103,7 @@ def _validate_success_episode(
     sim_events: Sequence[str],
     narrations: Sequence[str],
     blocks: int,
-) -> None:
+) -> int:
     events = _event_transitions(sim_events)
     observed = [(event.get("kind"), event.get("ordinal")) for _, event in events]
     expected = [(kind, ordinal) for ordinal in range(1, blocks + 1) for kind in ("picked", "placed")]
@@ -130,9 +130,7 @@ def _validate_success_episode(
     if [(ordinal, total) for _, ordinal, total in places] != canonical:
         raise ValueError(f"episode {episode_index} has invalid place narration centers")
     expected_centers = [
-        (kind, ordinal, blocks)
-        for ordinal in range(1, blocks + 1)
-        for kind in ("picked", "placed")
+        (kind, ordinal, blocks) for ordinal in range(1, blocks + 1) for kind in ("picked", "placed")
     ]
     if ordered_centers != expected_centers:
         raise ValueError(f"episode {episode_index} narration centers are not in canonical order")
@@ -143,6 +141,7 @@ def _validate_success_episode(
         raise ValueError(
             f"episode {episode_index} completion narration precedes or coincides with final placement"
         )
+    return completions[0]
 
 
 def _validate_manifest(manifest: dict[str, Any], expected_episodes: int) -> None:
@@ -190,8 +189,16 @@ def _validate_manifest(manifest: dict[str, Any], expected_episodes: int) -> None
         raise ValueError("manifest source episode provenance is not complete and unique")
     if manifest.get("total_episodes") != expected_episodes:
         raise ValueError("manifest total episode count is invalid")
-    if manifest.get("total_frames") != sum(source["frame_count"] for source in sources):
-        raise ValueError("manifest total frame count disagrees with source provenance")
+    trim_policy = manifest.get("trim_policy")
+    source_total_frames = sum(source["frame_count"] for source in sources)
+    if trim_policy is None:
+        if manifest.get("total_frames") != source_total_frames:
+            raise ValueError("manifest total frame count disagrees with source provenance")
+    else:
+        _validate_trim_policy(trim_policy, expected_episodes, source_total_frames)
+        _validate_stats_policy(manifest.get("stats_policy"))
+        if manifest.get("total_frames") != trim_policy["trimmed_total_frames"]:
+            raise ValueError("manifest total frame count disagrees with trim policy")
     requested_ablation = manifest.get("ablation_episode_count")
     if not isinstance(requested_ablation, int) or requested_ablation < 0:
         raise ValueError("manifest ablation episode count is invalid")
@@ -227,6 +234,175 @@ def _validate_manifest(manifest: dict[str, Any], expected_episodes: int) -> None
         raise ValueError("a 200-episode dataset requires an exact 180/20 train/validation split")
     if expected_episodes == 200 and requested_ablation != 50:
         raise ValueError("a 200-episode dataset requires exactly 50 ablation episodes")
+
+
+def _validate_trim_policy(policy: dict[str, Any], expected_episodes: int, source_total_frames: int) -> None:
+    """Validate the portable, deterministic record of every episode cutoff."""
+
+    if not isinstance(policy, dict) or policy.get("version") != 1:
+        raise ValueError("manifest trim policy version is invalid")
+    if policy.get("name") != "canonical-completion-following-frames":
+        raise ValueError("manifest trim policy name is invalid")
+    if policy.get("canonical_marker") != "Task completed.":
+        raise ValueError("manifest trim policy marker is invalid")
+    keep = policy.get("keep_following_frames")
+    if type(keep) is not int or keep < 0:
+        raise ValueError("manifest trim policy following-frame count is invalid")
+    records = policy.get("episodes")
+    if not isinstance(records, list) or len(records) != expected_episodes:
+        raise ValueError("manifest trim policy episode records are invalid")
+    expected_original_total = 0
+    expected_trimmed_total = 0
+    canonical_records: list[dict[str, int]] = []
+    for episode_index, record in enumerate(records):
+        if not isinstance(record, dict) or record.get("episode_index") != episode_index:
+            raise ValueError("manifest trim policy episode indexes are invalid")
+        completion = record.get("completion_frame_index")
+        original = record.get("original_length")
+        trimmed = record.get("trimmed_length")
+        if not all(type(value) is int for value in (completion, original, trimmed)):
+            raise ValueError("manifest trim policy episode values are invalid")
+        if original <= 0 or completion < 0 or completion >= original:
+            raise ValueError("manifest trim policy completion index is invalid")
+        expected_length = min(original, completion + keep + 1)
+        if trimmed != expected_length:
+            raise ValueError("manifest trim policy cutoff mismatch")
+        expected_original_total += original
+        expected_trimmed_total += trimmed
+        canonical_records.append(
+            {
+                "episode_index": episode_index,
+                "completion_frame_index": completion,
+                "original_length": original,
+                "trimmed_length": trimmed,
+            }
+        )
+    encoded = json.dumps(canonical_records, sort_keys=True, separators=(",", ":")).encode()
+    expected_hash = hashlib.sha256(encoded).hexdigest()
+    if policy.get("episode_records_sha256") != expected_hash:
+        raise ValueError("manifest trim policy episode records hash is invalid")
+    if policy.get("original_total_frames") != expected_original_total:
+        raise ValueError("manifest trim policy original total is invalid")
+    if expected_original_total != source_total_frames:
+        raise ValueError("manifest trim policy original total disagrees with provenance")
+    if policy.get("trimmed_total_frames") != expected_trimmed_total:
+        raise ValueError("manifest trim policy trimmed total is invalid")
+
+
+def _validate_stats_policy(policy: Any) -> None:
+    if not isinstance(policy, dict) or policy.get("version") != 1:
+        raise ValueError("manifest stats policy version is invalid")
+    expected_scalars = {
+        "name": "retained-numeric-identity-visual",
+        "numeric_stats": "recomputed-from-retained-rows",
+        "visual_stats": "omitted",
+        "visual_normalization": "IDENTITY",
+    }
+    for key, expected in expected_scalars.items():
+        if policy.get(key) != expected:
+            raise ValueError(f"manifest stats policy {key} is invalid")
+    for key in ("numeric_features", "visual_features"):
+        values = policy.get(key)
+        if (
+            not isinstance(values, list)
+            or not all(isinstance(value, str) for value in values)
+            or values != sorted(set(values))
+        ):
+            raise ValueError(f"manifest stats policy {key} is invalid")
+
+
+def _validate_trimmed_stats(
+    root: Path,
+    info: dict[str, Any],
+    manifest: dict[str, Any],
+    episode_rows: list[dict[str, Any]],
+) -> None:
+    policy = manifest["stats_policy"]
+    features = info["features"]
+    expected_visual = sorted(
+        key for key, feature in features.items() if feature.get("dtype") in {"image", "video"}
+    )
+    expected_numeric = sorted(
+        key
+        for key, feature in features.items()
+        if feature.get("dtype") not in {"string", "language", "image", "video"}
+    )
+    if policy["visual_features"] != expected_visual:
+        raise ValueError("manifest stats policy visual features disagree with dataset schema")
+    if policy["numeric_features"] != expected_numeric:
+        raise ValueError("manifest stats policy numeric features disagree with dataset schema")
+
+    stats_path = root / "meta/stats.json"
+    if not stats_path.is_file():
+        raise ValueError("trimmed dataset global stats are missing")
+    episode_values = [{key: [] for key in expected_numeric} for _ in range(int(info["total_episodes"]))]
+    for path in sorted((root / "data").rglob("*.parquet")):
+        table = pq.read_table(path, columns=["episode_index", *expected_numeric]).to_pydict()
+        episode_ids = table["episode_index"]
+        for key in expected_numeric:
+            for episode_index, value in zip(episode_ids, table[key], strict=True):
+                if type(episode_index) is not int or not 0 <= episode_index < len(episode_values):
+                    raise ValueError("trimmed dataset stats episode index is invalid")
+                episode_values[episode_index][key].append(value)
+    numeric_features = {key: features[key] for key in expected_numeric}
+    expected_episode_stats: list[dict[str, Any]] = []
+    lengths = {row["episode_index"]: row["length"] for row in episode_rows}
+    for episode_index, values in enumerate(episode_values):
+        if any(len(feature_values) != lengths.get(episode_index) for feature_values in values.values()):
+            raise ValueError(f"trimmed dataset stats rows for episode {episode_index} are incomplete")
+        arrays = {key: np.asarray(feature_values) for key, feature_values in values.items()}
+        expected_episode_stats.append(compute_episode_stats(arrays, numeric_features))
+    expected_global_stats = aggregate_stats(expected_episode_stats)
+    global_stats = json.loads(stats_path.read_text())
+    _compare_stats_tree(global_stats, expected_global_stats, "global")
+
+    actual_episode_rows: dict[int, dict[str, Any]] = {}
+    visual_prefixes = tuple(f"stats/{key}/" for key in expected_visual)
+    for path in sorted((root / "meta/episodes").rglob("*.parquet")):
+        table = pq.read_table(path)
+        if any(name.startswith(visual_prefixes) for name in table.column_names):
+            raise ValueError("trimmed dataset episode visual stats must be omitted")
+        for row in table.to_pylist():
+            episode_index = row["episode_index"]
+            if episode_index in actual_episode_rows or episode_index not in lengths:
+                raise ValueError("trimmed dataset episode stats indexes are invalid")
+            actual_episode_rows[episode_index] = {
+                key.removeprefix("stats/"): value for key, value in row.items() if key.startswith("stats/")
+            }
+    if set(actual_episode_rows) != set(lengths):
+        raise ValueError("trimmed dataset episode stats are incomplete")
+    for episode_index, expected_stats in enumerate(expected_episode_stats):
+        expected_flat = flatten_dict(expected_stats)
+        _compare_stats_tree(
+            actual_episode_rows[episode_index],
+            expected_flat,
+            f"episode {episode_index}",
+        )
+
+
+def _compare_stats_tree(actual: Any, expected: Any, location: str) -> None:
+    if not isinstance(actual, dict) or not isinstance(expected, dict):
+        raise ValueError(f"trimmed dataset {location} stats structure is invalid")
+    if set(actual) != set(expected):
+        raise ValueError(f"trimmed dataset {location} stats keys are invalid")
+    for key in sorted(expected):
+        actual_value = actual[key]
+        expected_value = expected[key]
+        if isinstance(expected_value, dict):
+            _compare_stats_tree(actual_value, expected_value, f"{location}/{key}")
+            continue
+        actual_array = np.asarray(actual_value)
+        expected_array = np.asarray(expected_value)
+        if actual_array.shape != expected_array.shape:
+            raise ValueError(f"trimmed dataset {location}/{key} stats shape is invalid")
+        if not np.issubdtype(actual_array.dtype, np.number) or not np.all(np.isfinite(actual_array)):
+            raise ValueError(f"trimmed dataset {location}/{key} stats are not finite numeric values")
+        if key.rsplit("/", 1)[-1] == "count":
+            matches = np.array_equal(actual_array, expected_array)
+        else:
+            matches = np.allclose(actual_array, expected_array, rtol=1e-6, atol=1e-8)
+        if not matches:
+            raise ValueError(f"trimmed dataset {location}/{key} stats values are invalid")
 
 
 def audit_sources(root: str | Path) -> dict[str, Any]:
@@ -304,9 +480,7 @@ def validate_success_dataset(
         "dataset_from_index",
         "dataset_to_index",
     ]
-    video_keys = [
-        key for key, feature in info["features"].items() if feature.get("dtype") == "video"
-    ]
+    video_keys = [key for key, feature in info["features"].items() if feature.get("dtype") == "video"]
     for key in video_keys:
         episode_columns.extend(
             [
@@ -340,6 +514,8 @@ def validate_success_dataset(
     narrations: list[str] = []
     episode_task_names: set[str] = set()
     data_file_episodes: dict[tuple[int, int], set[int]] = {}
+    observed_episode_lengths: list[int] = []
+    observed_completion_frames: list[int] = []
 
     def finish_episode() -> None:
         nonlocal current_episode, current_frame, sim_events, narrations, episode_task_names
@@ -356,7 +532,10 @@ def validate_success_dataset(
             raise ValueError(f"episode {current_episode} dataset_to_index is invalid")
         if set(metadata["tasks"]) != episode_task_names:
             raise ValueError(f"episode {current_episode} task text mapping is invalid")
-        _validate_success_episode(current_episode, sim_events, narrations, blocks)
+        observed_completion_frames.append(
+            _validate_success_episode(current_episode, sim_events, narrations, blocks)
+        )
+        observed_episode_lengths.append(current_frame)
         current_episode += 1
         current_frame = 0
         sim_events = []
@@ -409,6 +588,23 @@ def validate_success_dataset(
         if not data_path.is_file() or episode_index not in data_file_episodes.get(data_pair, set()):
             raise ValueError(f"episode {episode_index} data parquet pointer is invalid")
 
+    manifest_path = root / MANIFEST_PATH
+    manifest: dict[str, Any] = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        _validate_manifest(manifest, expected_episodes)
+    elif require_manifest:
+        raise ValueError(f"success dataset manifest is missing: {manifest_path}")
+    trim_policy = manifest.get("trim_policy")
+    if trim_policy is not None:
+        _validate_trimmed_stats(root, info, manifest, episode_rows)
+        records = trim_policy["episodes"]
+        for episode_index, record in enumerate(records):
+            if observed_episode_lengths[episode_index] != record["trimmed_length"]:
+                raise ValueError(f"episode {episode_index} trim policy cutoff mismatch")
+            if observed_completion_frames[episode_index] != record["completion_frame_index"]:
+                raise ValueError(f"episode {episode_index} trim policy completion mismatch")
+
     video_tolerance = max(2.0 / fps, tolerance)
     for key in video_keys:
         spans_by_file: dict[tuple[int, int], list[tuple[int, float, float]]] = {}
@@ -459,23 +655,21 @@ def validate_success_dataset(
             raise ValueError(f"video assets for {key} are not exactly covered by episode metadata")
         for pair, spans in spans_by_file.items():
             spans.sort(key=lambda item: item[1])
-            previous_stop = 0.0
+            previous_source_stop = 0.0
             for episode_index, start, stop in spans:
-                if abs(start - previous_stop) > tolerance:
+                if abs(start - previous_source_stop) > tolerance:
                     raise ValueError(f"episode {episode_index} video coverage for {key} has a gap/overlap")
-                previous_stop = stop
+                if trim_policy is None:
+                    previous_source_stop = stop
+                else:
+                    original_length = trim_policy["episodes"][episode_index]["original_length"]
+                    previous_source_stop = start + original_length / fps
             video_path = root / f"videos/{key}/chunk-{pair[0]:03d}/file-{pair[1]:03d}.mp4"
             duration = get_video_duration_in_s(video_path)
-            if not math.isfinite(duration) or abs(duration - previous_stop) > video_tolerance:
+            if not math.isfinite(duration) or abs(duration - previous_source_stop) > video_tolerance:
                 raise ValueError(f"video duration/coverage for {key} is inconsistent: {video_path}")
-
-    manifest_path = root / MANIFEST_PATH
-    if not manifest_path.exists():
-        if require_manifest:
-            raise ValueError(f"success dataset manifest is missing: {manifest_path}")
+    if not manifest:
         return {}
-    manifest = json.loads(manifest_path.read_text())
-    _validate_manifest(manifest, expected_episodes)
     if (
         manifest.get("total_episodes") != expected_episodes
         or manifest.get("total_frames") != expected_global_index
@@ -537,7 +731,9 @@ def prepare_success_dataset(
     if expected_episodes == 200:
         production_counts = [int(info.get("total_episodes", -1)) for info in infos]
         if len(sources) != 2 or production_counts != [50, 150]:
-            raise ValueError("a 200-episode dataset requires exactly two ordered sources with 50 then 150 episodes")
+            raise ValueError(
+                "a 200-episode dataset requires exactly two ordered sources with 50 then 150 episodes"
+            )
     signature = _schema_signature(infos[0])
     for source, info in zip(sources[1:], infos[1:], strict=True):
         if _schema_signature(info) != signature:

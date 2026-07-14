@@ -465,18 +465,17 @@ MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.collect \
 
 Require `saved=150`, `narration_ok=150/150`, and no source-root overwrite.
 
-- [ ] **Step 2: Merge with the existing 50 and augment forward-only**
+- [ ] **Step 2: Trim the immutable merge, then augment forward-only**
 
 ```bash
-.venv/bin/python -m lerobot_policy_snvla.scripts.prepare_success_dataset \
-  --source-root ~/datasets/t1_n3_v3 \
-  --source-root ~/datasets/t1_n3_v5_success150 \
-  --dst-root ~/datasets/t1_n3_v5_success200 \
-  --dst-repo-id local/t1_n3_v5_success200 \
-  --expected-episodes 200 --ablation-episodes 50
+.venv/bin/python -m lerobot_policy_snvla.scripts.trim_success_dataset \
+  --source-root ~/datasets/t1_n3_v5_success200 \
+  --dst-root ~/datasets/t1_n3_v5_success200_trim \
+  --dst-repo-id local/t1_n3_v5_success200_trim \
+  --expected-episodes 200 --keep-following-frames 10
 
 .venv/bin/python -m lerobot_policy_snvla.scripts.augment_narrations \
-  ~/datasets/t1_n3_v5_success200 \
+  ~/datasets/t1_n3_v5_success200_trim \
   ~/datasets/t1_n3_v5_success200_aug \
   --dst-repo-id local/t1_n3_v5_success200_aug \
   --window-size 5 --forward-only
@@ -486,7 +485,11 @@ Require `saved=150`, `narration_ok=150/150`, and no source-root overwrite.
   --expected-episodes 200
 ```
 
-Use the unaugmented `t1_n3_v3` source intentionally: the merged 200 episodes must pass through
+The raw merged root is immutable. Trimming precedes augmentation and requires exactly one canonical
+completion frame per raw episode; it retains that frame through offset `+10`, drops later dataset
+rows, and makes independent identical-byte MP4 copies without decoding or remuxing. Numeric,
+action, and state stats are recomputed from retained rows; visual stats are omitted under a
+fail-closed `stats_policy` only because SNVLA uses `VISUAL=IDENTITY`. The trimmed 200 episodes must pass through
 `augment_narrations` exactly once. The pre-augmentation builder validates exact semantic event
 cardinality from `sim_event` transitions and the canonical narration centers. In `--validate-only`
 mode on the augmented result, validate schema, episode/frame identity, event-transition ordering,

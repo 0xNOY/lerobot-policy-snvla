@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import argparse
+import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,9 +95,7 @@ def plan_augmentation_in_episode(
 
     for i, narration_frame in enumerate(narration_frames):
         prev_center = narration_frames[i - 1].abs_center_frame_idx if i > 0 else None
-        next_center = (
-            narration_frames[i + 1].abs_center_frame_idx if i < len(narration_frames) - 1 else None
-        )
+        next_center = narration_frames[i + 1].abs_center_frame_idx if i < len(narration_frames) - 1 else None
         narration_frame.abs_augmented_frame_idx.extend(
             compute_window(
                 narration_frame.abs_center_frame_idx,
@@ -204,6 +203,12 @@ def copy_dataset(src: LeRobotDataset, dst_path: Path, dst_repo_id: str | None = 
 
     if not dst_repo_id:
         dst_repo_id = src.repo_id
+
+    manifest_path = dst_path / "meta/success_dataset_manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        manifest["repo_id"] = dst_repo_id
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
     return LeRobotDataset(repo_id=dst_repo_id, root=dst_path)
 
