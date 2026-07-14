@@ -27,7 +27,6 @@ stepperプロトコル（`reset/act/narrations`）注入型で、スクリプト
 - 収集時のseed帯は `worker*100_000`（worker<16）→ **評価seedは 10_000_000 以降**を使い学習配置と重複させない
 - ブランチ `feat/p5-e2-sim-eval` で作業（venvがこのチェックアウトにeditable installされているためworktreeではなくin-placeブランチ）
 - テスト: LIBERO必須テストは `@pytest.mark.sim`。純ロジックテストはマーカーなし
-- コミットメッセージ末尾: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
 
 ## 分業ガイド（このセッション固有）
 
@@ -326,9 +325,7 @@ Expected: 全PASS
 
 ```bash
 git add src/lerobot_policy_snvla/sim/evaluate.py tests/sim/test_evaluate.py
-git commit -m "feat(sim): add T1 evaluation runner with injectable stepper
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+git commit -m "feat(sim): add T1 evaluation runner with injectable stepper"
 ```
 
 ---
@@ -495,9 +492,7 @@ Expected: usage表示（policy読み込みは走らない）
 
 ```bash
 git add src/lerobot_policy_snvla/sim/evaluate.py tests/sim/test_evaluate.py pyproject.toml
-git commit -m "feat(sim): add snvla-sim-eval CLI with PolicyStepper
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+git commit -m "feat(sim): add snvla-sim-eval CLI with PolicyStepper"
 ```
 
 ---
@@ -619,9 +614,7 @@ Expected: 全PASS。既存回帰: `.venv/bin/python -m pytest tests/ -m "not sim
 
 ```bash
 git add src/lerobot_policy_snvla/scripts/augment_narrations.py tests/scripts/test_augment_narrations.py
-git commit -m "feat(scripts): add forward-only narration augmentation mode
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+git commit -m "feat(scripts): add forward-only narration augmentation mode"
 ```
 
 ---
@@ -813,9 +806,7 @@ Simulation (LIBERO) 節の収集コマンドの後に評価コマンド（Step 1
 .venv/bin/python -m pytest tests/ -m "not sim" -q
 MUJOCO_GL=egl .venv/bin/python -m pytest tests/ -m sim -q
 git add docs/ README.md outputs/eval/ 2>/dev/null || git add docs/ README.md
-git commit -m "docs: add P5-E2 report and sim evaluation instructions
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+git commit -m "docs: add P5-E2 report and sim evaluation instructions"
 ```
 
 （`outputs/` が.gitignore対象の場合は結果JSONの要約をレポートに転記するだけでよい）

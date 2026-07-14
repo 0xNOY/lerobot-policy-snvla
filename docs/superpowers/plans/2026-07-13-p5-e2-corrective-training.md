@@ -21,7 +21,6 @@
 - 実装は各Taskでテストを先に追加し、意図した失敗を確認してからproduction codeを書く。
 - 推論時にシム真値をモデル入力や実況ゲートへ使用しない。
 - 既存依存バージョンを変更しない。
-- 各コミットに`Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>` trailerを付ける。
 
 ---
 

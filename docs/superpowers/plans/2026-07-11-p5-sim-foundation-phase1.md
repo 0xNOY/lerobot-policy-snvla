@@ -21,7 +21,6 @@
 - 実況規約はP3「観測記述」: イベントの**結果が確定・視認可能になったフレーム以降**にのみ実況を付与（先行宣言禁止）。プログラムで強制する
 - ブランチ `feat/p5-sim-t1` で作業（mainに直接コミットしない）。venvがこのチェックアウトにeditable installされているためworktreeではなくin-placeブランチを使う
 - テスト: LIBERO必須のテストは `@pytest.mark.sim` を付け、libero未インストール環境ではskip
-- コミットメッセージ末尾: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
 
 ## 分業ガイド（このセッション固有）
 
