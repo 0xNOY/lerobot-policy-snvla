@@ -327,9 +327,11 @@ def _log_epoch_duration(
 ) -> None:
     logging.info(
         "Epoch duration: requested_epochs=%s, calculated_steps=%s, "
-        "steps_per_epoch=%s, initial_step=%s, effective_epoch_progress=%.6g",
+        "calculated_save_freq=%s, steps_per_epoch=%s, initial_step=%s, "
+        "effective_epoch_progress=%.6g",
         duration.epochs,
         cfg.steps,
+        cfg.save_freq,
         steps_per_epoch,
         initial_step,
         initial_step / steps_per_epoch,

@@ -168,6 +168,21 @@ def test_configure_duration_uses_selected_frames_world_size_and_save_interval():
     assert initial_step == 0
 
 
+def test_epoch_duration_log_includes_calculated_save_frequency(caplog):
+    cfg = SimpleNamespace(steps=18, save_freq=4)
+
+    with caplog.at_level("INFO"):
+        train_bf16_fsdp._log_epoch_duration(
+            TrainingDuration(epochs=2.5, save_every_epochs=0.5, remaining_argv=[]),
+            cfg,
+            steps_per_epoch=7,
+            initial_step=0,
+        )
+
+    assert "calculated_steps=18" in caplog.text
+    assert "calculated_save_freq=4" in caplog.text
+
+
 def test_configure_duration_rejects_target_at_or_before_resume_step(tmp_path):
     state_dir = tmp_path / "training_state"
     state_dir.mkdir()
