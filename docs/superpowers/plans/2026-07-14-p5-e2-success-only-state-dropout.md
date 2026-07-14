@@ -1,5 +1,10 @@
 # P5-E2 Success-Only State-Dropout Implementation Plan
 
+> [!IMPORTANT]
+> **Execution state (2026-07-15): Tasks 1–6 are completed. Resume at Task 7.**
+> Checked boxes in Tasks 1–6 record completed implementation and verification; Tasks 7–9 remain
+> executable and unchecked.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace corrective training with 200 successful demonstrations, deterministic language state-dropout, real-state Action Expert conditioning, float epoch training, and a 16-epoch production run.
@@ -21,13 +26,13 @@
 - Modify: `src/lerobot_policy_snvla/constants.py`
 - Modify: `src/lerobot_policy_snvla/__init__.py`
 
-- [ ] **Step 1: Remove corrective modules, tests, and entry points**
+- [x] **Step 1: Remove corrective modules, tests, and entry points**
 
 Remove `snvla-sim-collect-corrective` and `snvla-prepare-corrective-dataset` from
 `[project.scripts]`, then delete the four files above. Do not delete
 `/home/noy/datasets/t1_n3_v4_corrective_pilot10`.
 
-- [ ] **Step 2: Remove corrective loss keys and introduce replacement keys**
+- [x] **Step 2: Remove corrective loss keys and introduce replacement keys**
 
 Replace the old constants with:
 
@@ -42,7 +47,7 @@ Keep `CURRENT_NARRATION` and `PREVIOUS_NARRATIONS`. Remove
 `_patch_batch_converters()` to preserve `STATE_DROPOUT_MASK`, `TRAINING_EPOCH`, and the narration
 keys; LeRobot already preserves `index`.
 
-- [ ] **Step 3: Verify removal and commit**
+- [x] **Step 3: Verify removal and commit**
 
 Run:
 
@@ -68,7 +73,7 @@ git commit -m "refactor: remove corrective training pipeline"
 - Modify: `src/lerobot_policy_snvla/processor_snvla.py`
 - Modify: `tests/policies/test_snvla.py`
 
-- [ ] **Step 1: Write failing schedule and prompt tests**
+- [x] **Step 1: Write failing schedule and prompt tests**
 
 Add focused tests requiring epoch 0 to retain state, deterministic selection, no adjacent dropout,
 and both narration modes to be eligible:
@@ -117,7 +122,7 @@ Run and confirm RED:
 .venv/bin/python -m pytest tests/policies/test_snvla.py -k "state_dropout_schedule or processor_omits_state" -v
 ```
 
-- [ ] **Step 2: Implement the pure schedule**
+- [x] **Step 2: Implement the pure schedule**
 
 Add config fields:
 
@@ -142,7 +147,7 @@ def state_dropout_mask(frame_ids: torch.Tensor, epoch: int, ratio: float, seed: 
 
 The `ratio <= 0.5` validation makes consecutive `True` values impossible.
 
-- [ ] **Step 3: Omit the complete prompt line and retain every loss**
+- [x] **Step 3: Omit the complete prompt line and retain every loss**
 
 Change `make_prefix_prompt()` to accept `state_str: str | None`:
 
@@ -158,7 +163,7 @@ In the training processor, read stable `index` and `TRAINING_EPOCH`, create `STA
 and pass `None` only for selected prompt rows. Do not mutate `observation.state`. Do not create or
 modify a diffusion/action-loss mask.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 Run:
 
@@ -182,7 +187,7 @@ git commit -m "feat(train): add deterministic language state dropout"
 - Modify: `src/lerobot_policy_snvla/modeling_snvla.py`
 - Modify: `tests/policies/test_snvla.py`
 
-- [ ] **Step 1: Write failing state-token and checkpoint migration tests**
+- [x] **Step 1: Write failing state-token and checkpoint migration tests**
 
 Add test-local `make_tiny_core()` and `old_checkpoint_projection_state()` fixtures using the
 existing tiny SNVLA config and the current `action_in_proj` key names. Then add tests for a
@@ -211,7 +216,7 @@ Run and confirm RED:
 .venv/bin/python -m pytest tests/policies/test_snvla.py -k "action_suffix or state_projection" -v
 ```
 
-- [ ] **Step 2: Add the state projection using the PI0 attention pattern**
+- [x] **Step 2: Add the state projection using the PI0 attention pattern**
 
 In `SNVLACore.__init__` add:
 
@@ -224,14 +229,14 @@ prepend a valid pad mask, and use attention markers `[1, 1, 0, ..., 0]` for the 
 block. Pass real normalized state through training `forward`, `_act`, and `denoise_step`. Continue
 taking action predictions from the last `chunk_size` suffix outputs.
 
-- [ ] **Step 3: Make old checkpoint loading exact**
+- [x] **Step 3: Make old checkpoint loading exact**
 
 Extract and test a pure `initialize_state_projection_keys()` helper. Call it from
 `_fix_pytorch_state_dict_keys`; when `state_proj` is absent and `action_in_proj` is present, clone the
 compatible weight and bias into `state_proj`. Reject incompatible shapes. Do not suppress loader
 warnings or use `strict=False`.
 
-- [ ] **Step 4: Remove action masking and expose grouped action metrics**
+- [x] **Step 4: Remove action masking and expose grouped action metrics**
 
 Reduce action loss over the full batch. Rename randomized metrics to state-dropout metrics and add:
 
@@ -247,7 +252,7 @@ state_dropout_fraction
 
 Every metric must be detached and finite for an empty group.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run:
 
@@ -271,7 +276,7 @@ git commit -m "feat(model): condition action expert on robot state"
 - Modify: `src/lerobot_policy_snvla/scripts/train_bf16_fsdp.py`
 - Modify: `tests/scripts/test_train_bf16_fsdp.py`
 
-- [ ] **Step 1: Write failing CLI conversion and epoch annotation tests**
+- [x] **Step 1: Write failing CLI conversion and epoch annotation tests**
 
 Add focused tests:
 
@@ -303,7 +308,7 @@ Run and confirm RED:
 .venv/bin/python -m pytest tests/scripts/test_train_bf16_fsdp.py -k "epochs_to_steps or epoch_aware or explicit_steps" -v
 ```
 
-- [ ] **Step 2: Parse float epochs before Draccus**
+- [x] **Step 2: Parse float epochs before Draccus**
 
 Support `--epochs=3.0` and `--epochs 3.0`, require a finite positive value, remove it from `sys.argv`,
 and reject an explicitly supplied `--steps`. Also support positive float
@@ -321,7 +326,7 @@ cfg.steps = math.ceil(epochs * steps_per_epoch)
 If resuming, read `training_state/training_step.json`; reject a target not greater than the saved
 step.
 
-- [ ] **Step 3: Annotate every raw batch with integer epoch**
+- [x] **Step 3: Annotate every raw batch with integer epoch**
 
 Replace the module-level `lerobot_train.cycle` only for this entry point with `epoch_aware_cycle`.
 It must iterate the DataLoader afresh each epoch, attach a tensor `TRAINING_EPOCH` matching the batch
@@ -329,12 +334,12 @@ index shape, start from the resumed step, and assert the prepared DataLoader len
 calculated `steps_per_epoch`. This avoids `itertools.cycle` batch caching and gives the processor an
 explicit epoch before `preprocessor(batch)`.
 
-- [ ] **Step 4: Preserve W&B preflight and log duration**
+- [x] **Step 4: Preserve W&B preflight and log duration**
 
 Keep `SNVLA_REQUIRE_WANDB=1`. Log requested epochs, calculated steps, steps per epoch, initial step,
 and effective epoch progress through the existing metric tracker.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run:
 
@@ -359,7 +364,7 @@ git commit -m "feat(train): support deterministic float epoch training"
 - Create: `tests/scripts/test_prepare_success_dataset.py`
 - Modify: `pyproject.toml`
 
-- [ ] **Step 1: Write one failing real-dataset aggregation test**
+- [x] **Step 1: Write one failing real-dataset aggregation test**
 
 Create two tiny LeRobot success datasets (two episodes plus one episode), aggregate into a new root,
 and require immutable sources, three renumbered episodes, a 90/10 episode partition manifest, and no
@@ -371,7 +376,7 @@ Run and confirm RED:
 .venv/bin/python -m pytest tests/scripts/test_prepare_success_dataset.py -v
 ```
 
-- [ ] **Step 2: Implement the success-only builder**
+- [x] **Step 2: Implement the success-only builder**
 
 Expose:
 
@@ -389,7 +394,7 @@ a fixed 50-episode ablation subset drawn from the 150 new episodes. Store these 
 `meta/success_dataset_manifest.json` keys `train_episode_ids`, `validation_episode_ids`, and
 `ablation_episode_ids` so shell commands can pass them through `--dataset.episodes`.
 
-- [ ] **Step 3: Add the CLI and verify**
+- [x] **Step 3: Add the CLI and verify**
 
 Register `snvla-prepare-success-dataset`, supporting repeated `--source-root`, `--expected-episodes`,
 `--validate-only`, `--ablation-episodes`, `--dst-root`, and `--dst-repo-id`. Cover those names in a
@@ -418,7 +423,7 @@ git commit -m "feat(data): prepare success-only training dataset"
 - Modify: `docs/superpowers/plans/2026-07-13-p5-e2-handoff.md`
 - Create: `docs/superpowers/reports/2026-07-14-p5-e2-success-only-report.md`
 
-- [ ] **Step 1: Run the required local verification**
+- [x] **Step 1: Run the required local verification**
 
 ```bash
 .venv/bin/python -m pytest tests/policies/test_snvla.py tests/scripts/test_train_bf16_fsdp.py tests/scripts/test_prepare_success_dataset.py -q
@@ -427,13 +432,13 @@ git commit -m "feat(data): prepare success-only training dataset"
 git diff --check
 ```
 
-- [ ] **Step 2: Replace active corrective instructions**
+- [x] **Step 2: Replace active corrective instructions**
 
 Mark the 2026-07-13 corrective plan as canceled by the user and point to this plan. Update the
 handoff to specify 200 successes, float epochs, `n_action_steps=10`, no corrective data, and all DGX
 checkpoint roots under `/raid/takenaka/snvla/checkpoints/`.
 
-- [ ] **Step 3: Commit verification documentation**
+- [x] **Step 3: Commit verification documentation**
 
 Record exact test counts and commands in the new report, then commit:
 

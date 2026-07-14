@@ -1,6 +1,16 @@
 # P5-E2: t1_n3_v3でのSNVLA学習とシム内評価 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> [!CAUTION]
+> **SUPERSEDED / HISTORY ONLY. DO NOT EXECUTE ANY UNCHECKED STEP IN THIS DOCUMENT.**
+> This plan and its old phase-2 continuation/evaluation commands are canceled and replaced. Resume
+> only from Task 7 of
+> [`2026-07-14-p5-e2-success-only-state-dropout.md`](./2026-07-14-p5-e2-success-only-state-dropout.md)
+> and record evidence in
+> [`2026-07-14-p5-e2-success-only-report.md`](../reports/2026-07-14-p5-e2-success-only-report.md).
+> The body below is preserved solely as historical implementation and diagnostic evidence.
+
+> **Archived former agent instruction:** The old task-by-task execution instruction is canceled.
+> Unchecked boxes below show what the superseded plan once proposed, not work to perform.
 
 **Goal:** 自動収集データセット `local/t1_n3_v3`（実況フレームをforward-only伝搬で増強した `local/t1_n3_v3_aug`）でSNVLAをfine-tuneし、LIBERO T1環境で「実況あり ≫ 実況なしablation」を検証する（スペックのP5-E2）。
 
@@ -11,9 +21,9 @@ stepperプロトコル（`reset/act/narrations`）注入型で、スクリプト
 **Tech Stack:** LeRobot 0.6.0 / hf-libero 0.1.x / Python 3.13 venv (`.venv`) / pytest / RTX 3090 24GB ×1
 
 > **2026-07-13追記:** 当初計画の単GPU学習仮定は成立せず、DGX 2GPU FSDPへ移行した。
-> OOM解消、FSDP + compile/CUDA Graph、現行本番コマンド、残作業は
-> `2026-07-13-p5-e2-handoff.md` を正とする。現在はstep 0→15000のphase-2学習中で、
-> 実況あり/なし各30エピソードの最終評価は未実施。
+> OOM解消とFSDP + compile/CUDA Graphの記録は歴史的証拠として残す。当時は
+> step 0→15000のphase-2学習中と記録したが、その継続と実況あり/なし各30エピソードの
+> 旧最終評価は後にcanceled/replacedとなった。現行状態には使用しない。
 
 ## Global Constraints
 
@@ -647,7 +657,8 @@ git commit -m "feat(scripts): add forward-only narration augmentation mode"
 >
 > **2026-07-13上書き:** 上記はphase-1の履歴。phase-2は2×A100 FULL_SHARD / batch 8×2 /
 > lr 10e-5 / 固定形状loss-only compile + CUDA Graph / SDPA / fused QKV /
-> checkpoint interval=2で実行中。完全なコマンドは同日handoff §3を参照。
+> checkpoint interval=2で実行していた。当該runの継続コマンドはcanceled/replacedであり、
+> 実行しない。
 
 **Files:** なし（実験のみ。結果はTask 6のレポートに記録）
 
@@ -746,7 +757,8 @@ nohup .venv/bin/python -m lerobot.scripts.lerobot_train \
 Run: `ls outputs/train/snvla_t1_n3_v3_aug/checkpoints/`
 Expected: `002500 ... 020000 last`
 
-中断された場合は同コマンド + `--resume=true` で再開できる。
+当時は中断時に同コマンド + `--resume=true` で再開する想定だったが、この再開手順は
+canceled/replacedであり、実行しない。
 
 ---
 

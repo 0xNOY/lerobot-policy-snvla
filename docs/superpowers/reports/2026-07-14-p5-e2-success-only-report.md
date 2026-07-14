@@ -1,6 +1,8 @@
 # P5-E2 success-only state-dropout report
 
-**Status:** Tasks 1–6 complete locally at base commit `1aad432`; Tasks 7–9 not run.
+**Status:** Tasks 1–5 were complete at `1aad432`; Task 6 verification ran against that commit and
+its documentation was committed as `e0a86e8`. The 16-epoch update is `80a5b5f`. Tasks 1–6 are
+complete; resume execution at Task 7.
 
 ## Objective and decisions
 
@@ -17,8 +19,8 @@ language robustness from Action Expert state conditioning:
 - fix `n_action_steps=10` and state/action maxima at 32/32;
 - compare dropout ratios `0.0`, `0.25`, and `0.50` with fixed 3.0-epoch, 10-on/10-off ablations;
 - train the selected ratio for 16.0 epochs, saving every 2.0 epochs through epoch 16;
-- require W&B, DGX GPUs 2,3, strict checkpoint loading, and checkpoint/output roots under
-  `/raid/takenaka/snvla/checkpoints`;
+- require W&B, DGX GPUs 2,3, strict checkpoint loading, and all DGX training checkpoint/output roots
+  under `/raid/takenaka/snvla/checkpoints`;
 - finish with recorded 30 narration-on and 30 narration-off episodes. If ablation evidence is
   ambiguous, stop for user direction.
 
@@ -68,8 +70,8 @@ Result: `package import: ok` (runner wall time 4.33 s).
 git diff --check
 ```
 
-Result: exit 0 with no output before documentation edits. A final post-edit diff check is required
-before commit.
+Result: exit 0 with no output before documentation edits. The post-edit working-tree check and
+committed-range check (`1aad432..80a5b5f`) also completed successfully with no output.
 
 ## Exact checkpoint loader gates
 
