@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace corrective training with 200 successful demonstrations, deterministic language state-dropout, real-state Action Expert conditioning, float epoch training, and an 8-epoch production run.
+**Goal:** Replace corrective training with 200 successful demonstrations, deterministic language state-dropout, real-state Action Expert conditioning, float epoch training, and a 16-epoch production run.
 
 **Architecture:** A stable frame/epoch schedule omits the textual `State:` line on at most half of training samples without consecutive-epoch dropout. A PI0-style state projection always supplies normalized state to the Action Expert, while all selected samples retain action loss. The SNVLA entry point converts float epochs to steps and annotates raw batches with integer epoch before preprocessing.
 
@@ -613,7 +613,7 @@ and selection rationale. Do not commit evaluation recordings or `outputs/`.
 
 ---
 
-### Task 9: Eight-epoch production training and final evaluation
+### Task 9: Sixteen-epoch production training and final evaluation
 
 **Files:**
 - Modify: `docs/superpowers/reports/2026-07-14-p5-e2-success-only-report.md`
@@ -622,7 +622,7 @@ and selection rationale. Do not commit evaluation recordings or `outputs/`.
 
 - [ ] **Step 1: Run production training**
 
-On DGX use the selected ratio, all 180 train episode IDs, `--epochs=8.0`, W&B, and
+On DGX use the selected ratio, all 180 train episode IDs, `--epochs=16.0`, W&B, and
 `CUDA_VISIBLE_DEVICES=2,3`. Use:
 
 ```text
@@ -630,7 +630,7 @@ output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_success200_prod
 ```
 
 Keep max dimensions 32/32, bf16 FULL_SHARD, fixed padding 256, and `n_action_steps=10`. Save at
-epochs 2, 4, 6, and 8; the epoch-8 save is the final checkpoint. Confirm the exact
+epochs 2, 4, 6, 8, 10, 12, 14, and 16; the epoch-16 save is the final checkpoint. Confirm the exact
 `All keys loaded successfully!` message from both ranks, finite losses, the expected state-dropout
 schedule, a W&B URL, and no `Warning: Could not load state dict`, OOM, or runtime errors.
 
@@ -664,7 +664,7 @@ SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_s
   --policy.max_state_dim=32 --policy.max_action_dim=32 --policy.n_action_steps=10 \
   --policy.state_dropout_enabled=true --policy.state_dropout_ratio="$SELECTED_RATIO" \
   --policy.state_dropout_seed=20260714 --seed=20260714 \
-  --epochs=8.0 --save-every-epochs=2.0 \
+  --epochs=16.0 --save-every-epochs=2.0 \
   --batch_size=8 --log_freq=10 --num_workers=8 \
   --output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_success200_prod \
   --wandb.enable=true --wandb.project=snvla-p5 \

@@ -65,7 +65,8 @@ state-present.
 3. Evaluate each run on identical seeds for narration-on and narration-off, 10 episodes each. Rank
    using false pick/place/task-completed counts, picked, placed, success, and minimum end-effector to
    object distance. Stop for user input if the adoption decision is ambiguous.
-4. Train the selected setting on all 200 episodes for 8.0 epochs with W&B enabled and
+4. Train the selected setting on all 180 manifest training episodes from the 200-episode dataset
+   for 16.0 epochs with W&B enabled and
    `CUDA_VISIBLE_DEVICES=2,3` on DGX. Store every DGX training checkpoint under
    `/raid/takenaka/snvla/checkpoints/`; do not place checkpoints under `$HOME` or the source tree.
 5. Evaluate the final checkpoint with narration-on and narration-off for 30 recorded episodes each.
