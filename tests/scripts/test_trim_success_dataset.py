@@ -94,7 +94,14 @@ def _raw_merged(tmp_path: Path) -> Path:
     merged = tmp_path / "raw-merged"
     _source(first, "test/first", 19, 10)
     _source(second, "test/second", 12, 20)
-    prepare_success_dataset([first, second], merged, "test/raw-merged", 2, ablation_episodes=1)
+    prepare_success_dataset(
+        [first, second],
+        merged,
+        "test/raw-merged",
+        2,
+        ablation_episodes=1,
+        allow_legacy_completion=True,
+    )
     return merged
 
 

@@ -5,6 +5,8 @@ from enum import Enum
 
 import numpy as np
 
+from .completion import CANONICAL_HOME_EEF_POSITION_M, HOME_POSITION_TOLERANCE_M
+
 
 class Phase(Enum):
     HOVER = "HOVER"
@@ -15,6 +17,7 @@ class Phase(Enum):
     LOWER = "LOWER"
     RELEASE = "RELEASE"
     RETREAT = "RETREAT"
+    RETURN_HOME = "RETURN_HOME"
     DONE = "DONE"
 
 
@@ -23,7 +26,7 @@ class ExpertConfig:
     hover_height: float = 0.12
     # 把持物が横倒し(長辺半分≈0.05-0.06)でもかごの壁上端(≈0.145)を越えて運べる高さ
     lift_height: float = 0.30
-    pos_tol: float = 0.015
+    pos_tol: float = HOME_POSITION_TOLERANCE_M
     grasp_frames: int = 8
     release_frames: int = 8
     kp: float = 6.0
@@ -163,6 +166,9 @@ class T1Expert:
         self.basket_body = BASKET_BODY
         self._idx = 0
         self._sm = PickPlaceStateMachine(ExpertConfig())
+        self._initial_eef_pos: np.ndarray | None = None
+        self._home_pos = np.asarray(CANONICAL_HOME_EEF_POSITION_M, dtype=np.float64)
+        self._finished = False
         # かご内の置き位置の割当。rngを与えると順序がエピソードごとにシャッフルされ、
         # 最終配置とアプローチ軌道に多様性が出る
         self._offsets = [PLACE_OFFSETS[i % len(PLACE_OFFSETS)] for i in range(n_blocks)]
@@ -171,12 +177,35 @@ class T1Expert:
 
     @property
     def finished(self) -> bool:
-        return self._idx >= len(self.bodies)
+        return self._finished
+
+    @property
+    def returning_home(self) -> bool:
+        return self._idx >= len(self.bodies) and not self._finished
+
+    @property
+    def home_position(self) -> np.ndarray:
+        return self._home_pos.copy()
+
+    @property
+    def initial_eef_position(self) -> np.ndarray | None:
+        return None if self._initial_eef_pos is None else self._initial_eef_pos.copy()
+
+    @staticmethod
+    def _hold_open_action() -> np.ndarray:
+        return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0])
 
     def act(self, obs) -> np.ndarray:
-        if self.finished:
-            return np.zeros(7)
         eef = np.asarray(obs["robot0_eef_pos"])
+        if self._initial_eef_pos is None:
+            self._initial_eef_pos = eef.copy()
+        if self.finished:
+            return self._hold_open_action()
+        if self.returning_home:
+            if self._sm._at(eef, self._home_pos):
+                self._finished = True
+                return self._hold_open_action()
+            return self._sm._move_action(eef, self._home_pos, -1.0)
         obj = get_body_pos(self.env, self.bodies[self._idx])
         offset = self._offsets[self._idx]
         # 高さはステートマシンのplace_transit/place_release(かご壁クリア/低ドロップ)が積む
@@ -184,5 +213,8 @@ class T1Expert:
         action, done = self._sm.step(eef, obj, place)
         if done:
             self._idx += 1
-            self._sm = PickPlaceStateMachine(self._sm.cfg)
+            if self._idx < len(self.bodies):
+                self._sm = PickPlaceStateMachine(self._sm.cfg)
+            else:
+                self._sm.phase = Phase.RETURN_HOME
         return action

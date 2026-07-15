@@ -89,7 +89,7 @@ class NarrationFormat:
     ``Picking up X 1 of N... (done)\\nPutting X 1 of N into the basket... (done)\\n
     ... Task completed.\\n``
     開始断片は動作開始時、`` (done)\\n`` は真値イベントの確定フレーム（P3規約）、
-    task_completed は最後の (done) の直後に発行される。
+    task_completed は最後の (done) 後、EEFが固定canonical homeへ戻ってから発行される。
     """
 
     object_name: str = "chocolate pudding"

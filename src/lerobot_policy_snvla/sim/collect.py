@@ -3,7 +3,7 @@
 実況は so101_wn 互換の断片列で書き込む:
 ``Placing X 1 of N in the basket...`` → `` completed.\n`` → ... → ``Task completed.\n``
 開始断片は各ブロックの動作開始フレーム、完了断片は真値イベント（settle）フレーム、
-task_completed は最後の完了断片の直後フレームに発行される。
+task_completed は最後の完了断片後にEEFを固定canonical homeへ戻してから発行される。
 """
 
 import argparse
@@ -16,8 +16,20 @@ from pathlib import Path
 
 import numpy as np
 
+from .completion import (
+    CANONICAL_HOME_EEF_POSITION_M,
+    COLLECTION_HORIZON,
+    HOME_POSITION_TOLERANCE_M,
+    INITIAL_MIN_OFFSET_NORM_M,
+    INITIAL_POSE_MAX_STEPS,
+    INITIAL_POSE_TARGET_TOLERANCE_M,
+    INITIAL_XY_OFFSET_RANGE_M,
+    INITIAL_Z_OFFSET_RANGE_M,
+    POST_TASK_HOLD_FRAMES,
+    write_completion_timing_policy,
+)
 from .events import BasketRegion, EventTracker, NarrationFormat
-from .scripted_expert import T1Expert, get_body_pos
+from .scripted_expert import ExpertConfig, T1Expert, get_body_pos
 from .t1_count_blocks import (
     BASKET_BODY,
     DEFAULT_CATEGORY,
@@ -79,6 +91,60 @@ def _features(camera_hw: int) -> dict:
     }
 
 
+def _sample_initial_eef_target(rng: np.random.Generator) -> np.ndarray:
+    """Sample a non-trivial start target without consuming the place-offset RNG."""
+
+    for _ in range(1024):
+        offset = np.array(
+            [
+                rng.uniform(*INITIAL_XY_OFFSET_RANGE_M),
+                rng.uniform(*INITIAL_XY_OFFSET_RANGE_M),
+                rng.uniform(*INITIAL_Z_OFFSET_RANGE_M),
+            ]
+        )
+        if np.linalg.norm(offset) >= INITIAL_MIN_OFFSET_NORM_M:
+            return np.asarray(CANONICAL_HOME_EEF_POSITION_M) + offset
+    raise RuntimeError("failed to sample a valid randomized initial EEF target")
+
+
+def _move_to_initial_pose(env, obs, rng: np.random.Generator):
+    """Return ``(frame0 observation, consumed steps)`` after the unrecorded OSC pre-roll."""
+
+    target = _sample_initial_eef_target(rng)
+    for steps in range(INITIAL_POSE_MAX_STEPS):
+        eef = np.asarray(obs["robot0_eef_pos"])
+        if np.linalg.norm(eef - target) <= INITIAL_POSE_TARGET_TOLERANCE_M:
+            return obs, steps
+        delta = np.clip(ExpertConfig().kp * (target - eef), -1.0, 1.0)
+        action = np.array([*delta, 0.0, 0.0, 0.0, -1.0])
+        obs, _reward, _done, _info = env.step(action)
+    if (
+        np.linalg.norm(np.asarray(obs["robot0_eef_pos"]) - target)
+        <= INITIAL_POSE_TARGET_TOLERANCE_M
+    ):
+        return obs, INITIAL_POSE_MAX_STEPS
+    return None
+
+
+def _completion_contract_satisfied(
+    history: list[str],
+    fmt: NarrationFormat,
+    n_blocks: int,
+    *,
+    home_hold_ok: bool,
+    task_completed_emitted: bool,
+    post_task_hold_frames: int,
+) -> bool:
+    """Require the complete stream and exactly the contracted post-task hold."""
+
+    return (
+        "".join(history) == fmt.expected_stream(n_blocks)
+        and home_hold_ok
+        and task_completed_emitted
+        and post_task_hold_frames == POST_TASK_HOLD_FRAMES
+    )
+
+
 def _run_episode(
     env,
     n_blocks: int,
@@ -86,6 +152,7 @@ def _run_episode(
     fmt: NarrationFormat,
     category: str,
     rng: np.random.Generator | None = None,
+    initial_pose_rng: np.random.Generator | None = None,
 ) -> tuple[list[dict], bool, bool]:
     """1エピソード実行。(frames, success, narration_ok) を返す。
 
@@ -97,6 +164,14 @@ def _run_episode(
 
     bodies = object_body_names(n_blocks, category)
     obs = env.reset()
+    pre_roll = _move_to_initial_pose(
+        env,
+        obs,
+        initial_pose_rng if initial_pose_rng is not None else np.random.default_rng(0),
+    )
+    if pre_roll is None:
+        return [], False, False
+    obs, pre_roll_steps = pre_roll
     region = BasketRegion(
         center=get_body_pos(env, BASKET_BODY) + np.array([0.0, 0.0, 0.05]),
         half_extents=BASKET_HALF_EXTENTS,
@@ -110,22 +185,24 @@ def _run_episode(
     pick_started = 1  # pick開始断片を発行済みのブロック数
     place_started = 0  # place開始断片を発行済みのブロック数
     place_phases = {Phase.MOVE, Phase.LOWER, Phase.RELEASE, Phase.RETREAT}
+    task_completed_emitted = False
+    task_completed_frame_written = False
+    post_task_hold_frames = 0
+    home_hold_ok = True
     # robosuiteはhorizon到達後のstepで例外を出すため、必ず手前で打ち切る
     horizon = getattr(env.env, "horizon", 1000)
-    max_steps = min(MAX_STEPS_PER_BLOCK * n_blocks, horizon - 2)
+    max_steps = min(MAX_STEPS_PER_BLOCK * n_blocks, horizon - pre_roll_steps - 2)
     for frame_idx in range(max_steps):
         positions = {b: get_body_pos(env, b) for b in bodies}
         event = tracker.update(frame_idx, positions)
         if event:
             pending.append((fmt.done_fragment, json.dumps(dataclasses.asdict(event))))
-            if event.kind == "placed" and event.ordinal == n_blocks:
-                pending.append((fmt.task_completed_fragment, ""))
 
         action = expert.act(obs)
         if not expert.finished:
             cur_block = expert._idx + 1
             # 次ブロックへの着手（actでの_idx遷移）をpick開始断片として発行
-            if cur_block > pick_started:
+            if cur_block <= n_blocks and cur_block > pick_started:
                 pick_started = cur_block
                 pending.append((fmt.pick_narration(cur_block, n_blocks), ""))
             # 運搬フェーズ入りをplace開始断片として発行。pickedイベントが未確定の
@@ -137,6 +214,15 @@ def _run_episode(
             ):
                 place_started = cur_block
                 pending.append((fmt.place_narration(cur_block, n_blocks), ""))
+
+        if (
+            expert.finished
+            and tracker.count("placed") == n_blocks
+            and not pending
+            and not task_completed_emitted
+        ):
+            pending.append((fmt.task_completed_fragment, ""))
+            task_completed_emitted = True
 
         narration, sim_event = pending.pop(0) if pending else ("", "")
         frames.append(
@@ -152,10 +238,29 @@ def _run_episode(
         )
         if narration:
             history.append(narration)
+        if narration == fmt.task_completed_fragment:
+            task_completed_frame_written = True
+        elif task_completed_frame_written:
+            post_task_hold_frames += 1
+        if task_completed_frame_written:
+            home_hold_ok &= bool(
+                np.linalg.norm(
+                    np.asarray(obs["robot0_eef_pos"])
+                    - np.asarray(CANONICAL_HOME_EEF_POSITION_M)
+                )
+                <= HOME_POSITION_TOLERANCE_M
+            )
         obs, reward, done, info = env.step(action)
-        if expert.finished and tracker.count("placed") == n_blocks and not pending:
+        if post_task_hold_frames >= POST_TASK_HOLD_FRAMES:
             break
-    narration_ok = "".join(history) == fmt.expected_stream(n_blocks)
+    narration_ok = _completion_contract_satisfied(
+        history,
+        fmt,
+        n_blocks,
+        home_hold_ok=home_hold_ok,
+        task_completed_emitted=task_completed_emitted,
+        post_task_hold_frames=post_task_hold_frames,
+    )
     return frames, bool(env.check_success()), narration_ok
 
 
@@ -183,11 +288,26 @@ def collect_episodes(
     seed = seed0
     while saved < n_episodes:
         attempted += 1
-        env = make_t1_env(n_blocks=n_blocks, seed=seed, camera_hw=camera_hw, object_category=category)
-        rng = np.random.default_rng(seed)  # 置き順シャッフル用（配置と同じseed系列）
+        env = make_t1_env(
+            n_blocks=n_blocks,
+            seed=seed,
+            camera_hw=camera_hw,
+            object_category=category,
+            horizon=COLLECTION_HORIZON,
+        )
+        rng = np.random.default_rng(seed)  # 既存の置き順シャッフルstreamは変更しない
+        initial_pose_rng = np.random.default_rng(np.random.SeedSequence(seed).spawn(1)[0])
         seed += 1
         try:
-            frames, success, stream_ok = _run_episode(env, n_blocks, task_str, fmt, category, rng=rng)
+            frames, success, stream_ok = _run_episode(
+                env,
+                n_blocks,
+                task_str,
+                fmt,
+                category,
+                rng=rng,
+                initial_pose_rng=initial_pose_rng,
+            )
         finally:
             env.close()
         if not success or not stream_ok:
@@ -199,6 +319,7 @@ def collect_episodes(
         saved += 1
         narration_ok += 1  # saved エピソードはストリーム完全一致を満たす
         logging.info("episode %d/%d saved (%d frames)", saved, n_episodes, len(frames))
+    write_completion_timing_policy(dataset.root)
     if push_to_hub:
         dataset.push_to_hub()
     return CollectStats(saved, attempted, time.perf_counter() - t0, narration_ok)
@@ -272,6 +393,7 @@ def collect_episodes_parallel(
         aggr_root=root,
     )
     shutil.rmtree(shards_root)
+    write_completion_timing_policy(root)
     if push_to_hub:
         LeRobotDataset(repo_id, root=root).push_to_hub()
     return CollectStats(

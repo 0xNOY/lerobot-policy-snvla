@@ -21,6 +21,11 @@ from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stat
 from lerobot.datasets.dataset_tools import aggregate_datasets
 from lerobot.datasets.video_utils import decode_video_frames, get_video_duration_in_s
 from lerobot.utils.utils import flatten_dict
+from lerobot_policy_snvla.sim.completion import (
+    COMPLETION_TIMING_POLICY,
+    COMPLETION_TIMING_POLICY_PATH,
+    write_completion_timing_policy,
+)
 
 CORRECTIVE_FEATURES = {
     "diffusion_loss_mask",
@@ -31,6 +36,27 @@ MANIFEST_PATH = Path("meta/success_dataset_manifest.json")
 DEFAULT_SPLIT_SEED = 20260715
 _PICK_RE = re.compile(r"^Picking up .+ (\d+) of (\d+)\.\.\.\s*$")
 _PLACE_RE = re.compile(r"^Putting .+ (\d+) of (\d+) into the basket\.\.\.\s*$")
+_DONE_FRAGMENT = " (done)\n"
+_TASK_COMPLETED_FRAGMENT = "Task completed.\n"
+
+
+def _read_completion_timing_policy(root: Path) -> dict[str, Any] | None:
+    path = root / COMPLETION_TIMING_POLICY_PATH
+    if not path.is_file():
+        return None
+    try:
+        policy = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"completion timing policy is invalid JSON: {path}") from exc
+    _validate_completion_timing_policy(policy)
+    return policy
+
+
+def _validate_completion_timing_policy(policy: Any) -> None:
+    if policy != COMPLETION_TIMING_POLICY:
+        raise ValueError(
+            "completion timing policy is invalid; expected the exact production completion contract"
+        )
 
 
 def _read_info(root: Path) -> dict[str, Any]:
@@ -144,7 +170,134 @@ def _validate_success_episode(
     return completions[0]
 
 
+def _validate_completion_timing_episode(
+    episode_index: int,
+    sim_events: Sequence[str],
+    narrations: Sequence[str],
+    previous_narrations: Sequence[str],
+    states: Sequence[Any],
+    blocks: int,
+) -> None:
+    """Fail closed on the production return-home completion contract."""
+
+    transitions = _narration_transitions(narrations)
+    fragments = [fragment for _, fragment in transitions]
+    expected_kinds: list[str] = []
+    for _ in range(blocks):
+        expected_kinds.extend(("pick", "done", "place", "done"))
+    expected_kinds.append("task")
+    if len(fragments) != len(expected_kinds):
+        raise ValueError(f"episode {episode_index} narration stream is not canonical")
+    for fragment, kind in zip(fragments, expected_kinds, strict=True):
+        valid = {
+            "pick": _PICK_RE.fullmatch(fragment) is not None,
+            "done": fragment == _DONE_FRAGMENT,
+            "place": _PLACE_RE.fullmatch(fragment) is not None,
+            "task": fragment == _TASK_COMPLETED_FRAGMENT,
+        }[kind]
+        if not valid:
+            raise ValueError(f"episode {episode_index} narration stream is not canonical")
+    for frame_index, (current, raw_previous) in enumerate(
+        zip(narrations, previous_narrations, strict=True)
+    ):
+        try:
+            history = json.loads(raw_previous or "[]")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"episode {episode_index} previous_narrations at frame {frame_index} is invalid JSON"
+            ) from exc
+        if not isinstance(history, list) or not all(isinstance(value, str) for value in history):
+            raise ValueError(
+                f"episode {episode_index} previous_narrations at frame {frame_index} is invalid"
+            )
+        if current:
+            matching_indexes = [
+                index
+                for index, (transition_frame, fragment) in enumerate(transitions)
+                if transition_frame <= frame_index and fragment == current
+            ]
+            expected_history = fragments[: matching_indexes[-1]] if matching_indexes else None
+        else:
+            completed_count = sum(
+                transition_frame < frame_index for transition_frame, _ in transitions
+            )
+            expected_history = fragments[:completed_count]
+        if history != expected_history:
+            raise ValueError(
+                f"episode {episode_index} narration history at frame {frame_index} "
+                "is inconsistent with the canonical stream"
+            )
+
+    events = _event_transitions(sim_events)
+    event_frames = [frame_index for frame_index, _ in events]
+    done_frames = [
+        frame_index for frame_index, narration in transitions if narration == _DONE_FRAGMENT
+    ]
+    if done_frames != event_frames:
+        raise ValueError(f"episode {episode_index} done fragments do not align with simulator events")
+    final_placed_frame = events[-1][0]
+    if narrations[final_placed_frame] != _DONE_FRAGMENT:
+        raise ValueError(f"episode {episode_index} final placed event is missing its done fragment")
+    task_frames = [
+        frame_index
+        for frame_index, narration in transitions
+        if narration == _TASK_COMPLETED_FRAGMENT
+    ]
+    if len(task_frames) != 1:
+        raise ValueError(f"episode {episode_index} must have one canonical Task completed transition")
+    task_frame = task_frames[0]
+    if final_placed_frame >= task_frame:
+        raise ValueError(f"episode {episode_index} Task completed is not after final placed done")
+
+    hold = int(COMPLETION_TIMING_POLICY["post_task_hold_frames"])
+    observed_hold = len(states) - task_frame - 1
+    if observed_hold != hold:
+        raise ValueError(
+            f"episode {episode_index} must have exactly {hold} post-completion hold frames; "
+            f"found {observed_hold}"
+        )
+    home_xyz = np.asarray(COMPLETION_TIMING_POLICY["home_eef_position_m"], dtype=np.float64)
+    try:
+        initial_xyz = np.asarray(states[0], dtype=np.float64)[:3]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"episode {episode_index} initial observation.state is invalid") from exc
+    if initial_xyz.shape != (3,) or not np.all(np.isfinite(initial_xyz)):
+        raise ValueError(f"episode {episode_index} initial EEF xyz is invalid")
+    tolerance = float(COMPLETION_TIMING_POLICY["home_position_tolerance_m"])
+    randomization = COMPLETION_TIMING_POLICY["initial_pose_randomization"]
+    initial_tolerance = float(randomization["target_tolerance_m"])
+    offsets = initial_xyz - home_xyz
+    bounds = randomization["position_offset_bounds_m"]
+    for axis, offset in zip(("x", "y", "z"), offsets, strict=True):
+        lower, upper = bounds[axis]
+        if offset < lower - initial_tolerance or offset > upper + initial_tolerance:
+            raise ValueError(
+                f"episode {episode_index} initial EEF {axis} offset is outside the randomized bounds"
+            )
+    minimum_norm = float(randomization["min_offset_norm_m"])
+    if float(np.linalg.norm(offsets)) + 1e-9 < minimum_norm - initial_tolerance:
+        raise ValueError(f"episode {episode_index} initial EEF offset is not meaningfully randomized")
+    for frame_index in range(task_frame, len(states)):
+        try:
+            xyz = np.asarray(states[frame_index], dtype=np.float64)[:3]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"episode {episode_index} observation.state at frame {frame_index} is invalid"
+            ) from exc
+        if xyz.shape != (3,) or not np.all(np.isfinite(xyz)):
+            raise ValueError(f"episode {episode_index} EEF xyz at frame {frame_index} is invalid")
+        distance = float(np.linalg.norm(xyz - home_xyz))
+        if distance > tolerance:
+            raise ValueError(
+                f"episode {episode_index} frame {frame_index} is not at home "
+                f"({distance:.6f}m > {tolerance:.6f}m)"
+            )
+
+
 def _validate_manifest(manifest: dict[str, Any], expected_episodes: int) -> None:
+    completion_policy = manifest.get("completion_timing_policy")
+    if completion_policy is not None:
+        _validate_completion_timing_policy(completion_policy)
     train = manifest.get("train_episode_ids")
     validation = manifest.get("validation_episode_ids")
     ablation = manifest.get("ablation_episode_ids")
@@ -425,6 +578,10 @@ def audit_sources(root: str | Path) -> dict[str, Any]:
     for source in manifest["sources"]:
         source_root = Path(source["root"])
         source_info = _read_info(source_root)
+        if manifest.get("completion_timing_policy") is not None:
+            source_policy = _read_completion_timing_policy(source_root)
+            if source_policy != manifest["completion_timing_policy"]:
+                raise ValueError(f"manifest source completion timing policy changed: {source_root}")
         if source["info_sha256"] != _sha256(source_root / "meta/info.json"):
             raise ValueError(f"manifest source info hash changed: {source_root}")
         if source["episode_count"] != source_info.get("total_episodes"):
@@ -447,6 +604,30 @@ def validate_success_dataset(
     if expected_episodes <= 0 or blocks <= 0:
         raise ValueError("expected_episodes and blocks must be positive")
     info = _read_info(root)
+    sidecar_completion_policy = _read_completion_timing_policy(root)
+    manifest_path = root / MANIFEST_PATH
+    manifest_preview: dict[str, Any] = {}
+    if manifest_path.is_file():
+        try:
+            manifest_preview = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"success dataset manifest is invalid JSON: {manifest_path}") from exc
+    manifest_completion_policy = manifest_preview.get("completion_timing_policy")
+    if manifest_completion_policy is not None:
+        _validate_completion_timing_policy(manifest_completion_policy)
+    if (
+        sidecar_completion_policy is not None
+        and manifest_completion_policy is not None
+        and sidecar_completion_policy != manifest_completion_policy
+    ):
+        raise ValueError("completion timing sidecar and manifest disagree")
+    completion_policy = sidecar_completion_policy or manifest_completion_policy
+    if require_manifest and (sidecar_completion_policy is None) != (
+        manifest_completion_policy is None
+    ):
+        raise ValueError(
+            "policy-aware merged datasets require completion timing policy in both sidecar and manifest"
+        )
     _reject_corrective_features(info.get("features", {}), root)
     if info.get("total_episodes") != expected_episodes:
         raise ValueError(
@@ -462,6 +643,8 @@ def validate_success_dataset(
         "sim_event",
         "current_narration",
     }
+    if completion_policy is not None:
+        required_features.update({"observation.state", "previous_narrations"})
     missing_features = required_features.difference(info.get("features", {}))
     if missing_features:
         raise ValueError(f"dataset is missing validation features: {sorted(missing_features)}")
@@ -512,18 +695,23 @@ def validate_success_dataset(
         "sim_event",
         "current_narration",
     ]
+    if completion_policy is not None:
+        data_columns.extend(["observation.state", "previous_narrations"])
     expected_global_index = 0
     current_episode = 0
     current_frame = 0
     sim_events: list[str] = []
     narrations: list[str] = []
+    states: list[Any] = []
+    previous_narrations: list[str] = []
     episode_task_names: set[str] = set()
     data_file_episodes: dict[tuple[int, int], set[int]] = {}
     observed_episode_lengths: list[int] = []
     observed_completion_frames: list[int] = []
 
     def finish_episode() -> None:
-        nonlocal current_episode, current_frame, sim_events, narrations, episode_task_names
+        nonlocal current_episode, current_frame, sim_events, narrations, states, previous_narrations
+        nonlocal episode_task_names
         if current_episode >= expected_episodes:
             raise ValueError("data contains too many episodes")
         metadata = episode_rows[current_episode]
@@ -540,11 +728,22 @@ def validate_success_dataset(
         observed_completion_frames.append(
             _validate_success_episode(current_episode, sim_events, narrations, blocks)
         )
+        if completion_policy is not None:
+            _validate_completion_timing_episode(
+                current_episode,
+                sim_events,
+                narrations,
+                previous_narrations,
+                states,
+                blocks,
+            )
         observed_episode_lengths.append(current_frame)
         current_episode += 1
         current_frame = 0
         sim_events = []
         narrations = []
+        states = []
+        previous_narrations = []
         episode_task_names = set()
 
     for path in sorted((root / "data").rglob("*.parquet")):
@@ -578,6 +777,9 @@ def validate_success_dataset(
             episode_task_names.add(task_names[task_index])
             sim_events.append(row["sim_event"])
             narrations.append(row["current_narration"])
+            if completion_policy is not None:
+                states.append(row["observation.state"])
+                previous_narrations.append(row["previous_narrations"])
             current_frame += 1
             expected_global_index += 1
     if current_frame:
@@ -593,10 +795,9 @@ def validate_success_dataset(
         if not data_path.is_file() or episode_index not in data_file_episodes.get(data_pair, set()):
             raise ValueError(f"episode {episode_index} data parquet pointer is invalid")
 
-    manifest_path = root / MANIFEST_PATH
     manifest: dict[str, Any] = {}
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
+        manifest = manifest_preview
         _validate_manifest(manifest, expected_episodes)
     elif require_manifest:
         raise ValueError(f"success dataset manifest is missing: {manifest_path}")
@@ -713,6 +914,7 @@ def prepare_success_dataset(
     blocks: int = 3,
     ablation_episodes: int = 50,
     split_seed: int = DEFAULT_SPLIT_SEED,
+    allow_legacy_completion: bool = False,
 ) -> dict[str, Any]:
     """Create a new success-only dataset by copying complete episodes from sources."""
 
@@ -733,6 +935,15 @@ def prepare_success_dataset(
             raise ValueError(f"destination overlaps source root: {source}")
 
     infos = [_read_info(source) for source in sources]
+    source_completion_policies = [_read_completion_timing_policy(source) for source in sources]
+    if any(policy is None for policy in source_completion_policies):
+        if not allow_legacy_completion:
+            raise ValueError(
+                "fresh dataset builds require completion timing policy sidecars on every source; "
+                "use allow_legacy_completion only for intentional legacy reconstruction"
+            )
+        if any(policy is not None for policy in source_completion_policies):
+            raise ValueError("cannot merge legacy and completion-policy sources")
     if expected_episodes == 200:
         production_counts = [int(info.get("total_episodes", -1)) for info in infos]
         if len(sources) != 2 or production_counts != [50, 150]:
@@ -796,6 +1007,10 @@ def prepare_success_dataset(
             "episode_order": "source argument order, then source episode index",
         },
     }
+    if source_completion_policies[0] is not None:
+        if any(policy != source_completion_policies[0] for policy in source_completion_policies[1:]):
+            raise ValueError("source completion timing policies disagree")
+        manifest["completion_timing_policy"] = source_completion_policies[0]
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = destination.parent / f".{destination.name}.staging-{uuid.uuid4().hex}"
     try:
@@ -807,6 +1022,8 @@ def prepare_success_dataset(
             concatenate_videos=False,
             concatenate_data=False,
         )
+        if source_completion_policies[0] is not None:
+            write_completion_timing_policy(staging)
         validate_success_dataset(
             staging,
             expected_episodes,
@@ -836,6 +1053,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--blocks", type=int, default=3)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument(
+        "--allow-legacy-completion",
+        action="store_true",
+        help="allow an intentional legacy build whose sources predate completion timing sidecars",
+    )
+    parser.add_argument(
         "--audit-sources",
         action="store_true",
         help="also reopen and hash the original source roots recorded in the manifest",
@@ -864,6 +1086,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.expected_episodes,
         blocks=args.blocks,
         ablation_episodes=args.ablation_episodes,
+        allow_legacy_completion=args.allow_legacy_completion,
     )
     print(f"prepared {args.expected_episodes} successful episodes in {args.dst_root}")
 

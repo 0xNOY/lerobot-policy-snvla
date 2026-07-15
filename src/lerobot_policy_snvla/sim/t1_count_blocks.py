@@ -146,6 +146,7 @@ def make_t1_env(
     camera_hw: int = 256,
     out_dir: Path | None = None,
     object_category: str = DEFAULT_CATEGORY,
+    horizon: int = 1000,
 ):
     """T1環境を構築する。seedは物体配置（BDDL生成）とenv両方に適用される。"""
     os.environ.setdefault("MUJOCO_GL", "egl")
@@ -158,6 +159,7 @@ def make_t1_env(
         bddl_file_name=str(bddl),
         camera_heights=camera_hw,
         camera_widths=camera_hw,
+        horizon=horizon,
     )
     env.seed(seed)
     return env

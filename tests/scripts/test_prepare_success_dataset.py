@@ -16,15 +16,31 @@ import lerobot_policy_snvla.scripts.prepare_success_dataset as prepare_module
 from lerobot_policy_snvla.scripts.augment_narrations import (
     apply_updates_to_dataset,
     collect_updates,
+    copy_dataset,
     plan_augmentation_in_episode,
 )
 from lerobot_policy_snvla.scripts.prepare_success_dataset import (
     CORRECTIVE_FEATURES,
     audit_sources,
     parse_args,
-    prepare_success_dataset,
     validate_success_dataset,
 )
+from lerobot_policy_snvla.scripts.prepare_success_dataset import (
+    prepare_success_dataset as _prepare_success_dataset,
+)
+from lerobot_policy_snvla.scripts.trim_success_dataset import trim_success_dataset
+from lerobot_policy_snvla.sim.completion import (
+    CANONICAL_HOME_EEF_POSITION_M,
+    COMPLETION_TIMING_POLICY,
+    write_completion_timing_policy,
+)
+
+
+def prepare_success_dataset(*args, **kwargs):
+    """Existing fixtures intentionally exercise the pre-policy compatibility path."""
+
+    kwargs.setdefault("allow_legacy_completion", True)
+    return _prepare_success_dataset(*args, **kwargs)
 
 FEATURES = {
     "action": {"dtype": "float32", "shape": (2,), "names": None},
@@ -101,6 +117,77 @@ def _source(root: Path, repo_id: str, episode_values: list[int], *, use_videos: 
     dataset.finalize()
 
 
+def _production_source(
+    root: Path,
+    repo_id: str,
+    *,
+    bad_home: bool = False,
+    hold_frames: int = 10,
+) -> None:
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        root=root,
+        fps=20,
+        features=deepcopy(FEATURES),
+        robot_type="test_robot",
+        use_videos=False,
+    )
+    fragments = [
+        "Picking up block 1 of 3...",
+        " (done)\n",
+        "Putting block 1 of 3 into the basket...",
+        " (done)\n",
+        "Picking up block 2 of 3...",
+        " (done)\n",
+        "Putting block 2 of 3 into the basket...",
+        " (done)\n",
+        "Picking up block 3 of 3...",
+        " (done)\n",
+        "Putting block 3 of 3 into the basket...",
+        " (done)\n",
+    ]
+    # Frame 12 is the home-arrival gap, frame 13 is completion, then ten holds.
+    narrations = [*fragments, "", "Task completed.\n", *([""] * hold_frames)]
+    events = {
+        1: ("picked", 1),
+        3: ("placed", 1),
+        5: ("picked", 2),
+        7: ("placed", 2),
+        9: ("picked", 3),
+        11: ("placed", 3),
+    }
+    home = np.asarray(CANONICAL_HOME_EEF_POSITION_M, dtype=np.float32)
+    history: list[str] = []
+    for frame_index, narration in enumerate(narrations):
+        if frame_index == 0:
+            xyz = home + np.array([0.03, 0.0, 0.0], dtype=np.float32)
+        elif frame_index >= 13:
+            xyz = home + (np.array([0.03, 0.0, 0.0], dtype=np.float32) if bad_home else 0)
+        else:
+            xyz = home + np.array([0.02, 0.01, 0.02], dtype=np.float32)
+        event = events.get(frame_index)
+        dataset.add_frame(
+            {
+                "action": np.array([0, frame_index], dtype=np.float32),
+                "observation.state": xyz,
+                "observation.images.image": np.zeros((4, 4, 3), dtype=np.uint8),
+                "current_narration": narration,
+                "previous_narrations": json.dumps(history),
+                "sim_event": (
+                    json.dumps({"kind": event[0], "ordinal": event[1], "frame": frame_index})
+                    if event
+                    else ""
+                ),
+                "task": "Put 3 blocks into the basket.",
+            }
+        )
+        if narration:
+            history.append(narration)
+    dataset.save_episode()
+    dataset.finalize()
+    write_completion_timing_policy(root)
+
+
 def _tree_hash(root: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
@@ -111,6 +198,94 @@ def _tree_hash(root: Path) -> str:
 
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_fresh_build_requires_and_preserves_strict_completion_policy(tmp_path):
+    source = tmp_path / "production-source"
+    second_source = tmp_path / "production-source-2"
+    destination = tmp_path / "production-merged"
+    _production_source(source, "test/production-source")
+    _production_source(second_source, "test/production-source-2")
+
+    manifest = _prepare_success_dataset(
+        [source, second_source],
+        destination,
+        "test/production-merged",
+        2,
+        ablation_episodes=1,
+    )
+
+    assert manifest["completion_timing_policy"] == COMPLETION_TIMING_POLICY
+    assert validate_success_dataset(destination, 2) == manifest
+    assert json.loads(
+        (destination / "meta/completion_timing_policy.json").read_text()
+    ) == COMPLETION_TIMING_POLICY
+    merged_sidecar = destination / "meta/completion_timing_policy.json"
+    merged_sidecar.unlink()
+    with pytest.raises(ValueError, match="in both sidecar and manifest"):
+        validate_success_dataset(destination, 2)
+    write_completion_timing_policy(destination)
+
+    trimmed = tmp_path / "production-trimmed"
+    augmented = tmp_path / "production-augmented"
+    trim_manifest = trim_success_dataset(
+        destination, trimmed, "test/production-trimmed", 2
+    )
+    trimmed_dataset = LeRobotDataset("test/production-trimmed", root=trimmed)
+    augmented_dataset = copy_dataset(trimmed_dataset, augmented, "test/production-augmented")
+    updates: dict[int, dict[str, str]] = {}
+    for episode_index in range(2):
+        collect_updates(
+            plan_augmentation_in_episode(
+                trimmed_dataset, episode_index, window_size=5, forward_only=True
+            ),
+            updates,
+        )
+    apply_updates_to_dataset(augmented_dataset, updates)
+    augmented_manifest = validate_success_dataset(augmented, 2)
+    assert trim_manifest["completion_timing_policy"] == COMPLETION_TIMING_POLICY
+    assert augmented_manifest["completion_timing_policy"] == COMPLETION_TIMING_POLICY
+    for root in (trimmed, augmented):
+        assert json.loads(
+            (root / "meta/completion_timing_policy.json").read_text()
+        ) == COMPLETION_TIMING_POLICY
+
+
+def test_fresh_build_rejects_missing_policy_and_non_home_completion(tmp_path):
+    legacy = tmp_path / "legacy"
+    _source(legacy, "test/legacy", [1])
+    with pytest.raises(ValueError, match="require completion timing policy sidecars"):
+        _prepare_success_dataset([legacy], tmp_path / "dst", "test/dst", 1, ablation_episodes=1)
+
+    invalid = tmp_path / "invalid-home"
+    _production_source(invalid, "test/invalid-home", bad_home=True)
+    with pytest.raises(ValueError, match="is not at home"):
+        _prepare_success_dataset(
+            [invalid], tmp_path / "invalid-dst", "test/invalid-dst", 1, ablation_episodes=1
+        )
+
+    short = tmp_path / "short-hold"
+    _production_source(short, "test/short-hold", hold_frames=9)
+    with pytest.raises(ValueError, match="exactly 10 post-completion hold frames"):
+        validate_success_dataset(short, 1, require_manifest=False)
+
+    long = tmp_path / "long-hold"
+    _production_source(long, "test/long-hold", hold_frames=11)
+    with pytest.raises(ValueError, match="exactly 10 post-completion hold frames"):
+        validate_success_dataset(long, 1, require_manifest=False)
+
+
+def test_completion_policy_rejects_inconsistent_narration_history(tmp_path):
+    source = tmp_path / "bad-history"
+    _production_source(source, "test/bad-history")
+    parquet_path = next((source / "data").rglob("*.parquet"))
+    dataset = LeRobotDataset("test/bad-history", root=source)
+    frame_data = pd.read_parquet(parquet_path)
+    frame_data.loc[13, "previous_narrations"] = "[]"
+    _write_parquet(frame_data, parquet_path, dataset.meta)
+
+    with pytest.raises(ValueError, match="inconsistent with the canonical stream"):
+        validate_success_dataset(source, 1, require_manifest=False)
 
 
 def test_prepare_aggregates_real_lerobot_datasets_without_mutating_sources(tmp_path):
