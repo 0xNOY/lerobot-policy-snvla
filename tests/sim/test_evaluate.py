@@ -205,6 +205,69 @@ def test_evaluate_serializes_and_logs_physical_picked_count(tmp_path, monkeypatc
     assert "picked=2" in caplog.text
 
 
+def test_evaluate_uses_explicit_seed_sequence(monkeypatch):
+    from lerobot_policy_snvla.sim import evaluate as evaluate_module
+
+    class FakeEnv:
+        def close(self):
+            pass
+
+    made_seeds = []
+    seeded = []
+
+    def fake_make_env(**kwargs):
+        made_seeds.append(kwargs["seed"])
+        return FakeEnv()
+
+    def fake_run_episode(*_args, seed, **_kwargs):
+        result = _result(False, 0)
+        result.seed = seed
+        return result
+
+    monkeypatch.setattr(evaluate_module, "make_t1_env", fake_make_env)
+    monkeypatch.setattr(evaluate_module, "run_episode", fake_run_episode)
+    monkeypatch.setattr(evaluate_module, "_seed_episode_rng", seeded.append)
+
+    summary, results = evaluate_module.evaluate(
+        make_stepper=lambda _env: None,
+        n_episodes=99,
+        n_blocks=3,
+        seed0=123,
+        seeds=[7, 100_004, 9],
+    )
+
+    assert made_seeds == [7, 100_004, 9]
+    assert seeded == made_seeds
+    assert [result.seed for result in results] == made_seeds
+    assert summary.n_episodes == 3
+
+
+def test_seed_episode_rng_seeds_python_numpy_and_torch(monkeypatch):
+    import random
+
+    import torch
+
+    from lerobot_policy_snvla.sim.evaluate import _seed_episode_rng
+
+    calls = []
+    monkeypatch.setattr(random, "seed", lambda seed: calls.append(("python", seed)))
+    monkeypatch.setattr(np.random, "seed", lambda seed: calls.append(("numpy", seed)))
+    monkeypatch.setattr(torch, "manual_seed", lambda seed: calls.append(("torch", seed)))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "manual_seed_all", lambda seed: calls.append(("cuda", seed))
+    )
+
+    _seed_episode_rng(12_345)
+
+    assert calls == [
+        ("python", 12_345),
+        ("numpy", 12_345),
+        ("torch", 12_345),
+        ("cuda", 12_345),
+    ]
+
+
 def test_metrics_only_fragment_is_not_reaudited_when_history_catches_up():
     from lerobot_policy_snvla.sim.eval_metrics import NarrationAudit
     from lerobot_policy_snvla.sim.evaluate import _observe_new_narrations
@@ -304,6 +367,26 @@ def test_episode_recorder_declares_truth_metric_feature_schemas(monkeypatch):
     }
     assert features["truth_picked"] == {"dtype": "int64", "shape": (1,), "names": None}
     assert features["truth_placed"] == {"dtype": "int64", "shape": (1,), "names": None}
+    assert captured["streaming_encoding"] is True
+
+
+def test_episode_recorder_can_disable_streaming_encoding(monkeypatch):
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    from lerobot_policy_snvla.sim.evaluate import EpisodeRecorder
+
+    captured = {}
+    monkeypatch.setattr(
+        LeRobotDataset,
+        "create",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
+    )
+
+    EpisodeRecorder(
+        "local/test", root=None, camera_hw=64, streaming_encoding=False
+    )._get_dataset()
+
+    assert captured["streaming_encoding"] is False
 
 
 def test_build_arg_parser_defaults():
@@ -314,8 +397,49 @@ def test_build_arg_parser_defaults():
     assert args.episodes == 30
     assert args.blocks == 3
     assert args.seed == EVAL_SEED0
+    assert args.seeds is None
     assert args.no_narration is False
     assert args.device == "cuda"
+    assert args.no_streaming_encoding is False
+
+
+def test_build_arg_parser_accepts_explicit_seed_sequence():
+    from lerobot_policy_snvla.sim.evaluate import build_arg_parser
+
+    args = build_arg_parser().parse_args(
+        ["--policy-path", "outputs/ckpt", "--seeds", "7, 100004,9"]
+    )
+
+    assert args.seeds == [7, 100_004, 9]
+    assert args.episodes is None
+    assert args.seed is None
+
+
+@pytest.mark.parametrize(
+    "range_args",
+    [
+        ["--episodes", "3"],
+        ["--seed", "7"],
+        ["--episodes", "3", "--seed", "7"],
+    ],
+)
+def test_build_arg_parser_rejects_seed_sequence_with_range_args(range_args):
+    from lerobot_policy_snvla.sim.evaluate import build_arg_parser
+
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(
+            ["--policy-path", "outputs/ckpt", "--seeds", "1,2", *range_args]
+        )
+
+
+@pytest.mark.parametrize("value", ["", ",", "1,nope"])
+def test_build_arg_parser_rejects_invalid_seed_sequence(value):
+    from lerobot_policy_snvla.sim.evaluate import build_arg_parser
+
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(
+            ["--policy-path", "outputs/ckpt", "--seeds", value]
+        )
 
 
 def test_build_arg_parser_accepts_record_options():
@@ -420,6 +544,148 @@ def test_policy_stepper_disables_checkpoint_training_processor(monkeypatch):
     assert overrides["device_processor"] == {"device": "cpu"}
 
 
+def test_policy_stepper_queue_fast_path_skips_observation_preprocessing(monkeypatch):
+    from collections import deque
+
+    import torch
+
+    from lerobot_policy_snvla.sim import collect
+    from lerobot_policy_snvla.sim.evaluate import PolicyStepper
+
+    class FakePolicy:
+        def __init__(self):
+            self.config = SimpleNamespace(use_relative_actions=False)
+            self._action_queue = deque([torch.tensor([[1.0, 2.0]])])
+            self._previous_narrations = ["seen"]
+            self.latest_metrics = {"stale": True}
+            self.reset_calls = 0
+
+        def select_action(self, batch):
+            assert batch == {}
+            self.latest_metrics = {}
+            return self._action_queue.popleft()
+
+        def reset(self):
+            self.reset_calls += 1
+            self._action_queue.clear()
+            self._previous_narrations = []
+            self.latest_metrics = {}
+
+    stepper = PolicyStepper.__new__(PolicyStepper)
+    stepper.device = torch.device("cpu")
+    stepper.policy = FakePolicy()
+    stepper.preprocessor = lambda _observation: pytest.fail("preprocessor must not run")
+    stepper.postprocessor = lambda action: action + 10
+    monkeypatch.setattr(collect, "_state8", lambda _obs: pytest.fail("state must not be read"))
+    monkeypatch.setattr(collect, "_images", lambda _obs: pytest.fail("images must not be read"))
+
+    action = stepper.act(object(), "task")
+
+    np.testing.assert_array_equal(action, np.array([11.0, 12.0], dtype=np.float32))
+    assert stepper.metrics() == {}
+    assert stepper.narrations() == ["seen"]
+
+    stepper.reset()
+    assert stepper.policy.reset_calls == 1
+    assert stepper.narrations() == []
+
+
+def test_policy_stepper_queue_fast_path_matches_normal_postprocessing(monkeypatch):
+    from collections import deque
+
+    import torch
+
+    from lerobot_policy_snvla.sim.evaluate import PolicyStepper
+
+    queued = torch.tensor([[0.25, -0.5]], dtype=torch.float32)
+
+    class FakePolicy:
+        def __init__(self):
+            self.config = SimpleNamespace(use_relative_actions=False)
+            self._action_queue = deque([queued.clone()])
+            self.latest_metrics = {}
+
+        def select_action(self, _batch):
+            self.latest_metrics = {"current_narration": ""}
+            return self._action_queue.popleft()
+
+    def postprocess(action):
+        return action * torch.tensor([[2.0, 4.0]]) + torch.tensor([[1.0, -1.0]])
+
+    expected_policy = FakePolicy()
+    expected = postprocess(expected_policy.select_action({})).squeeze(0).numpy()
+
+    stepper = PolicyStepper.__new__(PolicyStepper)
+    stepper.device = torch.device("cpu")
+    stepper.policy = FakePolicy()
+    stepper.preprocessor = lambda _observation: pytest.fail("preprocessor must not run")
+    stepper.postprocessor = postprocess
+
+    np.testing.assert_array_equal(stepper.act(object(), "task"), expected)
+    assert stepper.metrics() == {"current_narration": ""}
+
+
+def test_policy_stepper_relative_actions_use_observation_preprocessing(monkeypatch):
+    from collections import deque
+
+    import torch
+    from lerobot.common import control_utils
+
+    from lerobot_policy_snvla.sim import collect
+    from lerobot_policy_snvla.sim.evaluate import PolicyStepper
+
+    class FakePolicy:
+        config = SimpleNamespace(use_relative_actions=True)
+
+        def __init__(self):
+            self._action_queue = deque([torch.tensor([[1.0, 2.0]])])
+            self.latest_metrics = {}
+
+    calls = []
+
+    def fake_predict_action(
+        observation,
+        policy,
+        device,
+        preprocessor,
+        postprocessor,
+        **kwargs,
+    ):
+        calls.append((observation, policy, device, kwargs))
+        processed = preprocessor(observation)
+        return postprocessor(processed["queued_action"])
+
+    monkeypatch.setattr(control_utils, "predict_action", fake_predict_action)
+    monkeypatch.setattr(
+        collect, "_state8", lambda _obs: np.array([3.0], dtype=np.float32)
+    )
+    monkeypatch.setattr(
+        collect,
+        "_images",
+        lambda _obs: {"observation.images.image": np.zeros((1, 1, 3), dtype=np.uint8)},
+    )
+
+    stepper = PolicyStepper.__new__(PolicyStepper)
+    stepper.device = torch.device("cpu")
+    stepper.policy = FakePolicy()
+    stepper.preprocessor = lambda observation: {
+        **observation,
+        "queued_action": torch.tensor([[0.25, -0.5]]),
+    }
+    stepper.postprocessor = lambda action: action + 1
+
+    np.testing.assert_array_equal(
+        stepper.act(object(), "task"), np.array([1.25, 0.5], dtype=np.float32)
+    )
+    assert len(calls) == 1
+    observation, policy, device, kwargs = calls[0]
+    np.testing.assert_array_equal(observation["observation.state"], np.array([3.0]))
+    assert "observation.images.image" in observation
+    assert policy is stepper.policy
+    assert device == torch.device("cpu")
+    assert kwargs["task"] == "task"
+
+
 def test_inference_processor_check_rejects_retained_state_dropout(monkeypatch):
     from lerobot_policy_snvla import SNVLAConfig
     from lerobot_policy_snvla.processor_snvla import (
@@ -499,3 +765,7 @@ def test_expert_stepper_records_lerobot_dataset(tmp_path):
     assert len(dataset) > 0
     assert results[0].n_frames == len(dataset)
     assert summary.n_episodes == 1
+    assert len(list(record_root.rglob("*.mp4"))) == 2
+    first_frame = dataset[0]
+    assert tuple(first_frame["observation.images.image"].shape) == (3, 128, 128)
+    assert tuple(first_frame["observation.images.image2"].shape) == (3, 128, 128)

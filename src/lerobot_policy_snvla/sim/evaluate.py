@@ -8,8 +8,9 @@
 
 import json
 import logging
+import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -30,6 +31,17 @@ from .t1_count_blocks import (
 )
 
 EVAL_SEED0 = 10_000_000
+
+
+def _seed_episode_rng(seed: int) -> None:
+    """Seed policy sampling independently for each simulator episode."""
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 @dataclass
@@ -74,10 +86,18 @@ class Stepper(Protocol):
 class EpisodeRecorder:
     """評価ロールアウトを1エピソードずつLeRobotDatasetへ記録する。"""
 
-    def __init__(self, repo_id: str, root: Path | None, camera_hw: int):
+    def __init__(
+        self,
+        repo_id: str,
+        root: Path | None,
+        camera_hw: int,
+        *,
+        streaming_encoding: bool = True,
+    ):
         self.repo_id = repo_id
         self.root = root
         self.camera_hw = camera_hw
+        self.streaming_encoding = streaming_encoding
         self._dataset = None
 
     def _get_dataset(self):
@@ -100,6 +120,7 @@ class EpisodeRecorder:
                 features=features,
                 root=self.root,
                 robot_type="panda_libero",
+                streaming_encoding=self.streaming_encoding,
             )
         return self._dataset
 
@@ -304,17 +325,25 @@ def evaluate(
     out_path: Path | None = None,
     record_root: Path | None = None,
     record_repo_id: str | None = None,
+    seeds: Sequence[int] | None = None,
+    streaming_encoding: bool = True,
 ) -> tuple[EvalSummary, list[EpisodeResult]]:
     fmt = NarrationFormat(object_name=object_name or category_display_name(category))
     task = fmt.task_description(n_blocks)
     results: list[EpisodeResult] = []
     recorder = (
-        EpisodeRecorder(record_repo_id, record_root, camera_hw)
+        EpisodeRecorder(
+            record_repo_id,
+            record_root,
+            camera_hw,
+            streaming_encoding=streaming_encoding,
+        )
         if record_root is not None and record_repo_id is not None
         else None
     )
-    for i in range(n_episodes):
-        seed = seed0 + i
+    episode_seeds = list(seeds) if seeds is not None else list(range(seed0, seed0 + n_episodes))
+    for i, seed in enumerate(episode_seeds):
+        _seed_episode_rng(seed)
         env = make_t1_env(n_blocks=n_blocks, seed=seed, camera_hw=camera_hw, object_category=category)
         try:
             result = run_episode(
@@ -326,7 +355,7 @@ def evaluate(
         logging.info(
             "episode %d/%d seed=%d success=%s picked=%d placed=%d frames=%d (%.1fs)",
             i + 1,
-            n_episodes,
+            len(episode_seeds),
             seed,
             result.success,
             result.picked,
@@ -416,23 +445,39 @@ class PolicyStepper:
         self.policy.reset()
 
     def act(self, obs, task: str) -> np.ndarray:
+        import torch
         from lerobot.common.control_utils import predict_action
 
         from .collect import _images, _state8
 
-        observation = {"observation.state": _state8(obs), **_images(obs)}
-        action = predict_action(
-            observation,
-            self.policy,
-            self.device,
-            self.preprocessor,
-            self.postprocessor,
-            use_amp=False,
-            task=task,
-            robot_type="panda_libero",
+        action_queue = getattr(self.policy, "_action_queue", None)
+        use_relative_actions = getattr(
+            getattr(self.policy, "config", None), "use_relative_actions", None
         )
+        if (
+            action_queue is not None
+            and len(action_queue) > 0
+            and use_relative_actions is False
+        ):
+            # Queued actions were generated from the observation at the chunk boundary.
+            # Keep select_action() so policy metrics retain their normal per-frame reset,
+            # but skip rebuilding and transferring an observation that cannot affect it.
+            with torch.inference_mode():
+                action = self.postprocessor(self.policy.select_action({}))
+        else:
+            observation = {"observation.state": _state8(obs), **_images(obs)}
+            action = predict_action(
+                observation,
+                self.policy,
+                self.device,
+                self.preprocessor,
+                self.postprocessor,
+                use_amp=False,
+                task=task,
+                robot_type="panda_libero",
+            )
         # predict_actionはバッチ次元付き(1, action_dim)で返す。bf16はnumpy非対応
-        return action.float().squeeze(0).numpy()
+        return action.float().squeeze(0).cpu().numpy()
 
     def narrations(self) -> list[str]:
         return list(getattr(self.policy, "_previous_narrations", []))
@@ -449,15 +494,36 @@ def build_arg_parser():
             parsed = super().parse_args(args, namespace)
             if (parsed.record_root is None) != (parsed.record_repo_id is None):
                 self.error("--record-root and --record-repo-id must be specified together")
+            if parsed.seeds is not None:
+                if parsed.episodes is not None or parsed.seed is not None:
+                    self.error("--seeds cannot be combined with --episodes or --seed")
+            else:
+                parsed.episodes = 30 if parsed.episodes is None else parsed.episodes
+                parsed.seed = EVAL_SEED0 if parsed.seed is None else parsed.seed
             return parsed
+
+    def seed_list(value: str) -> list[int]:
+        try:
+            seeds = [int(item.strip()) for item in value.split(",") if item.strip()]
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("seeds must be comma-separated integers") from exc
+        if not seeds:
+            raise argparse.ArgumentTypeError("at least one seed is required")
+        return seeds
 
     parser = RecordArgumentParser(description=__doc__)
     parser.add_argument(
         "--policy-path", required=True, help="学習済みチェックポイント（pretrained_modelディレクトリ）"
     )
-    parser.add_argument("--episodes", type=int, default=30)
+    parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--blocks", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=EVAL_SEED0)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--seeds",
+        type=seed_list,
+        default=None,
+        help="明示的な評価seed列（カンマ区切り）。--episodes/--seedとは排他",
+    )
     parser.add_argument("--camera-hw", type=int, default=256)
     parser.add_argument("--category", default=DEFAULT_CATEGORY)
     parser.add_argument("--object-name", default=None)
@@ -467,6 +533,11 @@ def build_arg_parser():
     parser.add_argument("--out", type=Path, default=None, help="結果JSONの出力先")
     parser.add_argument("--record-root", type=Path, default=None, help="評価データセットの保存先")
     parser.add_argument("--record-repo-id", default=None, help="評価データセットのrepo ID")
+    parser.add_argument(
+        "--no-streaming-encoding",
+        action="store_true",
+        help="記録時のストリーミング動画エンコードを無効化（互換用）",
+    )
     return parser
 
 
@@ -481,7 +552,7 @@ def main():
     )
     summary, _ = evaluate(
         make_stepper=lambda env: stepper,
-        n_episodes=args.episodes,
+        n_episodes=args.episodes if args.seeds is None else len(args.seeds),
         n_blocks=args.blocks,
         seed0=args.seed,
         category=args.category,
@@ -490,6 +561,8 @@ def main():
         out_path=args.out,
         record_root=args.record_root,
         record_repo_id=args.record_repo_id,
+        seeds=args.seeds,
+        streaming_encoding=not args.no_streaming_encoding,
     )
     print(json.dumps(asdict(summary), indent=2))
 
