@@ -315,7 +315,17 @@ def migrate_unprefixed_pi05_base_keys(state_dict, model_config):
         renamed, max_state_dim=model_config.max_state_dim
     )
     renamed = _remap_joint_layers_and_fused_qkv(renamed, model_config)
-    return {f"model.{key}": value for key, value in renamed.items()}
+    migrated = {f"model.{key}": value for key, value in renamed.items()}
+    lm_head_key = "model.paligemma_with_expert.paligemma.lm_head.weight"
+    embed_tokens_key = (
+        "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+    )
+    if lm_head_key in migrated and embed_tokens_key not in migrated:
+        # The upstream base checkpoint stores only lm_head. The SNVLA module exposes a
+        # distinct parameter key for the semantically tied embedding, so strict loading
+        # needs both names; reuse the CPU tensor object without a multi-GB clone.
+        migrated[embed_tokens_key] = migrated[lm_head_key]
+    return migrated
 
 
 class FusedQKVProjection(nn.Module):

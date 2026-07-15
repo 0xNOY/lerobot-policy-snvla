@@ -897,8 +897,13 @@ def test_pi05_base_core_migration_prefixes_and_remaps_without_cloning_tied_lm():
     assert "model.state_proj.weight" in migrated
     assert "model.paligemma_with_expert.joint_layers.0.paligemma_qkv.weight" in migrated
     assert all(key.startswith("model.") for key in migrated)
-    assert migrated["model.paligemma_with_expert.paligemma.lm_head.weight"] is tied_lm
-    assert not any("embed_tokens.weight" in key for key in migrated)
+    lm_head_key = "model.paligemma_with_expert.paligemma.lm_head.weight"
+    embed_tokens_key = (
+        "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+    )
+    assert migrated[lm_head_key] is tied_lm
+    assert migrated[embed_tokens_key] is tied_lm
+    assert migrated[embed_tokens_key] is migrated[lm_head_key]
     torch.testing.assert_close(
         migrated["model.paligemma_with_expert.joint_layers.0.paligemma_qkv.weight"],
         torch.cat([q, k, v]),
