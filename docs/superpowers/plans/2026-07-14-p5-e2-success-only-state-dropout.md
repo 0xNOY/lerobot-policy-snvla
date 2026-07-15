@@ -1,13 +1,12 @@
 # P5-E2 Success-Only State-Dropout Implementation Plan
 
 > [!IMPORTANT]
-> **Execution state (2026-07-15): Tasks 1–6 are completed. Resume at Task 7.**
-> Checked boxes in Tasks 1–6 record completed implementation and verification; Tasks 7–9 remain
-> executable and unchecked.
+> **Execution state (2026-07-15): Tasks 1–8 are completed historical work. Resume at Task 9.**
+> Task 9 now follows the independently fixed fresh500 production specification below.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace corrective training with 200 successful demonstrations, deterministic language state-dropout, real-state Action Expert conditioning, float epoch training, and a 16-epoch production run.
+**Goal:** Run production from 500 fresh successful demonstrations with deterministic language state-dropout, observation noise, real-state Action Expert conditioning, and 16 float epochs.
 
 **Architecture:** A stable frame/epoch schedule omits the textual `State:` line on at most half of training samples without consecutive-epoch dropout. A PI0-style state projection always supplies normalized state to the Action Expert, while all selected samples retain action loss. The SNVLA entry point converts float epochs to steps and annotates raw batches with integer epoch before preprocessing.
 
@@ -617,7 +616,7 @@ if loading prints `Warning: Could not load state dict`. Record false completion 
 placed, success, and minimum distance. If the preferred ratio is not unambiguous, stop for user
 direction.
 
-- [ ] **Step 4: Record and commit the gate decision — blocked pending user ratio choice**
+- [ ] **Step 4: Preserve the ambiguous gate result as historical evidence**
 
 Append W&B URLs, exact epoch/step counts, checkpoint paths, load evidence, evaluation JSON paths,
 and selection rationale. Do not commit evaluation recordings or `outputs/`.
@@ -628,7 +627,7 @@ strict-load count 1, forbidden-warning count 0, and fatal count 0, using aligned
 initial conditions are paired but stochastic action draws are not guaranteed to be. All success
 rates were 0. `sr025` narration-on alone showed physical progress (`mean_picked=0.2`,
 `mean_placed=0.1`), while `sr050` narration-on had the best approach distance (`0.069459 m`); the
-choice is therefore ambiguous and Task 9 must not start without user direction. The full metric,
+choice is therefore ambiguous. The user has since fixed Task 9 independently at ratio `0.25`; the full metric,
 JSON/log SHA-256, and recording-path table is in the report. The initial `sr025` narration-on
 inference failed because checkpoint training dropout remained active; `fec0293` fixed it and the
 clean retry is the reported result. Keep `outputs/`, recordings, logs, and checkpoints uncommitted.
@@ -661,40 +660,40 @@ handoff. Keep every `p5e2_teacher_scene_ablation_*` output, recording, and log u
 
 - [ ] **Step 0: Recollect the production dataset with the completion contract**
 
-Leave the v5 dataset and all Task 8 evidence unchanged. Freshly collect ordered 50-episode and
-150-episode sources under v6 roots using fixed, disjoint recorded seed bands. Only the initial EEF
+Leave the v5 dataset and all Task 8 evidence unchanged. Freshly collect
+`$HOME/datasets/t1_n3_v7_success500_part50` with seed `30000000` and
+`$HOME/datasets/t1_n3_v7_success500_part450` with seed `40000000`. Only the initial EEF
 xyz is seed-randomized by an unrecorded pre-roll; the final target is the fixed canonical home. The
 final placed ` (done)\n` must precede the return home, `Task completed.\n` must be emitted exactly
 once only after home arrival, and exactly 10 fixed-home hold frames must follow.
 
 Strictly validate both source policy sidecars, merge only those new sources into
-`$HOME/datasets/t1_n3_v6_success200`, trim into
-`$HOME/datasets/t1_n3_v6_success200_trim`, augment once with `--window-size 5 --forward-only` into
-`$HOME/datasets/t1_n3_v6_success200_aug`, then run portable validation and transfer the augmented
+`$HOME/datasets/t1_n3_v7_success500` with 450 train, 50 validation, and 50 ablation IDs, trim into
+`$HOME/datasets/t1_n3_v7_success500_trim` with `--keep-following-frames 10`, augment once with
+`--window-size 10 --forward-only` into `$HOME/datasets/t1_n3_v7_success500_aug_w10`, then run
+portable validation and transfer the augmented
 root to DGX. Do not mix any v5 source into the production dataset.
 
 - [ ] **Step 1: Run production training**
 
-On DGX use the selected ratio, all 180 train episode IDs, `--epochs=16.0`, W&B, and
+On DGX use all 450 train episode IDs, `--epochs=16.0`, W&B metrics, and
 `CUDA_VISIBLE_DEVICES=2,3`. Use:
 
 ```text
-output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v6_success200_prod
+output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v7_success500_prod
 ```
 
-Keep max dimensions 32/32, bf16 FULL_SHARD, fixed padding 256, and `n_action_steps=10`. Save at
+Keep max dimensions 32/32, bf16 FULL_SHARD, fixed padding 256, and `n_action_steps=40`. Save at
 epochs 2, 4, 6, 8, 10, 12, 14, and 16; the epoch-16 save is the final checkpoint. Confirm the exact
 `All keys loaded successfully!` message from both ranks, finite losses, the expected state-dropout
 schedule, a W&B URL, and no `Warning: Could not load state dict`, OOM, or runtime errors.
 
-Run with the user-approved `SELECTED_RATIO` from Task 8:
+Run with state-dropout ratio `0.25` and observation-noise ratio `0.25`:
 
 ```bash
-: "${SELECTED_RATIO:?export the user-approved ratio from Task 8}"
-case "$SELECTED_RATIO" in 0|0.0|0.25|0.5|0.50) ;; *) echo "invalid SELECTED_RATIO" >&2; exit 2;; esac
-TRAIN_EPISODES=$(jq -c '.train_episode_ids' "$HOME/datasets/t1_n3_v6_success200_aug/meta/success_dataset_manifest.json")
+TRAIN_EPISODES=$(jq -c '.train_episode_ids' "$HOME/datasets/t1_n3_v7_success500_aug_w10/meta/success_dataset_manifest.json")
 CUDA_VISIBLE_DEVICES=2,3 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_OFFLINE=1 \
-SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_success200 \
+SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_success500 \
 .venv/bin/accelerate launch \
   --num_processes=2 --use_fsdp --fsdp_version=1 \
   --fsdp_sharding_strategy=FULL_SHARD \
@@ -704,25 +703,32 @@ SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_s
   --fsdp_state_dict_type=SHARDED_STATE_DICT \
   --fsdp_use_orig_params=true --mixed_precision=no \
   --module lerobot_policy_snvla.scripts.train_bf16_fsdp \
-  --dataset.repo_id=local/t1_n3_v6_success200_aug \
-  --dataset.root=$HOME/datasets/t1_n3_v6_success200_aug \
+  --dataset.repo_id=local/t1_n3_v7_success500_aug_w10 \
+  --dataset.root=$HOME/datasets/t1_n3_v7_success500_aug_w10 \
   --dataset.episodes="$TRAIN_EPISODES" \
   --policy.type=snvla \
-  --policy.pretrained_path=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v3_aug_p2/015000/pretrained_model \
+  --policy.pretrained_path=lerobot/pi05_base \
   --policy.push_to_hub=false --policy.compile_model=true --policy.compile_cudagraphs=true \
   --policy.training_padding_length=256 --policy.max_text_loss_tokens=16 \
   --policy.attention_backend=sdpa --policy.fuse_qkv=true \
   --policy.gradient_checkpointing=true --policy.gradient_checkpointing_interval=2 \
   --policy.dtype=bfloat16 --policy.optimizer_lr=1.0e-4 --policy.device=cuda \
-  --policy.max_state_dim=32 --policy.max_action_dim=32 --policy.n_action_steps=10 \
-  --policy.state_dropout_enabled=true --policy.state_dropout_ratio="$SELECTED_RATIO" \
+  --policy.max_state_dim=32 --policy.max_action_dim=32 --policy.n_action_steps=40 \
+  --policy.state_dropout_enabled=true --policy.state_dropout_ratio=0.25 \
   --policy.state_dropout_seed=20260714 --seed=20260714 \
+  --policy.observation_noise_enabled=true --policy.observation_noise_ratio=0.25 \
+  --policy.observation_noise_seed=20260715 \
+  --policy.observation_noise_scale_min=0.0 --policy.observation_noise_scale_max=0.5 \
   --epochs=16.0 --save-every-epochs=2.0 \
   --batch_size=8 --log_freq=10 --num_workers=8 \
-  --output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v6_success200_prod \
-  --wandb.enable=true --wandb.project=snvla-p5 \
-  --wandb.run_id=p5e2-success200-v6-prod-h10
+  --output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v7_success500_prod \
+  --save_checkpoint_to_hub=false \
+  --wandb.enable=true --wandb.disable_artifact=true --wandb.project=snvla-p5 \
+  --wandb.run_id=p5e2-success500-v7-prod-h40-sd025-on025
 ```
+
+Delegate launch monitoring to `agy --model "Gemini 3.5 Flash (Medium)"`; it must verify strict load,
+finite metrics, checkpoint creation, W&B metrics, and the absence of forbidden warnings/errors.
 
 - [ ] **Step 2: Evaluate intermediate checkpoints only if the final gate is unclear**
 
@@ -732,24 +738,24 @@ does not give an unambiguous adoption decision.
 
 - [ ] **Step 3: Run final recorded evaluation**
 
-With `n_action_steps=10`, run narration-on and narration-off for 30 episodes each, both with dataset
+With `n_action_steps=40`, run narration-on and narration-off for 30 episodes each, both with dataset
 recording. Transfer the final model to
-`$HOME/checkpoints/p5e2/success200_prod/pretrained_model`, then run:
+`$HOME/checkpoints/p5e2/success500_prod/pretrained_model`, then run:
 
 ```bash
 MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.evaluate \
-  --policy-path "$HOME/checkpoints/p5e2/success200_prod/pretrained_model" \
-  --episodes 30 --blocks 3 --seed 13000000 --n-action-steps 10 \
-  --out outputs/p5e2_success200_prod_narration_on.json \
-  --record-root "$HOME/datasets/p5e2_success200_prod_narration_on" \
-  --record-repo-id local/p5e2_success200_prod_narration_on
+  --policy-path "$HOME/checkpoints/p5e2/success500_prod/pretrained_model" \
+  --episodes 30 --blocks 3 --seed 13000000 --n-action-steps 40 \
+  --out outputs/p5e2_success500_prod_narration_on.json \
+  --record-root "$HOME/datasets/p5e2_success500_prod_narration_on" \
+  --record-repo-id local/p5e2_success500_prod_narration_on
 
 MUJOCO_GL=egl .venv/bin/python -m lerobot_policy_snvla.sim.evaluate \
-  --policy-path "$HOME/checkpoints/p5e2/success200_prod/pretrained_model" \
-  --episodes 30 --blocks 3 --seed 13000000 --n-action-steps 10 --no-narration \
-  --out outputs/p5e2_success200_prod_narration_off.json \
-  --record-root "$HOME/datasets/p5e2_success200_prod_narration_off" \
-  --record-repo-id local/p5e2_success200_prod_narration_off
+  --policy-path "$HOME/checkpoints/p5e2/success500_prod/pretrained_model" \
+  --episodes 30 --blocks 3 --seed 13000000 --n-action-steps 40 --no-narration \
+  --out outputs/p5e2_success500_prod_narration_off.json \
+  --record-root "$HOME/datasets/p5e2_success500_prod_narration_off" \
+  --record-repo-id local/p5e2_success500_prod_narration_off
 ```
 
 Require `All keys loaded successfully!` for each run and abort immediately on

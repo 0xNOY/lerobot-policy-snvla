@@ -5,8 +5,8 @@ evaluations are complete. Every evaluation completed 10 episodes/9980 recorded f
 strictly once, and had zero forbidden load warnings and zero fatal errors. All twelve success rates
 were `0.0`. On the teacher scenes, `sr025` produced the most physical progress
 (`mean_picked=mean_placed=0.3`), while `sr050` had a slightly better narration-on approach distance
-(`0.073743 m`) and no false task-completed event. The ratio decision remains ambiguous; Step 4 is a
-user decision, and Task 9 production training is blocked pending that choice.
+(`0.073743 m`) and no false task-completed event. Those results remain historical evidence; the user
+has now fixed the independent Task 9 production specification below.
 
 ## Objective and decisions
 
@@ -14,19 +14,20 @@ The approved direction replaces corrective training with a success-only dataset 
 language robustness from Action Expert state conditioning:
 
 - retain the corrective pilot only as diagnosis evidence; it was never used for training;
-- train on 200 successful demonstrations: raw existing 50 plus new 150, merged exactly once and
-  augmented exactly once;
+- train Task 9 on 500 fresh successful demonstrations: part50 seed `30000000` plus part450 seed
+  `40000000`, merged exactly once and augmented once with forward-only window 10;
 - omit the textual state line deterministically on a configurable `0.0..0.5` fraction of samples
   (default `0.25`), with epoch 0 always present and no consecutive-epoch dropout;
 - retain text, narration-mode, and action losses for every selected training sample;
 - always condition the Action Expert on real normalized state through `state_proj`;
-- fix `n_action_steps=10` and state/action maxima at 32/32;
+- use production `n_action_steps=40` and state/action maxima at 32/32;
 - compare dropout ratios `0.0`, `0.25`, and `0.50` with fixed 3.0-epoch, 10-on/10-off ablations;
-- train the selected ratio for 16.0 epochs, saving every 2.0 epochs through epoch 16;
-- require W&B, DGX GPUs 2,3, strict checkpoint loading, and all DGX training checkpoint/output roots
-  under `/raid/takenaka/snvla/checkpoints`;
-- finish with recorded 30 narration-on and 30 narration-off episodes. If ablation evidence is
-  ambiguous, stop for user direction.
+- train state-dropout ratio `0.25` plus observation-noise ratio `0.25` for 16.0 epochs from
+  `lerobot/pi05_base`, with observation-noise seed `20260715` and scale `0.0..0.5`;
+- require W&B metrics with artifacts and Hub uploads disabled, DGX GPUs 2,3, strict checkpoint
+  loading, and all DGX training checkpoint/output roots under `/raid/takenaka/snvla/checkpoints`;
+- finish with recorded 30 narration-on and 30 narration-off episodes; the historical ablation
+  ambiguity does not override the user's fixed Task 9 specification.
 
 The active execution specification is
 [`2026-07-14-p5-e2-success-only-state-dropout.md`](../plans/2026-07-14-p5-e2-success-only-state-dropout.md).
@@ -104,7 +105,7 @@ Partial loading, warning suppression, and `strict=False` are not acceptable subs
   identify an unambiguous efficacy winner. No production dropout ratio is claimed.
 - The completed v5 50+150 dataset remains unchanged as Task 8 evidence. It predates the new
   completion contract and must not be used for Task 9 production training. Task 9 requires fresh
-  50-episode and 150-episode sources and new v6 merge/trim/augmentation roots.
+  50-episode and 450-episode sources and new v7 merge/trim/augmentation roots.
 - Task 9 production training and final recorded 30-on/30-off evaluation have not run.
 - The DGX code destination is an rsynced working directory without `.git`, so this report does not
   claim a DGX branch or commit identity. The hashes below describe the historical pre-fix Task 7
@@ -404,28 +405,30 @@ teacher-scene matrix averaged `54.43 s/episode`, including startup and recording
 No ratio wins every gate in either matrix. All teacher-scene and unseen-scene success rates are
 zero. `sr025` has the strongest teacher-scene physical progress (`3` picks and `3` placements over
 10 narration-on episodes), while `sr050` has a marginally better teacher-scene distance and zero
-false task-completed events. Task 8 Step 3 is complete, but Step 4 and Task 9 remain blocked pending
-the user's explicit ratio choice. Evaluation JSON under `outputs/`, recordings, logs, and
+false task-completed events. Task 8 Step 3 is complete and its ambiguous result remains historical;
+Task 9 is now specified independently by the user. Evaluation JSON under `outputs/`, recordings, logs, and
 checkpoints remain outside the commit scope.
 
-## Blocked Task 9 — production and final recorded evaluation
+## Pending Task 9 — fresh500 production and final recorded evaluation
 
-Task 9 must not start until the user selects a ratio from the ambiguous Task 8 evidence.
+The user has fixed the Task 9 production specification independently of the ambiguous Task 8 gate.
 
-1. Freshly recollect ordered 50+150 successful demonstrations under v6 roots with fixed, disjoint
-   recorded seed bands. Only the initial EEF xyz is seed-randomized; after the final placed
+1. Freshly recollect `~/datasets/t1_n3_v7_success500_part50` at seed `30000000` and
+   `~/datasets/t1_n3_v7_success500_part450` at seed `40000000`. Only
+   the initial EEF xyz is seed-randomized; after the final placed
    ` (done)\n`, return to the fixed canonical home, emit `Task completed.\n` exactly once after
    arrival, and retain exactly 10 fixed-home hold frames. Strictly validate the policy sidecars,
-   merge into `~/datasets/t1_n3_v6_success200`, trim into
-   `~/datasets/t1_n3_v6_success200_trim`, augment once into
-   `~/datasets/t1_n3_v6_success200_aug`, validate, and transfer to DGX. Preserve all v5/Task 8 data
-   unchanged and do not mix it into v6.
-2. With the user-approved Task 8 ratio and all 180 v6 manifest train IDs, run DGX production at
-   `--epochs=16.0 --save-every-epochs=2.0`. Save epochs 2, 4, 6, 8, 10, 12, 14, and 16 below
-   `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v6_success200_prod`. Require W&B and GPUs 2,3.
+   merge into `~/datasets/t1_n3_v7_success500` with 450/50 train/validation and 50 ablation IDs,
+   trim into `~/datasets/t1_n3_v7_success500_trim`, augment once with forward-only window 10 into
+   `~/datasets/t1_n3_v7_success500_aug_w10`, validate, and transfer to DGX. Preserve all v5/Task 8
+   data unchanged.
+2. Run all 450 train IDs for 16.0 epochs from `lerobot/pi05_base`, with `n_action_steps=40`,
+   state-dropout `0.25`, and observation noise `0.25`/seed `20260715`/scale `0.0..0.5`. Save below
+   `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v7_success500_prod`. Enable W&B metrics but disable
+   artifacts and Hub uploads; monitor only through `agy` with Gemini 3.5 Flash (medium).
 3. Transfer and load epoch 16 first; inspect intermediate checkpoints only if the final adoption
    decision is unclear.
-4. At seed `13000000` and `n_action_steps=10`, record 30 narration-on plus the same 30 narration-off
+4. At seed `13000000` and `n_action_steps=40`, record 30 narration-on plus the same 30 narration-off
    episodes. Require exact loader gates and preserve videos/JSON outside git.
 5. Record duration, W&B run, checkpoint paths, success, picked/placed, approach distance, false
    pick/place/task-completed counters, and the adoption decision. Run final non-sim tests/Ruff and
