@@ -42,6 +42,11 @@ _SNVLA_PROCESSOR_CONFIG_FIELDS = (
     "state_dropout_enabled",
     "state_dropout_ratio",
     "state_dropout_seed",
+    "observation_noise_enabled",
+    "observation_noise_ratio",
+    "observation_noise_seed",
+    "observation_noise_scale_min",
+    "observation_noise_scale_max",
     "n_action_steps",
     "max_state_dim",
     "max_action_dim",
@@ -180,6 +185,13 @@ def require_wandb_cli_args(argv: Sequence[str]) -> None:
     project = _cli_arg_value(argv, "--wandb.project")
     if project is None or not project.strip():
         raise ValueError("SNVLA_REQUIRE_WANDB=1 requires --wandb.project")
+
+    if _cli_arg_value(argv, "--wandb.disable_artifact") != "true":
+        raise ValueError("SNVLA_REQUIRE_WANDB=1 requires --wandb.disable_artifact=true")
+    if _cli_arg_value(argv, "--save_checkpoint_to_hub") != "false":
+        raise ValueError("SNVLA_REQUIRE_WANDB=1 requires --save_checkpoint_to_hub=false")
+    if _cli_arg_value(argv, "--policy.push_to_hub") != "false":
+        raise ValueError("SNVLA_REQUIRE_WANDB=1 requires --policy.push_to_hub=false")
 
 
 @dataclass(frozen=True)
@@ -418,7 +430,10 @@ def _epoch_training_patches(
         elif (
             steps_per_epoch is None
             and isinstance(inner_cfg.policy, SNVLAConfig)
-            and inner_cfg.policy.state_dropout_enabled
+            and (
+                inner_cfg.policy.state_dropout_enabled
+                or inner_cfg.policy.observation_noise_enabled
+            )
         ):
             steps_per_epoch = epochs_to_steps(
                 1.0,
@@ -428,7 +443,8 @@ def _epoch_training_patches(
             )
             initial_step = _read_resume_step(inner_cfg.checkpoint_path) if inner_cfg.resume else 0
             logging.info(
-                "Step-based state-dropout epoch annotation: steps_per_epoch=%s, initial_step=%s",
+                "Step-based SNVLA augmentation epoch annotation: "
+                "steps_per_epoch=%s, initial_step=%s",
                 steps_per_epoch,
                 initial_step,
             )

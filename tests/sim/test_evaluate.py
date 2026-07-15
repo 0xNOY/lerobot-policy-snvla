@@ -493,6 +493,7 @@ def test_policy_stepper_disables_checkpoint_training_processor(monkeypatch):
         n_action_steps=2,
         state_dropout_enabled=True,
         state_dropout_ratio=0.5,
+        observation_noise_enabled=True,
     )
     monkeypatch.setattr(PreTrainedConfig, "from_pretrained", lambda *_args, **_kwargs: cfg)
 
@@ -538,6 +539,7 @@ def test_policy_stepper_disables_checkpoint_training_processor(monkeypatch):
 
     assert cfg.training is False
     assert cfg.state_dropout_enabled is False
+    assert cfg.observation_noise_enabled is False
     assert captured["policy_kwargs"]["config"] is cfg
     overrides = captured["processor_kwargs"]["preprocessor_overrides"]
     assert overrides["snvla_prepare_training_tokenizer_processor_step"]["config"] is cfg
@@ -686,7 +688,12 @@ def test_policy_stepper_relative_actions_use_observation_preprocessing(monkeypat
     assert kwargs["task"] == "task"
 
 
-def test_inference_processor_check_rejects_retained_state_dropout(monkeypatch):
+@pytest.mark.parametrize(
+    "enabled_field", ["state_dropout_enabled", "observation_noise_enabled"]
+)
+def test_inference_processor_check_rejects_retained_training_augmentation(
+    monkeypatch, enabled_field
+):
     from lerobot_policy_snvla import SNVLAConfig
     from lerobot_policy_snvla.processor_snvla import (
         SNVLAPrepareTrainingTokenizerProcessorStep,
@@ -701,16 +708,16 @@ def test_inference_processor_check_rejects_retained_state_dropout(monkeypatch):
         "lerobot_policy_snvla.processor_snvla.AutoTokenizer.from_pretrained",
         lambda _name: FakeTokenizer(),
     )
-    stale_step = SNVLAPrepareTrainingTokenizerProcessorStep(
-        config=SNVLAConfig(
-            compile_model=False,
-            chunk_size=2,
-            n_action_steps=2,
-            state_dropout_enabled=True,
-        )
+    config = SNVLAConfig(
+        compile_model=False,
+        chunk_size=2,
+        n_action_steps=2,
+        training=False,
     )
+    setattr(config, enabled_field, True)
+    stale_step = SNVLAPrepareTrainingTokenizerProcessorStep(config=config)
 
-    with pytest.raises(RuntimeError, match="retained training/state-dropout"):
+    with pytest.raises(RuntimeError, match="retained training/augmentation"):
         _assert_snvla_inference_processor_config(SimpleNamespace(steps=[stale_step]))
 
 

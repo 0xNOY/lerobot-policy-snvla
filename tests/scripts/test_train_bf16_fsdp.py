@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -138,9 +139,18 @@ def test_epoch_aware_cycle_aligns_actual_dataloader_shard_absolute_epoch():
     ]
 
 
-def test_step_based_snvla_dropout_annotates_epochs_without_changing_duration(monkeypatch):
+@pytest.mark.parametrize(
+    "policy",
+    [
+        make_processor_config(state_dropout_enabled=True),
+        make_processor_config(state_dropout_enabled=False, observation_noise_enabled=True),
+    ],
+)
+def test_step_based_snvla_augmentation_annotates_epochs_without_changing_duration(
+    policy, monkeypatch
+):
     cfg = SimpleNamespace(
-        policy=make_processor_config(state_dropout_enabled=True),
+        policy=policy,
         batch_size=2,
         steps=100,
         save_freq=50,
@@ -170,7 +180,7 @@ def test_step_based_snvla_dropout_annotates_epochs_without_changing_duration(mon
     "policy",
     [make_processor_config(state_dropout_enabled=False), SimpleNamespace(type="act")],
 )
-def test_step_based_non_dropout_training_keeps_original_cycle(policy, monkeypatch):
+def test_step_based_non_augmentation_training_keeps_original_cycle(policy, monkeypatch):
     marker = object()
     cfg = SimpleNamespace(
         policy=policy,
@@ -237,6 +247,9 @@ def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches
         state_dropout_ratio=0.5,
         state_dropout_seed=0,
         narration_loss_weight=2.0,
+        observation_noise_enabled=False,
+        observation_noise_ratio=0.1,
+        observation_noise_seed=0,
     )
     stale_preprocessor, stale_postprocessor = make_snvla_pre_post_processors(stale_cfg, dataset_stats={})
     stale_preprocessor.save_pretrained(tmp_path)
@@ -260,6 +273,11 @@ def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches
         state_dropout_ratio=0.25,
         state_dropout_seed=83,
         narration_loss_weight=7.0,
+        observation_noise_enabled=True,
+        observation_noise_ratio=0.25,
+        observation_noise_seed=91,
+        observation_noise_scale_min=0.05,
+        observation_noise_scale_max=0.4,
     )
     duration = TrainingDuration(None, None, [])
     accelerator = SimpleNamespace(num_processes=1)
@@ -280,6 +298,11 @@ def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches
     assert tokenizer_processor.config.state_dropout_seed == 83
     assert tokenizer_processor.config.n_action_steps == 10
     assert tokenizer_processor.config.narration_loss_weight == pytest.approx(7.0)
+    assert tokenizer_processor.config.observation_noise_enabled is True
+    assert tokenizer_processor.config.observation_noise_ratio == pytest.approx(0.25)
+    assert tokenizer_processor.config.observation_noise_seed == 91
+    assert tokenizer_processor.config.observation_noise_scale_min == pytest.approx(0.05)
+    assert tokenizer_processor.config.observation_noise_scale_max == pytest.approx(0.4)
     device_processor = next(
         step for step in preprocessor.steps if type(step).__name__ == "DeviceProcessorStep"
     )
@@ -330,6 +353,9 @@ def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches
     assert reloaded_cfg.state_dropout_seed == 83
     assert reloaded_cfg.n_action_steps == 10
     assert reloaded_cfg.narration_loss_weight == pytest.approx(7.0)
+    assert reloaded_cfg.observation_noise_enabled is True
+    assert reloaded_cfg.observation_noise_ratio == pytest.approx(0.25)
+    assert reloaded_cfg.observation_noise_seed == 91
 
 
 def test_snvla_processor_config_assertion_reports_mismatch(monkeypatch):
@@ -715,8 +741,27 @@ def test_record_output_metrics_globally_aggregates_narration_and_action_modes():
 @pytest.mark.parametrize(
     "argv",
     [
-        ["train", "--wandb.enable=true", "--wandb.project=snvla-p5"],
-        ["train", "--wandb.enable", "true", "--wandb.project", "snvla-p5"],
+        [
+            "train",
+            "--wandb.enable=true",
+            "--wandb.project=snvla-p5",
+            "--wandb.disable_artifact=true",
+            "--save_checkpoint_to_hub=false",
+            "--policy.push_to_hub=false",
+        ],
+        [
+            "train",
+            "--wandb.enable",
+            "true",
+            "--wandb.project",
+            "snvla-p5",
+            "--wandb.disable_artifact",
+            "true",
+            "--save_checkpoint_to_hub",
+            "false",
+            "--policy.push_to_hub",
+            "false",
+        ],
     ],
 )
 def test_require_wandb_accepts_equals_and_split_cli_forms(monkeypatch, argv):
@@ -743,14 +788,59 @@ def test_require_wandb_rejects_missing_or_false_enable(monkeypatch, argv):
 @pytest.mark.parametrize(
     "argv",
     [
-        ["train", "--wandb.enable=true"],
-        ["train", "--wandb.enable", "true", "--wandb.project="],
+        [
+            "train",
+            "--wandb.enable=true",
+            "--wandb.disable_artifact=true",
+            "--save_checkpoint_to_hub=false",
+            "--policy.push_to_hub=false",
+        ],
+        [
+            "train",
+            "--wandb.enable",
+            "true",
+            "--wandb.project=",
+            "--wandb.disable_artifact=true",
+            "--save_checkpoint_to_hub=false",
+            "--policy.push_to_hub=false",
+        ],
     ],
 )
 def test_require_wandb_rejects_missing_project(monkeypatch, argv):
     monkeypatch.setenv("SNVLA_REQUIRE_WANDB", "1")
 
     with pytest.raises(ValueError, match="--wandb.project"):
+        require_wandb_cli_args(argv)
+
+
+@pytest.mark.parametrize(
+    ("option", "required_value", "provided_value"),
+    [
+        ("--wandb.disable_artifact", "true", None),
+        ("--wandb.disable_artifact", "true", "false"),
+        ("--save_checkpoint_to_hub", "false", None),
+        ("--save_checkpoint_to_hub", "false", "true"),
+        ("--policy.push_to_hub", "false", None),
+        ("--policy.push_to_hub", "false", "true"),
+    ],
+)
+def test_require_wandb_rejects_missing_or_unsafe_upload_flags(
+    monkeypatch, option, required_value, provided_value
+):
+    monkeypatch.setenv("SNVLA_REQUIRE_WANDB", "1")
+    argv = [
+        "train",
+        "--wandb.enable=true",
+        "--wandb.project=snvla-p5",
+        "--wandb.disable_artifact=true",
+        "--save_checkpoint_to_hub=false",
+        "--policy.push_to_hub=false",
+    ]
+    argv = [argument for argument in argv if not argument.startswith(f"{option}=")]
+    if provided_value is not None:
+        argv.append(f"{option}={provided_value}")
+
+    with pytest.raises(ValueError, match=rf"{re.escape(option)}={required_value}"):
         require_wandb_cli_args(argv)
 
 

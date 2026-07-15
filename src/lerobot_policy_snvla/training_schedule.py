@@ -7,6 +7,7 @@ _UINT64_MASK = (1 << 64) - 1
 _SPLITMIX64_GAMMA = np.uint64(0x9E3779B97F4A7C15)
 _SPLITMIX64_MIX1 = np.uint64(0xBF58476D1CE4E5B9)
 _SPLITMIX64_MIX2 = np.uint64(0x94D049BB133111EB)
+_OBSERVATION_NOISE_MASK_SALT = 0xD1B54A32D192ED03
 
 
 def stable_unit_phases(frame_ids: torch.Tensor, seed: int) -> torch.Tensor:
@@ -46,3 +47,19 @@ def state_dropout_mask(
     previous = torch.floor((epoch - 1) * ratio + phase)
     current = torch.floor(epoch * ratio + phase)
     return current > previous
+
+
+def observation_noise_mask(
+    frame_ids: torch.Tensor,
+    epoch: int,
+    ratio: float,
+    seed: int,
+) -> torch.Tensor:
+    """Select deterministic observation-noise rows on a dropout-independent stream."""
+
+    return state_dropout_mask(
+        frame_ids,
+        epoch=epoch,
+        ratio=ratio,
+        seed=seed ^ _OBSERVATION_NOISE_MASK_SALT,
+    )

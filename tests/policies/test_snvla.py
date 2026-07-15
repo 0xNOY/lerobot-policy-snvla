@@ -15,6 +15,8 @@ from lerobot_policy_snvla import SNVLAConfig
 from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
 from lerobot_policy_snvla.constants import (
     NARRATION_TARGET_MASK,
+    OBSERVATION_NOISE_MASK,
+    OBSERVATION_NOISE_SCALE,
     STATE_DROPOUT_MASK,
     TRAINING_EPOCH,
 )
@@ -34,9 +36,11 @@ from lerobot_policy_snvla.processor_snvla import (
     PREVIOUS_NARRATIONS,
     TASK_KEY,
     SNVLAPrepareTrainingTokenizerProcessorStep,
+    _apply_observation_noise,
+    discretize_state,
     make_prefix_prompt,
 )
-from lerobot_policy_snvla.training_schedule import state_dropout_mask
+from lerobot_policy_snvla.training_schedule import observation_noise_mask, state_dropout_mask
 
 
 class DummyTokenizer:
@@ -146,6 +150,26 @@ def test_state_dropout_config_defaults_and_validation():
             dataclasses.replace(cfg, state_dropout_ratio=invalid_ratio)
 
 
+def test_observation_noise_config_defaults_and_validation():
+    cfg = make_test_config()
+
+    assert cfg.observation_noise_enabled is False
+    assert cfg.observation_noise_ratio == pytest.approx(0.25)
+    assert cfg.observation_noise_seed == 0
+    assert cfg.observation_noise_scale_min == pytest.approx(0.0)
+    assert cfg.observation_noise_scale_max == pytest.approx(0.5)
+    for changes in (
+        {"observation_noise_ratio": -0.01},
+        {"observation_noise_ratio": 0.51},
+        {"observation_noise_scale_min": -0.01},
+        {"observation_noise_scale_min": float("nan")},
+        {"observation_noise_scale_max": float("inf")},
+        {"observation_noise_scale_min": 0.3, "observation_noise_scale_max": 0.2},
+    ):
+        with pytest.raises(ValueError, match="observation_noise"):
+            dataclasses.replace(cfg, **changes)
+
+
 def test_snvla_training_masks_are_complementary_data():
     batch = {
         "state_dropout_mask": torch.tensor([False, True]),
@@ -226,6 +250,166 @@ def test_state_dropout_schedule_is_rank_independent():
         reconstructed[rank::3] = rank_mask
 
     torch.testing.assert_close(reconstructed, full_mask)
+
+
+def test_observation_noise_schedule_is_deterministic_balanced_and_dropout_independent():
+    frame_ids = torch.arange(1000)
+    masks = [observation_noise_mask(frame_ids, epoch, ratio=0.25, seed=7) for epoch in range(5)]
+
+    assert not masks[0].any()
+    for previous, current in zip(masks[:-1], masks[1:], strict=True):
+        assert not (previous & current).any()
+    assert masks[2].float().mean().item() == pytest.approx(0.25, abs=0.02)
+    torch.testing.assert_close(
+        masks[3], observation_noise_mask(frame_ids, epoch=3, ratio=0.25, seed=7)
+    )
+    assert not torch.equal(masks[2], state_dropout_mask(frame_ids, epoch=2, ratio=0.25, seed=7))
+
+    reconstructed = torch.empty_like(masks[3])
+    for rank in range(3):
+        reconstructed[rank::3] = observation_noise_mask(
+            frame_ids[rank::3], epoch=3, ratio=0.25, seed=7
+        )
+    torch.testing.assert_close(reconstructed, masks[3])
+
+
+def test_processor_observation_noise_is_row_keyed_clipped_and_shared_with_prompt(
+    monkeypatch,
+):
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    image1 = "observation.images.image"
+    image2 = "observation.images.image2"
+    cfg = dataclasses.replace(
+        make_test_config(),
+        input_features={
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+            image1: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 2, 2)),
+            image2: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 2, 2)),
+        },
+        observation_noise_enabled=True,
+        observation_noise_ratio=0.25,
+        observation_noise_seed=31,
+        observation_noise_scale_min=0.1,
+        observation_noise_scale_max=0.4,
+    )
+    monkeypatch.setattr(
+        processor_snvla,
+        "observation_noise_mask",
+        lambda frame_ids, epoch, ratio, seed: torch.tensor([True, False]),
+    )
+
+    def process(order):
+        processor = make_dummy_processor(monkeypatch, cfg)
+        transition = make_training_transition(batch_size=2, with_narration=[False, True])
+        transition[TransitionKey.OBSERVATION][OBS_STATE] = torch.tensor(
+            [[0.9] * 6, [-0.25] * 6]
+        )[order]
+        transition[TransitionKey.OBSERVATION][image1] = torch.full((2, 3, 2, 2), 0.95)[order]
+        transition[TransitionKey.OBSERVATION][image2] = torch.full((2, 3, 2, 2), 0.05)[order]
+        transition[TransitionKey.ACTION] = torch.arange(12, dtype=torch.float32).reshape(2, 6)[order]
+        transition[TransitionKey.COMPLEMENTARY_DATA]["index"] = torch.tensor([11, 22])[order]
+        transition[TransitionKey.COMPLEMENTARY_DATA][TRAINING_EPOCH] = torch.tensor([2, 2])
+        original_action = transition[TransitionKey.ACTION].clone()
+        result = processor(transition)
+        return result, processor, original_action
+
+    result, processor, original_action = process(torch.tensor([0, 1]))
+    observation = result[TransitionKey.OBSERVATION]
+    complementary = result[TransitionKey.COMPLEMENTARY_DATA]
+    assert complementary[OBSERVATION_NOISE_MASK].tolist() == [True, False]
+    assert 0.1 <= complementary[OBSERVATION_NOISE_SCALE][0] <= 0.4
+    assert complementary[OBSERVATION_NOISE_SCALE][1] == 0
+    assert observation[OBS_STATE].min() >= -1 and observation[OBS_STATE].max() <= 1
+    for key in (image1, image2):
+        assert observation[key].min() >= 0 and observation[key].max() <= 1
+    assert not torch.equal(observation[image1][0], observation[image2][0])
+    torch.testing.assert_close(observation[OBS_STATE][1], torch.full((6,), -0.25))
+    torch.testing.assert_close(result[TransitionKey.ACTION], original_action)
+    discretized = " ".join(map(str, discretize_state(observation[OBS_STATE], 6)[0]))
+    assert f"State: {discretized};" in processor.tokenizer.texts[0]
+    assert observation[OBS_LANGUAGE_TOKEN_LOSS_MASK].sum() > 0
+
+    repeated, _, _ = process(torch.tensor([0, 1]))
+    repeated_observation = repeated[TransitionKey.OBSERVATION]
+    torch.testing.assert_close(repeated_observation[OBS_STATE], observation[OBS_STATE])
+    torch.testing.assert_close(repeated_observation[image1], observation[image1])
+
+
+def test_observation_noise_scale_and_realization_are_order_independent():
+    image_key = "observation.images.image"
+    cfg = dataclasses.replace(
+        make_test_config(),
+        input_features={
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+            image_key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 2, 2)),
+        },
+        observation_noise_enabled=True,
+        observation_noise_seed=47,
+        observation_noise_scale_min=0.0,
+        observation_noise_scale_max=0.5,
+    )
+    frame_ids = torch.tensor([5, 9, 12])
+    observation = {
+        OBS_STATE: torch.zeros(3, 6),
+        image_key: torch.full((3, 3, 2, 2), 0.5),
+    }
+    noisy, scales = _apply_observation_noise(
+        observation, frame_ids, 3, torch.ones(3, dtype=torch.bool), cfg
+    )
+    permutation = torch.tensor([2, 0, 1])
+    permuted, permuted_scales = _apply_observation_noise(
+        {key: value[permutation] for key, value in observation.items()},
+        frame_ids[permutation],
+        3,
+        torch.ones(3, dtype=torch.bool),
+        cfg,
+    )
+
+    assert scales.unique().numel() == 3
+    torch.testing.assert_close(permuted_scales, scales[permutation])
+    torch.testing.assert_close(permuted[OBS_STATE], noisy[OBS_STATE][permutation])
+    torch.testing.assert_close(permuted[image_key], noisy[image_key][permutation])
+
+
+def test_observation_noise_can_overlap_state_dropout_without_masking_losses(monkeypatch):
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    cfg = dataclasses.replace(
+        make_dropout_config(ratio=0.25, seed=3),
+        observation_noise_enabled=True,
+        observation_noise_ratio=0.25,
+        observation_noise_seed=5,
+        observation_noise_scale_min=0.1,
+        observation_noise_scale_max=0.1,
+    )
+    processor = make_dummy_processor(monkeypatch, cfg)
+    monkeypatch.setattr(
+        processor_snvla,
+        "state_dropout_mask",
+        lambda *args, **kwargs: torch.tensor([True]),
+    )
+    monkeypatch.setattr(
+        processor_snvla,
+        "observation_noise_mask",
+        lambda *args, **kwargs: torch.tensor([True]),
+    )
+    transition = make_training_transition(batch_size=1, with_narration=[False])
+    transition[TransitionKey.OBSERVATION][OBS_STATE].fill_(0.5)
+    transition[TransitionKey.ACTION].fill_(0.25)
+    transition[TransitionKey.COMPLEMENTARY_DATA]["index"] = torch.tensor([17])
+    transition[TransitionKey.COMPLEMENTARY_DATA][TRAINING_EPOCH] = torch.tensor([2])
+
+    result = processor(transition)
+
+    assert "State:" not in processor.tokenizer.texts[0]
+    assert result[TransitionKey.COMPLEMENTARY_DATA][STATE_DROPOUT_MASK].item()
+    assert result[TransitionKey.COMPLEMENTARY_DATA][OBSERVATION_NOISE_MASK].item()
+    assert not torch.equal(
+        result[TransitionKey.OBSERVATION][OBS_STATE], torch.full((1, 6), 0.5)
+    )
+    torch.testing.assert_close(result[TransitionKey.ACTION], torch.full((1, 6), 0.25))
+    assert result[TransitionKey.OBSERVATION][OBS_LANGUAGE_TOKEN_LOSS_MASK].sum() > 0
 
 
 @pytest.mark.parametrize("epoch", [True, 1.0, 1 + 0j, torch.tensor(1)])
@@ -471,6 +655,8 @@ def test_policy_forward_passes_task_one_training_masks_to_core():
         OBS_STATE: torch.tensor([[1.0], [2.0]]),
         NARRATION_TARGET_MASK: torch.tensor([True, False]),
         STATE_DROPOUT_MASK: torch.tensor([True, False]),
+        OBSERVATION_NOISE_MASK: torch.tensor([False, True]),
+        OBSERVATION_NOISE_SCALE: torch.tensor([0.0, 0.3]),
     }
 
     SNVLAPolicy.forward(policy, batch)
@@ -478,11 +664,19 @@ def test_policy_forward_passes_task_one_training_masks_to_core():
     assert "language_mode_masks" in captured
     assert "narration_target_masks" in captured
     assert "state_dropout_masks" in captured
+    assert "observation_noise_masks" in captured
+    assert "observation_noise_scales" in captured
     torch.testing.assert_close(captured["state"], torch.tensor([[1.0, 0.0], [2.0, 0.0]]))
     torch.testing.assert_close(captured["language_mode_masks"], batch["observation.language.mode_mask"])
     torch.testing.assert_close(captured["narration_target_masks"], batch[NARRATION_TARGET_MASK])
     torch.testing.assert_close(
         captured["state_dropout_masks"], batch[STATE_DROPOUT_MASK]
+    )
+    torch.testing.assert_close(
+        captured["observation_noise_masks"], batch[OBSERVATION_NOISE_MASK]
+    )
+    torch.testing.assert_close(
+        captured["observation_noise_scales"], batch[OBSERVATION_NOISE_SCALE]
     )
 
 

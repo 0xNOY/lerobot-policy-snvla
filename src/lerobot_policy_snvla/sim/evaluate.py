@@ -391,8 +391,14 @@ def _assert_snvla_inference_processor_config(preprocessor) -> None:
             f"found {len(tokenizer_steps)}"
         )
     tokenizer_cfg = tokenizer_steps[0].config
-    if tokenizer_cfg.training or tokenizer_cfg.state_dropout_enabled:
-        raise RuntimeError("SNVLA inference preprocessor retained training/state-dropout configuration")
+    if (
+        tokenizer_cfg.training
+        or tokenizer_cfg.state_dropout_enabled
+        or tokenizer_cfg.observation_noise_enabled
+    ):
+        raise RuntimeError(
+            "SNVLA inference preprocessor retained training/augmentation configuration"
+        )
 
 
 class PolicyStepper:
@@ -421,6 +427,8 @@ class PolicyStepper:
             cfg.training = False
         if hasattr(cfg, "state_dropout_enabled"):
             cfg.state_dropout_enabled = False
+        if hasattr(cfg, "observation_noise_enabled"):
+            cfg.observation_noise_enabled = False
         if hasattr(cfg, "narration_generation_enabled"):
             cfg.narration_generation_enabled = narration_enabled
         if n_action_steps is not None:

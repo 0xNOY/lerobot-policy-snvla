@@ -32,6 +32,8 @@ from .constants import (
     GROUP_METRIC_NUMERATOR_PREFIX,
     NARRATION_TARGET_MASK,
     OBS_LANGUAGE_MODE_MASK,
+    OBSERVATION_NOISE_MASK,
+    OBSERVATION_NOISE_SCALE,
     STATE_DROPOUT_MASK,
 )
 from .processor_snvla import (
@@ -650,6 +652,8 @@ class SNVLACore(nn.Module):
         language_mode_masks=None,
         narration_target_masks=None,
         state_dropout_masks=None,
+        observation_noise_masks=None,
+        observation_noise_scales=None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         device = self.device
 
@@ -674,6 +678,22 @@ class SNVLACore(nn.Module):
         else:
             state_dropout_masks = state_dropout_masks.to(
                 device=device, dtype=torch.bool
+            ).view(-1)
+        if observation_noise_masks is None:
+            observation_noise_masks = torch.zeros(
+                batch_size, device=device, dtype=torch.bool
+            )
+        else:
+            observation_noise_masks = observation_noise_masks.to(
+                device=device, dtype=torch.bool
+            ).view(-1)
+        if observation_noise_scales is None:
+            observation_noise_scales = torch.zeros(
+                batch_size, device=device, dtype=torch.float32
+            )
+        else:
+            observation_noise_scales = observation_noise_scales.to(
+                device=device, dtype=torch.float32
             ).view(-1)
 
         if self.config.training_padding_length is not None:
@@ -815,6 +835,17 @@ class SNVLACore(nn.Module):
         state_dropout_count = torch.tensor(
             state_dropout_masks.numel(), device=device, dtype=torch.float32
         )
+        observation_noise_fraction = observation_noise_masks.float().mean()
+        observation_noise_selected = observation_noise_masks.float().sum()
+        observation_noise_scale_sum = (
+            observation_noise_scales * observation_noise_masks.float()
+        ).sum()
+        observation_noise_scale = observation_noise_scale_sum / observation_noise_selected.clamp(
+            min=1.0
+        )
+        observation_noise_count = torch.tensor(
+            observation_noise_masks.numel(), device=device, dtype=torch.float32
+        )
 
         info = {
             "loss": loss.detach(),
@@ -828,6 +859,12 @@ class SNVLACore(nn.Module):
             .sum()
             .detach(),
             f"{GROUP_METRIC_COUNT_PREFIX}state_dropout_fraction": state_dropout_count.detach(),
+            "observation_noise_fraction": observation_noise_fraction.detach(),
+            f"{GROUP_METRIC_NUMERATOR_PREFIX}observation_noise_fraction": observation_noise_selected.detach(),
+            f"{GROUP_METRIC_COUNT_PREFIX}observation_noise_fraction": observation_noise_count.detach(),
+            "observation_noise_scale": observation_noise_scale.detach(),
+            f"{GROUP_METRIC_NUMERATOR_PREFIX}observation_noise_scale": observation_noise_scale_sum.detach(),
+            f"{GROUP_METRIC_COUNT_PREFIX}observation_noise_scale": observation_noise_selected.detach(),
             **grouped_metrics,
         }
         return loss, info
@@ -1284,6 +1321,14 @@ class SNVLAPolicy(PI05Policy):
             STATE_DROPOUT_MASK,
             torch.zeros(actions.shape[0], device=actions.device, dtype=torch.bool),
         )
+        observation_noise_masks = batch.get(
+            OBSERVATION_NOISE_MASK,
+            torch.zeros(actions.shape[0], device=actions.device, dtype=torch.bool),
+        )
+        observation_noise_scales = batch.get(
+            OBSERVATION_NOISE_SCALE,
+            torch.zeros(actions.shape[0], device=actions.device, dtype=torch.float32),
+        )
 
         return self.model.forward(
             images=images,
@@ -1297,6 +1342,8 @@ class SNVLAPolicy(PI05Policy):
             language_mode_masks=language_mode_masks,
             narration_target_masks=narration_target_masks,
             state_dropout_masks=state_dropout_masks,
+            observation_noise_masks=observation_noise_masks,
+            observation_noise_scales=observation_noise_scales,
         )
 
     @classmethod

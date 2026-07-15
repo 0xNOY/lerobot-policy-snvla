@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field, fields
@@ -38,14 +39,93 @@ from .constants import (
     OBS_LANGUAGE_MODE_MASK,
     OBS_LANGUAGE_TOKEN_AR_MASK,
     OBS_LANGUAGE_TOKEN_LOSS_MASK,
+    OBSERVATION_NOISE_MASK,
+    OBSERVATION_NOISE_SCALE,
     PREVIOUS_NARRATIONS,
     STATE_DROPOUT_MASK,
     TRAINING_EPOCH,
 )
-from .training_schedule import state_dropout_mask
+from .training_schedule import observation_noise_mask, state_dropout_mask
 
 # 学習データセットが提供するキー
 TASK_KEY = "task"
+
+
+def _keyed_unit_value(frame_id: int, epoch: int, seed: int, stream: str) -> float:
+    payload = f"{seed}:{epoch}:{frame_id}:{stream}".encode()
+    bits = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
+    return (bits >> 11) * (1.0 / (1 << 53))
+
+
+def _keyed_gaussian(
+    shape: torch.Size,
+    *,
+    frame_id: int,
+    epoch: int,
+    seed: int,
+    stream: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    payload = f"{seed}:{epoch}:{frame_id}:{stream}:gaussian".encode()
+    generator_seed = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
+    generator = torch.Generator(device="cpu").manual_seed(generator_seed)
+    return torch.randn(shape, generator=generator, dtype=torch.float32).to(device=device, dtype=dtype)
+
+
+def _apply_observation_noise(
+    observation: dict[str, Any],
+    frame_ids: torch.Tensor,
+    epoch: int,
+    mask: torch.Tensor,
+    config: SNVLAConfig,
+) -> tuple[dict[str, Any], torch.Tensor]:
+    """Apply stateless row-keyed noise after normalization and before tokenization."""
+
+    result = dict(observation)
+    batch_size = mask.numel()
+    scales = torch.zeros(batch_size, dtype=torch.float32)
+    selected = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+    for row in selected:
+        frame_id = int(frame_ids[row].item())
+        unit = _keyed_unit_value(frame_id, epoch, config.observation_noise_seed, "scale")
+        scales[row] = config.observation_noise_scale_min + unit * (
+            config.observation_noise_scale_max - config.observation_noise_scale_min
+        )
+
+    state = torch.as_tensor(result[OBS_STATE]).to(torch.float32).clone()
+    for row in selected:
+        frame_id = int(frame_ids[row].item())
+        noise = _keyed_gaussian(
+            state[row].shape,
+            frame_id=frame_id,
+            epoch=epoch,
+            seed=config.observation_noise_seed,
+            stream="state",
+            device=state.device,
+            dtype=state.dtype,
+        )
+        state[row] = (state[row] + scales[row].to(state.device) * noise).clamp(-1.0, 1.0)
+    result[OBS_STATE] = state
+
+    for image_key in sorted(config.image_features):
+        if image_key not in result:
+            continue
+        image = torch.as_tensor(result[image_key]).to(torch.float32).clone()
+        for row in selected:
+            frame_id = int(frame_ids[row].item())
+            noise = _keyed_gaussian(
+                image[row].shape,
+                frame_id=frame_id,
+                epoch=epoch,
+                seed=config.observation_noise_seed,
+                stream=f"image:{image_key}",
+                device=image.device,
+                dtype=image.dtype,
+            )
+            image[row] = (image[row] + scales[row].to(image.device) * noise).clamp(0.0, 1.0)
+        result[image_key] = image
+    return result, scales
 
 
 def discretize_state(state: torch.Tensor, max_dim: int, num_bins: int = 256) -> np.ndarray:
@@ -141,7 +221,8 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
 
         transition = transition.copy()
 
-        state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
+        observation = dict(transition.get(TransitionKey.OBSERVATION, {}))
+        state = observation.get(OBS_STATE)
         if state is None:
             raise ValueError("State is required for SN-VLA")
 
@@ -164,14 +245,18 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
         batch_size = state.shape[0]
         complementary = transition[TransitionKey.COMPLEMENTARY_DATA]
         dropout_mask = torch.zeros(batch_size, dtype=torch.bool)
-        if self.config.state_dropout_enabled:
+        noise_mask = torch.zeros(batch_size, dtype=torch.bool)
+        noise_scales = torch.zeros(batch_size, dtype=torch.float32)
+        frame_ids = None
+        training_epoch = None
+        if self.config.state_dropout_enabled or self.config.observation_noise_enabled:
             frame_ids = complementary.get("index")
             if frame_ids is None:
-                raise ValueError("'index' not found in complementary data for state dropout.")
+                raise ValueError("'index' not found in complementary data for training augmentation.")
             training_epochs = complementary.get(TRAINING_EPOCH)
             if training_epochs is None:
                 raise ValueError(
-                    f"'{TRAINING_EPOCH}' not found in complementary data for state dropout."
+                    f"'{TRAINING_EPOCH}' not found in complementary data for training augmentation."
                 )
             training_epochs = torch.as_tensor(training_epochs).reshape(-1)
             if (
@@ -182,13 +267,36 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
                 raise TypeError(f"'{TRAINING_EPOCH}' must contain integer values.")
             if training_epochs.numel() == 0 or not torch.all(training_epochs == training_epochs[0]):
                 raise ValueError(f"'{TRAINING_EPOCH}' must contain one epoch value per batch.")
+            frame_ids = torch.as_tensor(frame_ids).reshape(batch_size)
+            training_epoch = training_epochs[0].item()
+
+        if self.config.state_dropout_enabled:
+            assert frame_ids is not None and training_epoch is not None
             dropout_mask = state_dropout_mask(
-                torch.as_tensor(frame_ids).reshape(batch_size),
-                epoch=training_epochs[0].item(),
+                frame_ids,
+                epoch=training_epoch,
                 ratio=self.config.state_dropout_ratio,
                 seed=self.config.state_dropout_seed,
             )
+        if self.config.observation_noise_enabled:
+            assert frame_ids is not None and training_epoch is not None
+            noise_mask = observation_noise_mask(
+                frame_ids,
+                epoch=training_epoch,
+                ratio=self.config.observation_noise_ratio,
+                seed=self.config.observation_noise_seed,
+            )
+            observation, noise_scales = _apply_observation_noise(
+                observation,
+                frame_ids,
+                training_epoch,
+                noise_mask,
+                self.config,
+            )
+            state = observation[OBS_STATE]
         complementary[STATE_DROPOUT_MASK] = dropout_mask
+        complementary[OBSERVATION_NOISE_MASK] = noise_mask
+        complementary[OBSERVATION_NOISE_SCALE] = noise_scales
 
         # Discretize states for the entire batch
         discretized_states = discretize_state(state, max_dim=self.config.max_state_dim)
@@ -300,7 +408,7 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
                 all_mode_masks[i] += [False] * pad_length
 
         # Convert to tensors and stack
-        obs = transition.get(TransitionKey.OBSERVATION, {})
+        obs = observation
         obs[OBS_LANGUAGE_TOKENS] = torch.tensor(all_input_ids, dtype=torch.long)
         obs[OBS_LANGUAGE_ATTENTION_MASK] = torch.tensor(all_attention_masks, dtype=torch.bool)
         obs[OBS_LANGUAGE_TOKEN_AR_MASK] = torch.tensor(all_ar_masks, dtype=torch.bool)

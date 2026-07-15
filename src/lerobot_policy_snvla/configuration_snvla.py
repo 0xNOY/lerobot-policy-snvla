@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
@@ -66,6 +67,12 @@ class SNVLAConfig(PreTrainedConfig):
     state_dropout_ratio: float = 0.25
     state_dropout_seed: int = 0
 
+    observation_noise_enabled: bool = False
+    observation_noise_ratio: float = 0.25
+    observation_noise_seed: int = 0
+    observation_noise_scale_min: float = 0.0
+    observation_noise_scale_max: float = 0.5
+
     # 実況トークンの損失重み（1.0 = 通常、>1.0 = より重要視）
     narration_loss_weight: float = 5.0
 
@@ -130,6 +137,18 @@ class SNVLAConfig(PreTrainedConfig):
             raise ValueError("max_text_loss_tokens must be positive")
         if not 0.0 <= self.state_dropout_ratio <= 0.5:
             raise ValueError("state_dropout_ratio must be between 0.0 and 0.5")
+        if not 0.0 <= self.observation_noise_ratio <= 0.5:
+            raise ValueError("observation_noise_ratio must be between 0.0 and 0.5")
+        if not math.isfinite(self.observation_noise_scale_min) or self.observation_noise_scale_min < 0:
+            raise ValueError("observation_noise_scale_min must be finite and non-negative")
+        if (
+            not math.isfinite(self.observation_noise_scale_max)
+            or self.observation_noise_scale_max < self.observation_noise_scale_min
+        ):
+            raise ValueError(
+                "observation_noise_scale_max must be finite and greater than or equal to "
+                "observation_noise_scale_min"
+            )
         if self.gradient_checkpointing_interval <= 0:
             raise ValueError("gradient_checkpointing_interval must be positive")
         if self.attention_backend not in {"eager", "sdpa"}:
