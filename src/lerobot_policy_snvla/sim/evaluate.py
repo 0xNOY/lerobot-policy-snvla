@@ -346,6 +346,26 @@ def evaluate(
     return summary, results
 
 
+def _assert_snvla_inference_processor_config(preprocessor) -> None:
+    from lerobot_policy_snvla.processor_snvla import (
+        SNVLAPrepareTrainingTokenizerProcessorStep,
+    )
+
+    tokenizer_steps = [
+        step
+        for step in preprocessor.steps
+        if isinstance(step, SNVLAPrepareTrainingTokenizerProcessorStep)
+    ]
+    if len(tokenizer_steps) != 1:
+        raise RuntimeError(
+            "SNVLA inference preprocessor must contain exactly one tokenizer step; "
+            f"found {len(tokenizer_steps)}"
+        )
+    tokenizer_cfg = tokenizer_steps[0].config
+    if tokenizer_cfg.training or tokenizer_cfg.state_dropout_enabled:
+        raise RuntimeError("SNVLA inference preprocessor retained training/state-dropout configuration")
+
+
 class PolicyStepper:
     """学習済みSNVLA/pi05チェックポイントをStepperに適合させる。
 
@@ -368,6 +388,10 @@ class PolicyStepper:
         self.device = torch.device(device)
         cfg = PreTrainedConfig.from_pretrained(pretrained_path)
         cfg.device = device
+        if hasattr(cfg, "training"):
+            cfg.training = False
+        if hasattr(cfg, "state_dropout_enabled"):
+            cfg.state_dropout_enabled = False
         if hasattr(cfg, "narration_generation_enabled"):
             cfg.narration_generation_enabled = narration_enabled
         if n_action_steps is not None:
@@ -375,11 +399,18 @@ class PolicyStepper:
         self.policy = get_policy_class(cfg.type).from_pretrained(pretrained_path, config=cfg)
         self.policy.to(self.device)
         self.policy.eval()
+        preprocessor_overrides = {"device_processor": {"device": device}}
+        if getattr(cfg, "type", None) == "snvla":
+            preprocessor_overrides["snvla_prepare_training_tokenizer_processor_step"] = {
+                "config": cfg
+            }
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             cfg,
             pretrained_path=pretrained_path,
-            preprocessor_overrides={"device_processor": {"device": device}},
+            preprocessor_overrides=preprocessor_overrides,
         )
+        if getattr(cfg, "type", None) == "snvla":
+            _assert_snvla_inference_processor_config(self.preprocessor)
 
     def reset(self) -> None:
         self.policy.reset()

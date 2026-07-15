@@ -351,6 +351,103 @@ def test_build_arg_parser_rejects_only_one_record_option(record_args):
         build_arg_parser().parse_args(["--policy-path", "outputs/ckpt", *record_args])
 
 
+def test_policy_stepper_disables_checkpoint_training_processor(monkeypatch):
+    import lerobot.policies
+    import lerobot.policies.factory
+    from lerobot.configs.policies import PreTrainedConfig
+
+    from lerobot_policy_snvla import SNVLAConfig
+    from lerobot_policy_snvla.processor_snvla import (
+        SNVLAPrepareTrainingTokenizerProcessorStep,
+    )
+    from lerobot_policy_snvla.sim.evaluate import PolicyStepper
+
+    cfg = SNVLAConfig(
+        compile_model=False,
+        device="cpu",
+        chunk_size=2,
+        n_action_steps=2,
+        state_dropout_enabled=True,
+        state_dropout_ratio=0.5,
+    )
+    monkeypatch.setattr(PreTrainedConfig, "from_pretrained", lambda *_args, **_kwargs: cfg)
+
+    class FakePolicy:
+        def to(self, _device):
+            return self
+
+        def eval(self):
+            return self
+
+        def reset(self):
+            pass
+
+    class FakePolicyClass:
+        @classmethod
+        def from_pretrained(cls, _path, **kwargs):
+            captured["policy_kwargs"] = kwargs
+            return FakePolicy()
+
+    class FakeTokenizer:
+        def convert_ids_to_tokens(self, token_id):
+            return f"<tok{token_id}>"
+
+    captured = {}
+    monkeypatch.setattr(lerobot.policies, "get_policy_class", lambda _type: FakePolicyClass)
+    monkeypatch.setattr(
+        "lerobot_policy_snvla.processor_snvla.AutoTokenizer.from_pretrained",
+        lambda _name: FakeTokenizer(),
+    )
+
+    def fake_make_processors(policy_cfg, **kwargs):
+        captured["processor_cfg"] = policy_cfg
+        captured["processor_kwargs"] = kwargs
+        step_cfg = kwargs["preprocessor_overrides"][
+            "snvla_prepare_training_tokenizer_processor_step"
+        ]["config"]
+        step = SNVLAPrepareTrainingTokenizerProcessorStep(config=step_cfg)
+        return SimpleNamespace(steps=[step]), SimpleNamespace()
+
+    monkeypatch.setattr(lerobot.policies.factory, "make_pre_post_processors", fake_make_processors)
+
+    PolicyStepper("checkpoint", device="cpu")
+
+    assert cfg.training is False
+    assert cfg.state_dropout_enabled is False
+    assert captured["policy_kwargs"]["config"] is cfg
+    overrides = captured["processor_kwargs"]["preprocessor_overrides"]
+    assert overrides["snvla_prepare_training_tokenizer_processor_step"]["config"] is cfg
+    assert overrides["device_processor"] == {"device": "cpu"}
+
+
+def test_inference_processor_check_rejects_retained_state_dropout(monkeypatch):
+    from lerobot_policy_snvla import SNVLAConfig
+    from lerobot_policy_snvla.processor_snvla import (
+        SNVLAPrepareTrainingTokenizerProcessorStep,
+    )
+    from lerobot_policy_snvla.sim.evaluate import _assert_snvla_inference_processor_config
+
+    class FakeTokenizer:
+        def convert_ids_to_tokens(self, token_id):
+            return f"<tok{token_id}>"
+
+    monkeypatch.setattr(
+        "lerobot_policy_snvla.processor_snvla.AutoTokenizer.from_pretrained",
+        lambda _name: FakeTokenizer(),
+    )
+    stale_step = SNVLAPrepareTrainingTokenizerProcessorStep(
+        config=SNVLAConfig(
+            compile_model=False,
+            chunk_size=2,
+            n_action_steps=2,
+            state_dropout_enabled=True,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="retained training/state-dropout"):
+        _assert_snvla_inference_processor_config(SimpleNamespace(steps=[stale_step]))
+
+
 @pytest.mark.sim
 def test_expert_stepper_succeeds_on_unseen_seed():
     pytest.importorskip("libero", reason="LIBERO not installed (pip install -e '.[sim]')")
