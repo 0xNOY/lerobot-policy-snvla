@@ -1,10 +1,13 @@
 import argparse
+import concurrent.futures
 import json
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 # Use a non-graphical backend when no DISPLAY is available (headless environments)
 if not os.environ.get("DISPLAY"):
@@ -16,6 +19,7 @@ import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 from huggingface_hub.errors import HFValidationError
+from matplotlib.font_manager import findfont
 from matplotlib.gridspec import GridSpec
 from matplotlib.offsetbox import AnnotationBbox, HPacker, TextArea, VPacker
 from matplotlib.patches import FancyBboxPatch
@@ -65,14 +69,168 @@ def _context_text_box(change_additions, fontsize=9):
 class _CanvasFFMpegWriter(animation.FFMpegWriter):
     """Write the already-rendered Agg canvas without rendering it a second time."""
 
+    def _write_all(self, pixels):
+        view = memoryview(pixels).cast("B")
+        while view:
+            written = self._proc.stdin.write(view)
+            if not written:
+                raise BrokenPipeError("FFmpeg stopped accepting video frames")
+            view = view[written:]
+
     def grab_frame(self, **savefig_kwargs):
         if savefig_kwargs:
             raise TypeError("_CanvasFFMpegWriter does not accept savefig options")
-        rgba = memoryview(self.fig.canvas.buffer_rgba()).cast("B")
-        self._proc.stdin.write(rgba)
+        self._write_all(self.fig.canvas.buffer_rgba())
+
+    def write_rgba(self, frame):
+        """Write a pre-composited contiguous RGBA frame."""
+        self._write_all(frame)
 
 
-def extract_episode_data(dataset, episode_idx=0):
+def _array_bounds(bbox, canvas_height):
+    """Convert a Matplotlib bottom-left bbox to NumPy top-left slices."""
+    x0 = max(0, int(round(bbox.x0)))
+    x1 = int(round(bbox.x1))
+    y0 = max(0, canvas_height - int(round(bbox.y1)))
+    y1 = canvas_height - int(round(bbox.y0))
+    return y0, y1, x0, x1
+
+
+def _nvenc_is_usable():
+    """Check actual NVENC usability, not just whether FFmpeg lists the codec."""
+    if shutil.which("ffmpeg") is None:
+        return False
+    probe = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            # Recent NVENC generations reject dimensions below 145 pixels.
+            "color=size=256x256",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "h264_nvenc",
+            "-f",
+            "null",
+            "-",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+def _select_video_encoder(encoder, preset):
+    if encoder == "auto":
+        encoder = "h264_nvenc" if _nvenc_is_usable() else "libx264"
+    if encoder == "h264_nvenc":
+        preset_order = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]
+        # NVENC uses p1 (fastest) through p7 (best quality).
+        preset = f"p{preset_order.index(preset) + 1}"
+    return encoder, preset
+
+
+def _decode_video_segment(video_path, start_time, num_frames, fps, size=(224, 224)):
+    """Decode and resize a consecutive episode segment in one FFmpeg call."""
+    width, height = size
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-ss",
+        str(start_time),
+        "-i",
+        os.fspath(video_path),
+        "-an",
+        "-sn",
+        "-dn",
+        "-frames:v",
+        str(num_frames),
+        "-vf",
+        f"fps={fps},scale={width}:{height}:flags=fast_bilinear",
+        "-pix_fmt",
+        "rgb24",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ]
+    result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    frame_size = width * height * 3
+    actual_frames, remainder = divmod(len(result.stdout), frame_size)
+    if remainder or actual_frames != num_frames:
+        raise RuntimeError(f"FFmpeg decoded {actual_frames}/{num_frames} frames from {video_path}")
+    return np.frombuffer(result.stdout, dtype=np.uint8).reshape(num_frames, height, width, 3)
+
+
+def _deserialize_previous_narration(value):
+    try:
+        return "".join(json.loads(value))
+    except (json.JSONDecodeError, TypeError):
+        print(repr(value))
+        return value or ""
+
+
+def _extract_episode_data_fast(dataset, episode_idx):
+    """Read tabular columns in one Arrow slice and video streams in parallel."""
+    if shutil.which("ffmpeg") is None or not hasattr(dataset, "hf_dataset"):
+        raise RuntimeError("Fast extraction requires FFmpeg and a local Arrow dataset")
+
+    episode = dataset.meta.episodes[episode_idx]
+    from_idx = episode["dataset_from_index"]
+    to_idx = episode["dataset_to_index"]
+    num_frames = to_idx - from_idx
+    batch = dataset.hf_dataset[from_idx:to_idx]
+    camera_keys = dataset.meta.camera_keys
+
+    decode_jobs = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(camera_keys))) as executor:
+        for key in camera_keys:
+            video_path = Path(dataset.root) / dataset.meta.get_video_file_path(episode_idx, key)
+            start_time = episode[f"videos/{key}/from_timestamp"]
+            decode_jobs[key] = executor.submit(
+                _decode_video_segment, video_path, start_time, num_frames, dataset.fps
+            )
+        camera_frames = {key: job.result() for key, job in decode_jobs.items()}
+
+    previous_values = batch.get("previous_narrations", [""] * num_frames)
+    previous_narrations = [_deserialize_previous_narration(value) for value in previous_values]
+    current_narrations = batch.get("current_narration", [""] * num_frames)
+    timestamps = np.arange(num_frames, dtype=np.float64) / dataset.fps
+    narration_events = [
+        {
+            "frame": frame_idx,
+            "timestamp": timestamps[frame_idx],
+            "narration": narration,
+            "previous": previous_narrations[frame_idx],
+        }
+        for frame_idx, narration in enumerate(current_narrations)
+        if narration
+    ]
+
+    def stack_column(name):
+        values = batch.get(name)
+        return np.stack([np.asarray(value) for value in values]) if values else None
+
+    tasks = episode.get("tasks", [])
+    return {
+        "task": tasks[0] if tasks else "N/A",
+        "camera_frames": camera_frames,
+        "narration_events": narration_events,
+        "previous_narrations_per_frame": previous_narrations,
+        "state_data": stack_column("observation.state"),
+        "action_data": stack_column("action"),
+        "timestamps": timestamps,
+        "fps": dataset.fps,
+        "num_frames": num_frames,
+    }
+
+
+def _extract_episode_data_legacy(dataset, episode_idx=0):
     """エピソードから全データを抽出"""
     from_idx = dataset.meta.episodes["dataset_from_index"][episode_idx]
     to_idx = dataset.meta.episodes["dataset_to_index"][episode_idx]
@@ -117,10 +275,7 @@ def extract_episode_data(dataset, episode_idx=0):
 
         # previous_narrationsをデシリアライズ
         previous_narrations = frame.get("previous_narrations", "")
-        try:
-            previous_narrations = "".join(json.loads(previous_narrations))
-        except json.JSONDecodeError:
-            print(repr(previous_narrations))
+        previous_narrations = _deserialize_previous_narration(previous_narrations)
 
         # ナレーションイベントを記録
         if frame.get("current_narration"):
@@ -156,8 +311,27 @@ def extract_episode_data(dataset, episode_idx=0):
     }
 
 
+def extract_episode_data(dataset, episode_idx=0):
+    """Extract an episode, preferring bulk Arrow/video reads when available."""
+    try:
+        started_at = time.perf_counter()
+        data = _extract_episode_data_fast(dataset, episode_idx)
+        print(f"Fast extraction completed in {time.perf_counter() - started_at:.2f}s")
+        return data
+    except (OSError, RuntimeError, subprocess.SubprocessError, KeyError, IndexError, ValueError) as error:
+        print(f"Fast extraction unavailable ({error}); using the compatible decoder")
+        return _extract_episode_data_legacy(dataset, episode_idx)
+
+
 def visualize_episode_with_narrations(
-    dataset, episode_idx=0, output_path=None, interval=50, encoder_preset="veryfast"
+    dataset,
+    episode_idx=0,
+    output_path=None,
+    interval=50,
+    encoder_preset="veryfast",
+    encoder="auto",
+    renderer="auto",
+    render_workers=0,
 ):
     """
     エピソードをナレーション付きで可視化
@@ -344,7 +518,7 @@ def visualize_episode_with_narrations(
 
     # 現在時刻のマーカー
     narration_line = narration_ax.axvline(x=0, color="blue", linewidth=2, label="Current time")
-    narration_ax.legend(loc="upper right")
+    narration_legend = narration_ax.legend(loc="upper right")
 
     # Previous Narrationsタイムライン（区間として表示）
     prev_narration_ax = fig.add_subplot(gs[2])
@@ -369,7 +543,7 @@ def visualize_episode_with_narrations(
 
     # 現在時刻のマーカー
     prev_narration_line = prev_narration_ax.axvline(x=0, color="blue", linewidth=2, label="Current time")
-    prev_narration_ax.legend(loc="upper right")
+    prev_narration_legend = prev_narration_ax.legend(loc="upper right")
 
     # ロボット状態とアクションのタイムライン
     state_ax = fig.add_subplot(gs[3])
@@ -383,20 +557,39 @@ def visualize_episode_with_narrations(
     if has_state:
         num_state_dims = min(data["state_data"].shape[1], 6)  # 最大6次元まで表示
         for i in range(num_state_dims):
-            (line,) = state_ax.plot([], [], label=f"State {i}", alpha=0.7)
+            (line,) = state_ax.plot(
+                data["timestamps"], data["state_data"][:, i], label=f"State {i}", alpha=0.7
+            )
             state_lines.append(line)
 
     if has_action:
         num_action_dims = min(data["action_data"].shape[1], 6)  # 最大6次元まで表示
         for i in range(num_action_dims):
-            (line,) = state_ax.plot([], [], "--", label=f"Action {i}", alpha=0.7)
+            (line,) = state_ax.plot(
+                data["timestamps"], data["action_data"][:, i], "--", label=f"Action {i}", alpha=0.7
+            )
             action_lines.append(line)
 
     # 現在時刻のマーカー
     state_line = state_ax.axvline(x=0, color="blue", linewidth=2)
+    # Render the complete traces once, then hide their future portion with a
+    # moving mask.  This replaces up to twelve growing paths per frame.
+    state_future_mask = FancyBboxPatch(
+        (0, 0),
+        1,
+        1,
+        transform=state_ax.transAxes,
+        boxstyle="square,pad=0",
+        facecolor=state_ax.get_facecolor(),
+        edgecolor="none",
+        zorder=2.5,
+    )
+    state_ax.add_patch(state_future_mask)
+    state_line.set_zorder(3)
 
+    state_legend = None
     if has_state or has_action:
-        state_ax.legend(loc="upper right", ncol=2, fontsize=8)
+        state_legend = state_ax.legend(loc="upper right", ncol=2, fontsize=8)
         state_ax.set_ylabel("Value")
 
         # Y軸の範囲を設定
@@ -451,13 +644,9 @@ def visualize_episode_with_narrations(
         # 状態とアクションのタイムラインを更新
         state_line.set_xdata([current_time, current_time])
 
-        if has_state:
-            for i, line in enumerate(state_lines):
-                line.set_data(data["timestamps"][: frame_idx + 1], data["state_data"][: frame_idx + 1, i])
-
-        if has_action:
-            for i, line in enumerate(action_lines):
-                line.set_data(data["timestamps"][: frame_idx + 1], data["action_data"][: frame_idx + 1, i])
+        duration = data["timestamps"][-1]
+        progress = current_time / duration if duration else 1.0
+        state_future_mask.set_bounds(progress, 0, 1 - progress, 1)
 
         return (
             camera_images
@@ -467,52 +656,148 @@ def visualize_episode_with_narrations(
                 state_line,
                 title_text,
                 context_none_text,
+                state_future_mask,
             ]
             + context_boxes
-            + state_lines
-            + action_lines
         )
 
     if output_path:
         print(f"Saving animation to {output_path}...")
-        # FuncAnimation.save() calls Figure.savefig() for every frame, which
-        # redraws all static axes, labels and narration annotations.  Agg
-        # blitting lets us draw those once and only redraw changing artists.
+        selected_encoder, selected_preset = _select_video_encoder(encoder, encoder_preset)
+        print(f"Encoding with {selected_encoder} ({selected_preset})")
+        if renderer == "matplotlib":
+            print("Rendering with the compatibility Matplotlib backend")
+            writer = animation.FFMpegWriter(
+                fps=data["fps"],
+                codec=selected_encoder,
+                bitrate=5000,
+                extra_args=["-preset", selected_preset],
+            )
+            anim = animation.FuncAnimation(
+                fig, update, frames=data["num_frames"], interval=interval, blit=False, repeat=False
+            )
+            started_at = time.perf_counter()
+            anim.save(output_path, writer=writer, dpi=fig.dpi)
+            print(f"Animation saved to {output_path} in {time.perf_counter() - started_at:.1f}s")
+            plt.close(fig)
+            return None
+
+        print("Rendering with the parallel composite backend")
+        # Draw the static Matplotlib layout once.  The composite backend then
+        # updates only the changing pixel regions for each video frame.
         dynamic_artists = update(0)
         for artist in dynamic_artists:
             artist.set_animated(True)
 
-        writer = _CanvasFFMpegWriter(fps=data["fps"], bitrate=5000, extra_args=["-preset", encoder_preset])
+        writer = _CanvasFFMpegWriter(
+            fps=data["fps"],
+            codec=selected_encoder,
+            bitrate=5000,
+            extra_args=["-preset", selected_preset],
+        )
         started_at = time.perf_counter()
         with writer.saving(fig, output_path, dpi=fig.dpi):
             fig.canvas.draw()
             background = fig.canvas.copy_from_bbox(fig.bbox)
+            canvas_width, canvas_height = fig.canvas.get_width_height()
+            static_frame = np.asarray(fig.canvas.buffer_rgba()).copy()
 
             # Context changes only a handful of times per episode.  Cache the
             # rendered panel for each state so its nested text boxes do not
             # need to be laid out and drawn on every video frame.
             context_artists = [context_none_text, *context_boxes]
-            context_artist_ids = {id(artist) for artist in context_artists}
-            context_regions = []
+            context_bounds = _array_bounds(context_ax.bbox, canvas_height)
+            cy0, cy1, cx0, cx1 = context_bounds
+            context_patches = []
             for cached_artist in context_artists:
                 for artist in context_artists:
                     artist.set_visible(artist is cached_artist)
                 fig.canvas.restore_region(background)
                 fig.draw_artist(cached_artist)
-                context_regions.append(fig.canvas.copy_from_bbox(context_ax.bbox))
+                context_patches.append(np.asarray(fig.canvas.buffer_rgba())[cy0:cy1, cx0:cx1].copy())
 
-            for frame_idx in range(data["num_frames"]):
-                fig.canvas.restore_region(background)
+            camera_bounds = [
+                _array_bounds(image.get_window_extent(), canvas_height) for image in camera_images
+            ]
+            narration_bounds = _array_bounds(narration_ax.bbox, canvas_height)
+            prev_narration_bounds = _array_bounds(prev_narration_ax.bbox, canvas_height)
+            state_bounds = _array_bounds(state_ax.bbox, canvas_height)
+            legends = [narration_legend, prev_narration_legend]
+            if state_legend is not None:
+                legends.append(state_legend)
+            legend_patches = []
+            for legend in legends:
+                bounds = _array_bounds(legend.get_window_extent(), canvas_height)
+                y0, y1, x0, x1 = bounds
+                legend_patches.append((bounds, static_frame[y0:y1, x0:x1].copy()))
+            # GridSpec reserves the top 10% of the figure for the dynamic title.
+            title_bottom = int(round(canvas_height * 0.1))
+            title_font = ImageFont.truetype(
+                findfont(title_text.get_fontproperties()),
+                round(title_text.get_fontsize() * fig.dpi / 72),
+            )
+
+            def draw_time_line(frame, axis, bounds, current_time):
+                y0, y1, x0, x1 = bounds
+                x = int(round(axis.transData.transform((current_time, 0))[0]))
+                x = min(max(x, x0 + 1), x1 - 2)
+                frame[y0 + 1 : y1 - 1, x - 1 : x + 2] = (0, 0, 255, 255)
+
+            def compose_frame(frame_idx):
+                frame = static_frame.copy()
+                current_time = data["timestamps"][frame_idx]
+                title = (
+                    f"Episode {episode_idx} - Frame {frame_idx}/{data['num_frames']} "
+                    f"(t={current_time:.2f}s)\nTask: {data['task']}"
+                )
+                title_image = Image.new("RGBA", (canvas_width, title_bottom), "white")
+                title_draw = ImageDraw.Draw(title_image)
+                title_bbox = title_draw.multiline_textbbox((0, 0), title, font=title_font, align="center")
+                title_x = (canvas_width - (title_bbox[2] - title_bbox[0])) // 2
+                title_draw.multiline_text((title_x, 20), title, fill="black", font=title_font, align="center")
+                frame[:title_bottom] = np.asarray(title_image)
+
                 context_state = np.searchsorted(context_change_frames, frame_idx, side="right")
-                fig.canvas.restore_region(context_regions[context_state])
-                for artist in update(frame_idx):
-                    if id(artist) not in context_artist_ids:
-                        fig.draw_artist(artist)
-                fig.canvas.blit(fig.bbox)
-                writer.grab_frame()
+                frame[cy0:cy1, cx0:cx1] = context_patches[context_state]
 
-                if (frame_idx + 1) % 100 == 0 or frame_idx + 1 == data["num_frames"]:
-                    print(f"Rendered {frame_idx + 1}/{data['num_frames']} frames", flush=True)
+                for camera_idx, key in enumerate(camera_keys):
+                    y0, y1, x0, x1 = camera_bounds[camera_idx]
+                    image = Image.fromarray(data["camera_frames"][key][frame_idx]).resize(
+                        (x1 - x0, y1 - y0), Image.Resampling.BILINEAR
+                    )
+                    frame[y0:y1, x0:x1, :3] = np.asarray(image)
+                    frame[y0:y1, x0:x1, 3] = 255
+
+                draw_time_line(frame, narration_ax, narration_bounds, current_time)
+                draw_time_line(frame, prev_narration_ax, prev_narration_bounds, current_time)
+
+                sy0, sy1, sx0, sx1 = state_bounds
+                state_x = int(round(state_ax.transData.transform((current_time, 0))[0]))
+                state_x = min(max(state_x, sx0 + 1), sx1 - 2)
+                frame[sy0 + 1 : sy1 - 1, state_x:sx1 - 1] = (255, 255, 255, 255)
+                frame[sy0 + 1 : sy1 - 1, state_x - 1 : state_x + 2] = (0, 0, 255, 255)
+                for bounds, patch in legend_patches:
+                    y0, y1, x0, x1 = bounds
+                    frame[y0:y1, x0:x1] = patch
+                return frame
+
+            worker_count = render_workers or min(4, os.cpu_count() or 1)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                # Keep only a small bounded set of full-resolution frames in
+                # flight; Executor.map would eagerly queue the whole episode.
+                next_frame = 0
+                pending = []
+                while next_frame < min(worker_count * 2, data["num_frames"]):
+                    pending.append(executor.submit(compose_frame, next_frame))
+                    next_frame += 1
+                for frame_idx in range(data["num_frames"]):
+                    frame = pending.pop(0).result()
+                    if next_frame < data["num_frames"]:
+                        pending.append(executor.submit(compose_frame, next_frame))
+                        next_frame += 1
+                    writer.write_rgba(frame)
+                    if (frame_idx + 1) % 100 == 0 or frame_idx + 1 == data["num_frames"]:
+                        print(f"Rendered {frame_idx + 1}/{data['num_frames']} frames", flush=True)
 
         elapsed = time.perf_counter() - started_at
         print(f"Animation saved to {output_path} in {elapsed:.1f}s")
@@ -538,9 +823,30 @@ def main():
         "--encoder-preset",
         default="veryfast",
         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
-        help="FFmpeg x264 speed/size tradeoff used for video output (default: veryfast)",
+        help="Encoder speed/size tradeoff used for video output (default: veryfast)",
+    )
+    parser.add_argument(
+        "--encoder",
+        default="auto",
+        choices=["auto", "libx264", "h264_nvenc"],
+        help="Video encoder; auto uses NVIDIA NVENC when usable (default: auto)",
+    )
+    parser.add_argument(
+        "--renderer",
+        default="auto",
+        choices=["auto", "composite", "matplotlib"],
+        help="Frame backend; auto/composite is fastest, matplotlib is the compatibility path",
+    )
+    parser.add_argument(
+        "--render-workers",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Composite worker threads; 0 selects min(4, CPU count) (default: 0)",
     )
     args = parser.parse_args()
+    if args.render_workers < 0:
+        parser.error("--render-workers must be 0 or greater")
 
     try:
         dataset = LeRobotDataset(args.dataset_name, revision="main")
@@ -555,6 +861,9 @@ def main():
         output_path=args.output,
         interval=args.interval,
         encoder_preset=args.encoder_preset,
+        encoder=args.encoder,
+        renderer=args.renderer,
+        render_workers=args.render_workers,
     )
 
 
