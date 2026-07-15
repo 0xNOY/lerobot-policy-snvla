@@ -37,6 +37,7 @@ _lerobot_update_policy = lerobot_train.update_policy
 _active_epoch_metrics: "EpochMetricContext | None" = None
 
 _SNVLA_TOKENIZER_STEP = "snvla_prepare_training_tokenizer_processor_step"
+_PI05_BASE_PRETRAINED_PATH = "lerobot/pi05_base"
 _SNVLA_PROCESSOR_CONFIG_FIELDS = (
     "training",
     "state_dropout_enabled",
@@ -59,6 +60,12 @@ _SNVLA_PROCESSOR_CONFIG_FIELDS = (
     "begin_of_action_token_id",
     "eos_token_id",
 )
+
+
+def _is_pi05_base_pretrained_path(pretrained_path: object) -> bool:
+    """Match only the upstream base identifier whose processors are not SNVLA processors."""
+
+    return pretrained_path == _PI05_BASE_PRETRAINED_PATH
 
 
 @dataclass(frozen=True)
@@ -469,6 +476,18 @@ def _epoch_training_patches(
     def make_processors_with_current_snvla_config(policy_cfg, *args, **kwargs):
         if not isinstance(policy_cfg, SNVLAConfig):
             return original_make_processors(policy_cfg, *args, **kwargs)
+
+        pretrained_path = args[0] if args else kwargs.get("pretrained_path")
+        if _is_pi05_base_pretrained_path(pretrained_path):
+            if args:
+                args = (None, *args[1:])
+            else:
+                kwargs["pretrained_path"] = None
+            preprocessor, postprocessor = original_make_processors(
+                policy_cfg, *args, **kwargs
+            )
+            _assert_current_snvla_processor_config(preprocessor, policy_cfg)
+            return preprocessor, postprocessor
 
         overrides = dict(kwargs.get("preprocessor_overrides") or {})
         tokenizer_override = dict(overrides.get(_SNVLA_TOKENIZER_STEP) or {})

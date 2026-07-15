@@ -411,6 +411,105 @@ def test_processor_factory_patch_does_not_change_non_snvla(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("positional", [False, True])
+def test_processor_factory_bypasses_only_pi05_base_processors_and_preserves_dataset_stats(
+    monkeypatch, positional
+):
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
+    policy_cfg = make_processor_config()
+    tokenizer_step = SNVLAPrepareTrainingTokenizerProcessorStep(config=policy_cfg)
+    postprocessor = object()
+    seen = {}
+
+    def fake_factory(inner_cfg, *args, **kwargs):
+        seen.update(policy_cfg=inner_cfg, args=args, kwargs=kwargs)
+        return SimpleNamespace(steps=[tokenizer_step]), postprocessor
+
+    monkeypatch.setattr(train_bf16_fsdp.lerobot_train, "make_pre_post_processors", fake_factory)
+    dataset_stats = {"observation.state": {"mean": torch.zeros(1)}}
+    overrides = {"device_processor": {"device": "cpu"}}
+    with train_bf16_fsdp._epoch_training_patches(
+        TrainingDuration(None, None, []), SimpleNamespace(num_processes=1)
+    ):
+        if positional:
+            result = train_bf16_fsdp.lerobot_train.make_pre_post_processors(
+                policy_cfg,
+                "lerobot/pi05_base",
+                dataset_stats=dataset_stats,
+                preprocessor_overrides=overrides,
+            )
+            assert seen["args"] == (None,)
+        else:
+            result = train_bf16_fsdp.lerobot_train.make_pre_post_processors(
+                policy_cfg,
+                pretrained_path="lerobot/pi05_base",
+                dataset_stats=dataset_stats,
+                preprocessor_overrides=overrides,
+            )
+            assert seen["args"] == ()
+            assert seen["kwargs"]["pretrained_path"] is None
+
+    assert result == (SimpleNamespace(steps=[tokenizer_step]), postprocessor)
+    assert seen["kwargs"]["dataset_stats"] is dataset_stats
+    assert seen["kwargs"]["preprocessor_overrides"] == overrides
+    assert train_bf16_fsdp._SNVLA_TOKENIZER_STEP not in overrides
+
+
+def test_processor_factory_keeps_existing_snvla_pretrained_path_and_injects_override(monkeypatch):
+    import lerobot_policy_snvla.processor_snvla as processor_snvla
+
+    monkeypatch.setattr(processor_snvla.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
+    policy_cfg = make_processor_config()
+    seen = {}
+
+    def fake_factory(inner_cfg, *args, **kwargs):
+        seen.update(policy_cfg=inner_cfg, args=args, kwargs=kwargs)
+        step_config = kwargs["preprocessor_overrides"][train_bf16_fsdp._SNVLA_TOKENIZER_STEP][
+            "config"
+        ]
+        return (
+            SimpleNamespace(
+                steps=[SNVLAPrepareTrainingTokenizerProcessorStep(config=step_config)]
+            ),
+            object(),
+        )
+
+    monkeypatch.setattr(train_bf16_fsdp.lerobot_train, "make_pre_post_processors", fake_factory)
+    dataset_stats = {"observation.state": {"mean": torch.zeros(1)}}
+    with train_bf16_fsdp._epoch_training_patches(
+        TrainingDuration(None, None, []), SimpleNamespace(num_processes=1)
+    ):
+        train_bf16_fsdp.lerobot_train.make_pre_post_processors(
+            policy_cfg,
+            pretrained_path="/raid/takenaka/snvla/checkpoints/existing/pretrained_model",
+            dataset_stats=dataset_stats,
+        )
+
+    assert seen["kwargs"]["pretrained_path"].endswith("pretrained_model")
+    assert seen["kwargs"]["dataset_stats"] is dataset_stats
+    assert (
+        seen["kwargs"]["preprocessor_overrides"][train_bf16_fsdp._SNVLA_TOKENIZER_STEP][
+            "config"
+        ]
+        is policy_cfg
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("lerobot/pi05_base", True),
+        ("lerobot/pi05_base/", False),
+        ("/tmp/lerobot/pi05_base", False),
+        (None, False),
+    ],
+)
+def test_pi05_base_processor_path_match_is_exact(path, expected):
+    assert train_bf16_fsdp._is_pi05_base_pretrained_path(path) is expected
+
+
 @pytest.mark.parametrize("form", [["--epochs=3.0"], ["--epochs", "3.0"]])
 def test_parse_training_duration_supports_equals_and_split_forms(form):
     duration = parse_training_duration([*form, "--batch_size=8"])
