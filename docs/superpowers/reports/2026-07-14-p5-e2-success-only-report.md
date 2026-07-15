@@ -1,10 +1,11 @@
 # P5-E2 success-only state-dropout report
 
-**Status:** Tasks 1–7 are complete. Task 8 is not valid: the `sr025` ablation reached step 2670, but
-the pretrained processor silently retained its saved state-dropout-disabled configuration instead
-of the active policy configuration. The run was stopped, produced no checkpoint, and must not be
-used as efficacy evidence. A scoped fail-closed processor-config reconciliation fix is implemented
-locally; no retry is claimed here.
+**Status:** Tasks 1–7 and Task 8 through its six recorded evaluations are complete. Every ablation
+evaluation completed 10 episodes/9980 recorded frames, loaded strictly once, and had zero forbidden
+load warnings and zero fatal errors. All six success rates were `0.0`. The ratio decision is
+ambiguous: `sr025` produced the only physical progress (`mean_picked=0.2`, `mean_placed=0.1`) while
+`sr050` achieved the best narration-on approach distance (`0.069459 m`). Step 4 therefore remains a
+user decision, and Task 9 production training is blocked pending that choice.
 
 ## Objective and decisions
 
@@ -94,9 +95,12 @@ Partial loading, warning suppression, and `strict=False` are not acceptable subs
 
 ## Known limitations and unexecuted work
 
-- One success-only smoke attempt failed before checkpoint loading or training. No successful smoke,
-  ablation, production training, or final evaluation has run. The local compatibility fix and
-  regenerated artifacts are not yet on DGX; retry only after resync and remote validation.
+- The first success-only smoke attempt failed before checkpoint loading or training. It remains
+  preserved as failure evidence, but a fresh smoke retry and all three 3.0-epoch ablations later
+  completed successfully after the visual-stats and processor-configuration fixes were synced.
+- Task 8 checkpoint transfer and all six recorded 10-episode evaluations completed, but they do not
+  identify an unambiguous efficacy winner. No production dropout ratio is claimed.
+- Task 9 production training and final recorded 30-on/30-off evaluation have not run.
 - The DGX code destination is an rsynced working directory without `.git`, so this report does not
   claim a DGX branch or commit identity. The hashes below describe the historical pre-fix Task 7
   transfer, not the current zero-count-placeholder implementation or regenerated local artifacts.
@@ -261,8 +265,9 @@ The regenerated local artifacts retain 144,170 frames and unchanged action-stat 
 | shared `meta/stats.json` | `801ddbba8a58b666b70c7bc8c434c3ff194545ac791ae34f86e55059d964c975` |
 
 At the time this first-failure evidence was recorded, the fixed artifacts and code had not yet been
-synced to DGX and no retry had run. The following section records the later, separate ablation
-failure.
+synced to DGX. They were subsequently synced and the successful smoke retry recorded below was run
+as a fresh job; the failed output is not counted as a successful smoke. The following section first
+retains the separate invalid ablation evidence.
 
 ## Invalid `sr025` ablation — stale pretrained processor configuration
 
@@ -290,31 +295,91 @@ padding, text-loss cap, and narration loss weight against the active configurati
 scoped to SNVLA and is covered by a stale serialized-preprocessor regression plus real
 epoch-annotated batch conversion.
 
-Before any DGX retry, local review also found that the original epoch annotation hook only activated
+Before the DGX retries, local review also found that the original epoch annotation hook only activated
 for `--epochs`. The 100-step smoke uses `--steps=100`; after enabling the corrected processor config,
 that path would have failed immediately because `training_epoch` was absent. The entrypoint now
 computes the annotation epoch length from the selected dataset, distributed world size, and batch
 size for step-based SNVLA training when state dropout is enabled. It retains the requested
 `steps`/`save_freq`, does not publish requested-epoch metrics, and restores the saved epoch plus
 within-epoch offset on resume. Step-based non-SNVLA and dropout-disabled training retain LeRobot's
-original cycle. This correction has only been verified locally; no DGX retry is claimed.
+original cycle. The corrected path was subsequently exercised by the successful smoke and ablation
+runs below.
 
-## Pending Task 8 — resync, smoke retry, and fixed efficacy gate
+## Completed Task 8 training gate — smoke retry and fixed ablations
 
-1. Sync the fixed code and regenerated augmented metadata/data to DGX, verify hashes and portable
-   validation, then run a fresh 100-step W&B smoke on GPUs 2,3 at ratio `0.25` using the manifest IDs.
-   Do not treat the failed W&B run as a successful smoke. Require exact loader gates,
-   finite grouped losses, no OOM/runtime warning, and epoch-0 dropout fraction `0.0`.
-2. From the same checkpoint and identical configuration, run ratios `0.0`, `0.25`, and `0.50` for
-   exactly `--epochs=3.0`, saving at `--save-every-epochs=3.0`, under the three specified
-   `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_ablation_srTAG` roots.
-3. Load each final ablation checkpoint strictly and record 10 narration-on plus the same 10
-   narration-off episodes, seed `12000000`, `n_action_steps=10`.
-4. Record W&B URLs, calculated steps, checkpoint paths, loader evidence, false completion counters,
-   picked/placed/success, minimum distance, and the selection rationale. If the winner is ambiguous,
-   stop for user direction.
+After syncing the zero-count visual-stat placeholders and the authoritative pretrained-processor
+configuration reconciliation (`70f81578075abf930ebe644b627d2deb951e3563`), the fresh 100-step
+`sr025` smoke retry completed on DGX GPUs 2,3 with W&B enabled. It reached 100/100 steps, printed
+`All keys loaded successfully!` on both ranks, kept epoch-0 dropout at `0.0`, produced finite
+grouped losses, and completed without `Warning: Could not load state dict`, OOM, or traceback. Its
+checkpoint at
+`/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_smoke_sr025/checkpoints/000100/pretrained_model`
+also passed strict reload. W&B run
+[`p5e2-success200-smoke-h10-sd025-r1`](https://wandb.ai/0xnoy-tamagawa-university/snvla-p5/runs/p5e2-success200-smoke-h10-sd025-r1)
+finished normally. The DGX log is `/tmp/p5e2_task8_smoke_sr025_r1.log` with SHA-256
+`3294beac55f1040dc7e3a1a7d8d2b6d9b206eace69956f3fe0dc52d5389ebd89`. Two normal vision
+embedding-handling warnings were present, but neither was the forbidden state-dict warning. This
+successful retry is distinct from the preserved initial visual-stats failure described above.
 
-## Pending Task 9 — production and final recorded evaluation
+All three fixed ablations then used the same P2 initialization checkpoint, 50 manifest episode IDs,
+seed `20260714`, state-dropout seed `20260714`, and all other model/training settings. Only the
+dropout ratio, output root, and W&B run ID differed. Each calculated `6507` total steps and save
+frequency from `2169` steps/epoch, exited 0 at 3.0 epochs, emitted the exact strict-load success
+phrase twice, and passed a strict reload of its saved checkpoint. All logged losses were finite;
+none contained the forbidden load warning, OOM, or traceback.
+
+| Ratio | Valid W&B run | Dropout evidence | Final checkpoint | DGX log / SHA-256 |
+|---|---|---|---|---|
+| `0.0` (`sr000`) | [p5e2-success200-ablation-h10-sd000](https://wandb.ai/0xnoy-tamagawa-university/snvla-p5/runs/p5e2-success200-ablation-h10-sd000) | `0.0` throughout all epochs | `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_ablation_sr000/checkpoints/006507/pretrained_model` | `/tmp/p5e2_task8_ablation_sr000.log` / `e938732d12735686a354c30ded393bff565ce8c9d0fe762ed6750840f38293f6` |
+| `0.25` (`sr025-r1`) | [p5e2-success200-ablation-h10-sd025-r1](https://wandb.ai/0xnoy-tamagawa-university/snvla-p5/runs/p5e2-success200-ablation-h10-sd025-r1) | epoch 0 `0.0`; epochs 1–2 observed `0.21..0.35`, with nonzero state-present and state-dropped losses | `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_ablation_sr025/checkpoints/006507/pretrained_model` | `/tmp/p5e2_task8_ablation_sr025_r1.log` / `fd69b7f668d517c7db1b7204b6bf41769dbf3156f46570cf5a56a2ab73ca53ef` |
+| `0.50` (`sr050`) | [p5e2-success200-ablation-h10-sd050](https://wandb.ai/0xnoy-tamagawa-university/snvla-p5/runs/p5e2-success200-ablation-h10-sd050) | epoch means `0.000000`, `0.496088`, `0.499431` | `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_ablation_sr050/checkpoints/006507/pretrained_model` | `/tmp/p5e2_task8_ablation_sr050.log` / `0cdbc19d2205a6f2eaecf0887ec72bfcb9cec9cdaabef28d7267f712a5494f60` |
+
+The `sr050` final `pretrained_model` contains seven files; its `model.safetensors` is
+8,287,004,280 bytes. Its final total loss was approximately `0.053`. The valid `sr025-r1` root also
+contains `checkpoints/006507/pretrained_model` and `checkpoints/last/pretrained_model`. The original
+stopped `sr025` run and W&B record remain preserved but must never be substituted for `sr025-r1`.
+
+## Completed Task 8 recorded evaluation; ratio decision pending
+
+The three final checkpoints were transferred to
+`/home/noy/checkpoints/p5e2/ablation_srTAG/pretrained_model` and evaluated locally with
+`n_action_steps=10` and three blocks. All six valid runs used environment seeds
+`12000000..12000009`; each printed
+`All keys loaded successfully!` exactly once and recorded 10 episodes/9980 frames. Each valid log
+has `Warning: Could not load state dict` count 0, case-insensitive `fatal` count 0, and traceback
+count 0.
+
+| Ratio/mode | Success | Mean picked / placed / count error | False pick / place / task-completed | Mean minimum EEF-object distance (m) | Gates strict / forbidden / fatal | JSON / SHA-256 | Record root | Log / SHA-256 |
+|---|---:|---:|---:|---:|---:|---|---|---|
+| `sr000` on | `0.0` | `0.0 / 0.0 / 3.0` | `27 / 17 / 1` | `0.0770309463` | `1 / 0 / 0` | `outputs/p5e2_ablation_sr000_narration_on.json` / `a01a5e6d867c17fc983739ed2b74951540db08f88bbf91fcff8d045997db61bb` | `/home/noy/datasets/p5e2_ablation_sr000_narration_on` | `/home/noy/logs/p5e2/p5e2_ablation_sr000_narration_on.log` / `f5eab069186cec39bfcc938850668a2e3506ef74bfce7e7b5c04484a55865e27` |
+| `sr000` off | `0.0` | `0.0 / 0.0 / 3.0` | `0 / 0 / 0` | `0.2329705563` | `1 / 0 / 0` | `outputs/p5e2_ablation_sr000_narration_off.json` / `fd77e1b07217c56430ce06c4783d2b8d10988a014d9935321ced79d075c53045` | `/home/noy/datasets/p5e2_ablation_sr000_narration_off` | `/home/noy/logs/p5e2/p5e2_ablation_sr000_narration_off.log` / `f42d2978fa9529b542d7b1b3d283f9cb1ad02339fd60658de0ba96ef2868abc9` |
+| `sr025` on | `0.0` | `0.2 / 0.1 / 2.9` | `19 / 14 / 1` | `0.0927951188` | `1 / 0 / 0` | `outputs/p5e2_ablation_sr025_narration_on.json` / `5eba7a1123df5c0c63f192d8bf0d5a6a1f03c30a95f1dfe15c43098e1e644121` | `/home/noy/datasets/p5e2_ablation_sr025_narration_on` | `/home/noy/logs/p5e2/p5e2_ablation_sr025_narration_on_r1.log` / `4e6c9c86bc9defa652e0de0e2ad8d87e4a2257d9a273bf723b8c2984bdc6508c` |
+| `sr025` off | `0.0` | `0.0 / 0.0 / 3.0` | `0 / 0 / 0` | `0.1775123928` | `1 / 0 / 0` | `outputs/p5e2_ablation_sr025_narration_off.json` / `5d25abc0806d97a05ee87ff54dd929e96e2e93463e6c89135edc014d1b4534b6` | `/home/noy/datasets/p5e2_ablation_sr025_narration_off` | `/home/noy/logs/p5e2/p5e2_ablation_sr025_narration_off.log` / `0e95a1e474568d487829c1b3e040bdb55acf8cac567bb1ddf924774b59075cc8` |
+| `sr050` on | `0.0` | `0.0 / 0.0 / 3.0` | `21 / 14 / 1` | `0.0694590227` | `1 / 0 / 0` | `outputs/p5e2_ablation_sr050_narration_on.json` / `ad8781b5b328e98a5306cc8b0fa2a250bb80425c7af4a86ab0efc485f61c9999` | `/home/noy/datasets/p5e2_ablation_sr050_narration_on` | `/home/noy/logs/p5e2/p5e2_ablation_sr050_narration_on.log` / `84f2b7111c11de7c14149786dcacb10156ada7f5713f57d784e965acc3d27d03` |
+| `sr050` off | `0.0` | `0.0 / 0.0 / 3.0` | `0 / 0 / 0` | `0.2108056777` | `1 / 0 / 0` | `outputs/p5e2_ablation_sr050_narration_off.json` / `6b64d2ee13420837053d778f69481628dd73a573c14ac2d4a4700ee06f9309e1` | `/home/noy/datasets/p5e2_ablation_sr050_narration_off` | `/home/noy/logs/p5e2/p5e2_ablation_sr050_narration_off.log` / `123637a46718cac8270cafc6d85909b42f21f7251459273f4b5b36a0eb791cb6` |
+
+The first `sr025` narration-on inference attempt loaded strictly, then failed before an episode with
+`ValueError: 'index' not found in complementary data for state dropout.` Its failed log is
+`/home/noy/logs/p5e2/p5e2_ablation_sr025_narration_on.log`, SHA-256
+`8b6ad9024cb46a7864350d0c8f67e5a86d23cc5a781852e980f42345e93b7556`. Commit
+`fec029366ae3739e92743a3e0dcc381e8ceea99b` disables the checkpoint's training-only state dropout
+during inference, supplies the active inference config to the processor, and fail-closed checks
+that training/dropout state was not retained. The `sr025` narration-on row above is the clean retry.
+
+The environment-seed sequence is paired across all six runs, but the evaluation CLI does not
+explicitly seed PyTorch's action-sampling RNG. Consequently these results align simulator initial
+conditions but are not guaranteed to use identical stochastic action draws across ratios/modes;
+that is a comparison caveat, not evidence of a deterministic paired-policy trial.
+
+No ratio wins every gate. `sr025` is the only checkpoint to pick or place anything, whereas `sr050`
+has the best narration-on minimum distance; all variants have zero task successes and all
+narration-on variants emit false completion events. Task 8 Step 3 is complete, but Step 4 and Task 9
+are blocked pending the user's explicit ratio choice. Evaluation JSON under `outputs/`, recordings,
+logs, and checkpoints remain outside the commit scope.
+
+## Blocked Task 9 — production and final recorded evaluation
+
+Task 9 must not start until the user selects a ratio from the ambiguous Task 8 evidence.
 
 1. With the user-approved Task 8 ratio and all 180 manifest train IDs, run DGX production at
    `--epochs=16.0 --save-every-epochs=2.0`. Save epochs 2, 4, 6, 8, 10, 12, 14, and 16 below

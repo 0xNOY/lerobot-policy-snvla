@@ -516,7 +516,7 @@ and this active-plan checkbox update; never commit dataset files or `outputs/`.
 **Files:**
 - Modify: `docs/superpowers/reports/2026-07-14-p5-e2-success-only-report.md`
 
-- [ ] **Step 1: Run the 100-step integration smoke test**
+- [x] **Step 1: Run the 100-step integration smoke test**
 
 On DGX set `CUDA_VISIBLE_DEVICES=2,3`, `SNVLA_REQUIRE_WANDB=1`, use bf16 FULL_SHARD, fixed padding
 256, max dimensions 32/32, and `n_action_steps=10`. Use `--steps=100` and
@@ -563,7 +563,7 @@ SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_s
 Require the exact `All keys loaded successfully!` message from both ranks, a W&B URL, finite grouped
 losses, no `Warning: Could not load state dict`, no OOM, and realized epoch-0 dropout fraction 0.0.
 
-- [ ] **Step 2: Run three 3.0-epoch ablations from the same checkpoint**
+- [x] **Step 2: Run three 3.0-epoch ablations from the same checkpoint**
 
 Use manifest ablation episode IDs and identical seed/config. Run ratios `0.0`, `0.25`, `0.50` with
 `--epochs=3.0`. Save only below:
@@ -589,7 +589,7 @@ and final save frequency before training.
 
 Enable W&B for all three and confirm no frame has adjacent-epoch dropout in logged audit counters.
 
-- [ ] **Step 3: Transfer final ablation checkpoints locally and evaluate**
+- [x] **Step 3: Transfer final ablation checkpoints locally and evaluate**
 
 For each ratio, require `All keys loaded successfully!`, then run narration-on and narration-off for
 10 identical-seed episodes with `n_action_steps=10`. Transfer each final model to
@@ -617,10 +617,21 @@ if loading prints `Warning: Could not load state dict`. Record false completion 
 placed, success, and minimum distance. If the preferred ratio is not unambiguous, stop for user
 direction.
 
-- [ ] **Step 4: Record and commit the gate decision**
+- [ ] **Step 4: Record and commit the gate decision — blocked pending user ratio choice**
 
 Append W&B URLs, exact epoch/step counts, checkpoint paths, load evidence, evaluation JSON paths,
 and selection rationale. Do not commit evaluation recordings or `outputs/`.
+
+Step 3 completed for all six ratio/mode runs: each produced 10 episodes/9980 recorded frames,
+strict-load count 1, forbidden-warning count 0, and fatal count 0, using aligned environment seeds
+`12000000..12000009`. The CLI does not explicitly seed PyTorch's action-sampling RNG, so simulator
+initial conditions are paired but stochastic action draws are not guaranteed to be. All success
+rates were 0. `sr025` narration-on alone showed physical progress (`mean_picked=0.2`,
+`mean_placed=0.1`), while `sr050` narration-on had the best approach distance (`0.069459 m`); the
+choice is therefore ambiguous and Task 9 must not start without user direction. The full metric,
+JSON/log SHA-256, and recording-path table is in the report. The initial `sr025` narration-on
+inference failed because checkpoint training dropout remained active; `fec0293` fixed it and the
+clean retry is the reported result. Keep `outputs/`, recordings, logs, and checkpoints uncommitted.
 
 ---
 
