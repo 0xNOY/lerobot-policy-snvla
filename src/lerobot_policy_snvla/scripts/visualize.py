@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -16,8 +17,59 @@ import matplotlib.pyplot as plt
 import numpy as np
 from huggingface_hub.errors import HFValidationError
 from matplotlib.gridspec import GridSpec
+from matplotlib.offsetbox import AnnotationBbox, HPacker, TextArea, VPacker
+from matplotlib.patches import FancyBboxPatch
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+
+def _context_text_box(change_additions, fontsize=9):
+    """Build multiline context with separately styled inline change markers."""
+    rows = [[]]
+    for change_number, addition in change_additions:
+        rows[-1].append(
+            TextArea(
+                str(change_number),
+                textprops={
+                    "fontsize": fontsize - 1,
+                    "fontweight": "bold",
+                    "color": "navy",
+                    "bbox": {
+                        "boxstyle": "round,pad=0.2",
+                        "facecolor": "white",
+                        "edgecolor": "navy",
+                        "linewidth": 1,
+                    },
+                },
+            )
+        )
+        parts = addition.split("\n")
+        for part_index, part in enumerate(parts):
+            if part:
+                rows[-1].append(TextArea(part, textprops={"fontsize": fontsize}))
+            if part_index < len(parts) - 1:
+                rows.append([])
+
+    packed_rows = [
+        HPacker(
+            children=row or [TextArea("", textprops={"fontsize": fontsize})],
+            align="baseline",
+            pad=0,
+            sep=3,
+        )
+        for row in rows
+    ]
+    return VPacker(children=packed_rows, align="center", pad=0, sep=4)
+
+
+class _CanvasFFMpegWriter(animation.FFMpegWriter):
+    """Write the already-rendered Agg canvas without rendering it a second time."""
+
+    def grab_frame(self, **savefig_kwargs):
+        if savefig_kwargs:
+            raise TypeError("_CanvasFFMpegWriter does not accept savefig options")
+        rgba = memoryview(self.fig.canvas.buffer_rgba()).cast("B")
+        self._proc.stdin.write(rgba)
 
 
 def extract_episode_data(dataset, episode_idx=0):
@@ -49,18 +101,18 @@ def extract_episode_data(dataset, episode_idx=0):
         for key in camera_keys:
             if key in frame:
                 image = frame[key].numpy().transpose(1, 2, 0)
-                # 正規化された画像を0-1範囲に調整
-                image = np.clip(image, 0, 1) if image.max() <= 1.0 else np.clip(image / 255.0, 0, 1)
-
-                # Pillowでリサイズ（cv2を使わないことでQtプラグイン問題を回避）
-                # PILはuint8を期待するため、0-1 floatを255でスケールしてから変換
+                # Keep frames as uint8.  Matplotlib accepts uint8 directly and
+                # this cuts the camera-frame memory traffic to one quarter.
                 if np.issubdtype(image.dtype, np.floating):
-                    pil_img = Image.fromarray((image * 255.0).astype(np.uint8))
+                    scale = 255.0 if image.max() <= 1.0 else 1.0
+                    image = np.clip(image * scale, 0, 255).astype(np.uint8)
                 else:
-                    pil_img = Image.fromarray(image.astype(np.uint8))
+                    image = np.clip(image, 0, 255).astype(np.uint8, copy=False)
 
+                # Pillow avoids OpenCV/Qt plugin conflicts in headless runs.
+                pil_img = Image.fromarray(image)
                 pil_img = pil_img.resize((224, 224), Image.BILINEAR)
-                image = np.array(pil_img).astype(np.float32) / 255.0
+                image = np.asarray(pil_img)
                 camera_frames[key].append(image)
 
         # previous_narrationsをデシリアライズ
@@ -104,7 +156,9 @@ def extract_episode_data(dataset, episode_idx=0):
     }
 
 
-def visualize_episode_with_narrations(dataset, episode_idx=0, output_path=None, interval=50):
+def visualize_episode_with_narrations(
+    dataset, episode_idx=0, output_path=None, interval=50, encoder_preset="veryfast"
+):
     """
     エピソードをナレーション付きで可視化
 
@@ -130,6 +184,24 @@ def visualize_episode_with_narrations(dataset, episode_idx=0, output_path=None, 
         if text != prev_text:
             previous_narrations_changes.append({"frame": i, "timestamp": data["timestamps"][i], "text": text})
             prev_text = text
+    context_change_frames = np.array(
+        [change["frame"] for change in previous_narrations_changes], dtype=np.int64
+    )
+    context_additions = []
+    context_additions_by_change = []
+    previous_context = ""
+    for change_number, change in enumerate(previous_narrations_changes, start=1):
+        context = change["text"]
+        if context.startswith(previous_context):
+            addition = context[len(previous_context) :]
+        else:
+            # Context is normally append-only.  If a producer replaces it,
+            # still preserve the new value and clearly mark the replacement.
+            addition = context
+            context_additions = []
+        context_additions.append((change_number, addition))
+        context_additions_by_change.append(list(context_additions))
+        previous_context = context
 
     print(f"Found {num_cameras} cameras")
     print(f"Found {len(data['narration_events'])} narration events")
@@ -137,27 +209,121 @@ def visualize_episode_with_narrations(dataset, episode_idx=0, output_path=None, 
     print(f"State data: {'Yes' if has_state else 'No'}")
     print(f"Action data: {'Yes' if has_action else 'No'}")
 
-    # レイアウトを作成（previous_narrations表示用に5行に拡張）
+    # Keep the cameras and the full context together at the top.  A larger
+    # vertical gap between the chart rows prevents x labels from colliding
+    # with the title of the chart below.
     fig = plt.figure(figsize=(16, 12))
-    gs = GridSpec(5, num_cameras, figure=fig, hspace=0.4, wspace=0.2)
+    gs = GridSpec(
+        4,
+        1,
+        figure=fig,
+        height_ratios=[2.4, 1, 0.34, 1],
+        hspace=0.82,
+        top=0.9,
+        bottom=0.07,
+        left=0.08,
+        right=0.96,
+    )
+
+    # Insert the context column between the two cameras.  For datasets with a
+    # different number of cameras it is placed near the center of the row.
+    context_column = max(1, num_cameras // 2) if num_cameras else 0
+    top_width_ratios = [1.0] * (num_cameras + 1)
+    top_width_ratios[context_column] = 1.75
+    top_gs = gs[0].subgridspec(1, num_cameras + 1, width_ratios=top_width_ratios, wspace=0.035)
 
     # カメラ画像用のサブプロット
     camera_axes = []
     camera_images = []
     for i, key in enumerate(camera_keys):
-        ax = fig.add_subplot(gs[0:2, i])
+        column = i if i < context_column else i + 1
+        ax = fig.add_subplot(top_gs[0, column])
         ax.set_title(f"{key}", fontsize=10, fontweight="bold")
         ax.axis("off")
+        ax.set_anchor("E" if column < context_column else "W")
 
         # 初期画像を表示
         im = ax.imshow(data["camera_frames"][key][0])
         camera_axes.append(ax)
         camera_images.append(im)
 
+    # Full, non-truncated previous_narrations text between the camera images.
+    context_ax = fig.add_subplot(top_gs[0, context_column])
+    context_ax.set_title("Previous Context", fontsize=10, fontweight="bold", pad=8)
+    context_ax.axis("off")
+    context_ax.add_patch(
+        FancyBboxPatch(
+            (0.015, 0.06),
+            0.97,
+            0.86,
+            transform=context_ax.transAxes,
+            boxstyle="round,pad=0.012",
+            facecolor="lightblue",
+            edgecolor="0.3",
+            alpha=0.7,
+        )
+    )
+    legend_box = HPacker(
+        children=[
+            TextArea(
+                "N",
+                textprops={
+                    "fontsize": 8,
+                    "fontweight": "bold",
+                    "color": "navy",
+                    "bbox": {
+                        "boxstyle": "round,pad=0.2",
+                        "facecolor": "white",
+                        "edgecolor": "navy",
+                        "linewidth": 1,
+                    },
+                },
+            ),
+            TextArea(
+                "context-change timing", textprops={"fontsize": 9, "fontstyle": "italic", "color": "navy"}
+            ),
+        ],
+        align="center",
+        pad=0,
+        sep=5,
+    )
+    context_ax.add_artist(
+        AnnotationBbox(
+            legend_box,
+            (0.5, 0.86),
+            xycoords=context_ax.transAxes,
+            frameon=False,
+            box_alignment=(0.5, 0.5),
+        )
+    )
+
+    context_boxes = []
+    for additions in context_additions_by_change:
+        context_box = AnnotationBbox(
+            _context_text_box(additions),
+            (0.5, 0.45),
+            xycoords=context_ax.transAxes,
+            frameon=False,
+            box_alignment=(0.5, 0.5),
+        )
+        context_box.set_visible(False)
+        context_ax.add_artist(context_box)
+        context_boxes.append(context_box)
+
+    context_none_text = context_ax.text(
+        0.5,
+        0.45,
+        "(none)",
+        transform=context_ax.transAxes,
+        ha="center",
+        va="center",
+        fontsize=9,
+    )
+
     # ナレーションタイムライン（current_narration用）
-    narration_ax = fig.add_subplot(gs[2, :])
-    narration_ax.set_title("Current Narration Timeline", fontsize=10, fontweight="bold")
-    narration_ax.set_xlabel("Time (s)")
+    narration_ax = fig.add_subplot(gs[1])
+    narration_ax.set_title("Current Narration Timeline", fontsize=10, fontweight="bold", pad=8)
+    narration_ax.set_xlabel("Time (s)", labelpad=5)
     narration_ax.set_xlim(0, data["timestamps"][-1])
     narration_ax.set_ylim(-0.5, len(data["narration_events"]) + 0.5)
     narration_ax.set_yticks([])
@@ -181,9 +347,9 @@ def visualize_episode_with_narrations(dataset, episode_idx=0, output_path=None, 
     narration_ax.legend(loc="upper right")
 
     # Previous Narrationsタイムライン（区間として表示）
-    prev_narration_ax = fig.add_subplot(gs[3, :])
-    prev_narration_ax.set_title("Previous Narrations (Context History)", fontsize=10, fontweight="bold")
-    prev_narration_ax.set_xlabel("Time (s)")
+    prev_narration_ax = fig.add_subplot(gs[2])
+    prev_narration_ax.set_title("Context History Timeline", fontsize=10, fontweight="bold", pad=8)
+    prev_narration_ax.set_xlabel("Time (s)", labelpad=5)
     prev_narration_ax.set_xlim(0, data["timestamps"][-1])
     prev_narration_ax.set_ylim(0, 1)
     prev_narration_ax.set_yticks([])
@@ -201,41 +367,14 @@ def visualize_episode_with_narrations(dataset, episode_idx=0, output_path=None, 
         # 区間を色付きで表示
         prev_narration_ax.axvspan(start_time, end_time, alpha=0.3, color=colors[i])
 
-        # テキストを表示（短縮版）
-        text_content = change["text"][:50] + "..." if len(change["text"]) > 50 else change["text"]
-        if text_content:  # 空でない場合のみ表示
-            mid_time = (start_time + end_time) / 2
-            prev_narration_ax.text(
-                mid_time,
-                0.5,
-                text_content,
-                rotation=0,
-                verticalalignment="center",
-                horizontalalignment="center",
-                fontsize=7,
-                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8, "edgecolor": colors[i]},
-            )
-
     # 現在時刻のマーカー
     prev_narration_line = prev_narration_ax.axvline(x=0, color="blue", linewidth=2, label="Current time")
     prev_narration_ax.legend(loc="upper right")
 
-    # 現在のprevious_narrationsを表示するテキストボックス
-    prev_narration_text = fig.text(
-        0.5,
-        0.42,
-        "",
-        ha="center",
-        va="top",
-        fontsize=8,
-        bbox={"boxstyle": "round", "facecolor": "lightblue", "alpha": 0.7},
-        wrap=True,
-    )
-
     # ロボット状態とアクションのタイムライン
-    state_ax = fig.add_subplot(gs[4, :])
-    state_ax.set_title("Robot State & Action Timeline", fontsize=10, fontweight="bold")
-    state_ax.set_xlabel("Time (s)")
+    state_ax = fig.add_subplot(gs[3])
+    state_ax.set_title("Robot State & Action Timeline", fontsize=10, fontweight="bold", pad=8)
+    state_ax.set_xlabel("Time (s)", labelpad=5)
     state_ax.set_xlim(0, data["timestamps"][-1])
 
     state_lines = []
@@ -300,17 +439,14 @@ def visualize_episode_with_narrations(dataset, episode_idx=0, output_path=None, 
 
         # 現在のprevious_narrationsテキストを更新
         current_prev_narrations = data["previous_narrations_per_frame"][frame_idx]
+        for context_box in context_boxes:
+            context_box.set_visible(False)
         if current_prev_narrations:
-            # テキストを適切な長さで折り返し
-            max_length = 150
-            display_text = (
-                current_prev_narrations[:max_length] + "..."
-                if len(current_prev_narrations) > max_length
-                else current_prev_narrations
-            )
-            prev_narration_text.set_text(f"Previous Context: {display_text}")
+            current_change_number = np.searchsorted(context_change_frames, frame_idx, side="right")
+            context_boxes[current_change_number - 1].set_visible(True)
+            context_none_text.set_visible(False)
         else:
-            prev_narration_text.set_text("Previous Context: (none)")
+            context_none_text.set_visible(True)
 
         # 状態とアクションのタイムラインを更新
         state_line.set_xdata([current_time, current_time])
@@ -325,27 +461,71 @@ def visualize_episode_with_narrations(dataset, episode_idx=0, output_path=None, 
 
         return (
             camera_images
-            + [narration_line, prev_narration_line, state_line, title_text, prev_narration_text]
+            + [
+                narration_line,
+                prev_narration_line,
+                state_line,
+                title_text,
+                context_none_text,
+            ]
+            + context_boxes
             + state_lines
             + action_lines
         )
 
-    # アニメーションを作成
-    print(f"Creating animation with {data['num_frames']} frames...")
-    anim = animation.FuncAnimation(
-        fig, update, frames=data["num_frames"], interval=interval, blit=False, repeat=True
-    )
-
     if output_path:
         print(f"Saving animation to {output_path}...")
-        writer = animation.FFMpegWriter(fps=data["fps"], bitrate=5000)
-        anim.save(output_path, writer=writer)
-        print(f"Animation saved to {output_path}")
+        # FuncAnimation.save() calls Figure.savefig() for every frame, which
+        # redraws all static axes, labels and narration annotations.  Agg
+        # blitting lets us draw those once and only redraw changing artists.
+        dynamic_artists = update(0)
+        for artist in dynamic_artists:
+            artist.set_animated(True)
+
+        writer = _CanvasFFMpegWriter(fps=data["fps"], bitrate=5000, extra_args=["-preset", encoder_preset])
+        started_at = time.perf_counter()
+        with writer.saving(fig, output_path, dpi=fig.dpi):
+            fig.canvas.draw()
+            background = fig.canvas.copy_from_bbox(fig.bbox)
+
+            # Context changes only a handful of times per episode.  Cache the
+            # rendered panel for each state so its nested text boxes do not
+            # need to be laid out and drawn on every video frame.
+            context_artists = [context_none_text, *context_boxes]
+            context_artist_ids = {id(artist) for artist in context_artists}
+            context_regions = []
+            for cached_artist in context_artists:
+                for artist in context_artists:
+                    artist.set_visible(artist is cached_artist)
+                fig.canvas.restore_region(background)
+                fig.draw_artist(cached_artist)
+                context_regions.append(fig.canvas.copy_from_bbox(context_ax.bbox))
+
+            for frame_idx in range(data["num_frames"]):
+                fig.canvas.restore_region(background)
+                context_state = np.searchsorted(context_change_frames, frame_idx, side="right")
+                fig.canvas.restore_region(context_regions[context_state])
+                for artist in update(frame_idx):
+                    if id(artist) not in context_artist_ids:
+                        fig.draw_artist(artist)
+                fig.canvas.blit(fig.bbox)
+                writer.grab_frame()
+
+                if (frame_idx + 1) % 100 == 0 or frame_idx + 1 == data["num_frames"]:
+                    print(f"Rendered {frame_idx + 1}/{data['num_frames']} frames", flush=True)
+
+        elapsed = time.perf_counter() - started_at
+        print(f"Animation saved to {output_path} in {elapsed:.1f}s")
+        plt.close(fig)
+        return None
     else:
+        print(f"Creating animation with {data['num_frames']} frames...")
+        anim = animation.FuncAnimation(
+            fig, update, frames=data["num_frames"], interval=interval, blit=False, repeat=True
+        )
         print("Displaying interactive animation (close window to exit)...")
         plt.show()
-
-    return anim
+        return anim
 
 
 def main():
@@ -354,6 +534,12 @@ def main():
     parser.add_argument("--episode-idx", type=int, default=0, help="Episode index to visualize")
     parser.add_argument("--output", type=str, default=None, help="Output video path (e.g., output.mp4)")
     parser.add_argument("--interval", type=int, default=50, help="Frame interval in milliseconds")
+    parser.add_argument(
+        "--encoder-preset",
+        default="veryfast",
+        choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
+        help="FFmpeg x264 speed/size tradeoff used for video output (default: veryfast)",
+    )
     args = parser.parse_args()
 
     try:
@@ -364,7 +550,11 @@ def main():
         dataset = LeRobotDataset(dataset_repo_id, root=dataset_root, revision="main")
 
     visualize_episode_with_narrations(
-        dataset, episode_idx=args.episode_idx, output_path=args.output, interval=args.interval
+        dataset,
+        episode_idx=args.episode_idx,
+        output_path=args.output,
+        interval=args.interval,
+        encoder_preset=args.encoder_preset,
     )
 
 
