@@ -1,10 +1,11 @@
 # P5-E2 success-only state-dropout report
 
-**Status:** Tasks 1–7 and Task 8 through its six recorded evaluations are complete. Every ablation
-evaluation completed 10 episodes/9980 recorded frames, loaded strictly once, and had zero forbidden
-load warnings and zero fatal errors. All six success rates were `0.0`. The ratio decision is
-ambiguous: `sr025` produced the only physical progress (`mean_picked=0.2`, `mean_placed=0.1`) while
-`sr050` achieved the best narration-on approach distance (`0.069459 m`). Step 4 therefore remains a
+**Status:** Tasks 1–7 and Task 8 through its six unseen-scene and six teacher-scene recorded
+evaluations are complete. Every evaluation completed 10 episodes/9980 recorded frames, loaded
+strictly once, and had zero forbidden load warnings and zero fatal errors. All twelve success rates
+were `0.0`. On the teacher scenes, `sr025` produced the most physical progress
+(`mean_picked=mean_placed=0.3`), while `sr050` had a slightly better narration-on approach distance
+(`0.073743 m`) and no false task-completed event. The ratio decision remains ambiguous; Step 4 is a
 user decision, and Task 9 production training is blocked pending that choice.
 
 ## Objective and decisions
@@ -41,6 +42,7 @@ The 2026-07-13 corrective plan is canceled and archival only.
 | 4 | `37ea2f25cf3b9deac402a556df4fca0d780dae24` | `feat(train): support deterministic float epoch training` | Float epoch-to-step conversion and epoch annotation |
 | 5 | `1aad43243d8f72667f28d0195c8332bd649ab97e` | `feat(data): prepare success-only training dataset` | Merge/validation CLI and deterministic manifest splits |
 | 7a | `a9c11b24e42290228a1af1b72ad394b941148deb` | `feat(data): trim post-completion success frames` | Atomic loader-visible trim, retained-row stats, manifest policy, and validation |
+| 8a | `cacbe32` | `perf(eval): accelerate recorded simulator rollouts` | Streamed video encoding, queued-action preprocessing fast path, explicit seed lists, and per-episode RNG seeding |
 
 ## Task 6 local verification
 
@@ -339,7 +341,7 @@ The `sr050` final `pretrained_model` contains seven files; its `model.safetensor
 contains `checkpoints/006507/pretrained_model` and `checkpoints/last/pretrained_model`. The original
 stopped `sr025` run and W&B record remain preserved but must never be substituted for `sr025-r1`.
 
-## Completed Task 8 recorded evaluation; ratio decision pending
+## Completed Task 8 unseen-scene recorded evaluation
 
 The three final checkpoints were transferred to
 `/home/noy/checkpoints/p5e2/ablation_srTAG/pretrained_model` and evaluated locally with
@@ -366,16 +368,42 @@ The first `sr025` narration-on inference attempt loaded strictly, then failed be
 during inference, supplies the active inference config to the processor, and fail-closed checks
 that training/dropout state was not retained. The `sr025` narration-on row above is the clean retry.
 
+These runs use the original evaluation seed band and are referred to below as the **unseen-scene
+evaluation**, to distinguish them from the subsequent replay of training scenes.
+
 The environment-seed sequence is paired across all six runs, but the evaluation CLI does not
 explicitly seed PyTorch's action-sampling RNG. Consequently these results align simulator initial
 conditions but are not guaranteed to use identical stochastic action draws across ratios/modes;
 that is a comparison caveat, not evidence of a deterministic paired-policy trial.
 
-No ratio wins every gate. `sr025` is the only checkpoint to pick or place anything, whereas `sr050`
-has the best narration-on minimum distance; all variants have zero task successes and all
-narration-on variants emit false completion events. Task 8 Step 3 is complete, but Step 4 and Task 9
-are blocked pending the user's explicit ratio choice. Evaluation JSON under `outputs/`, recordings,
-logs, and checkpoints remain outside the commit scope.
+## Completed Task 8 teacher-scene replay
+
+The user then requested evaluation on the same scenes used by the teacher data. The replay uses
+teacher episode IDs `[52,53,54,56,57,58,59,61,62,64]`, all from the training split, and their exact
+collector seeds `[20000003,20000004,20000005,20000007,20000008,20000009,20000010,20100001,
+20100002,20100004]`. Collector-reproduction checks confirmed the simulator frame lengths match the
+source episodes. All six runs used streaming simulator recording from `cacbe32`, completed 10
+episodes/9980 frames with two videos each, and passed gates strict/forbidden/fatal=`1/0/0`.
+
+| Ratio/mode | Success | Mean picked / placed / count error | False pick / place / task-completed | Mean minimum EEF-object distance (m) | Gates | JSON / SHA-256 | Record root | Log / SHA-256 |
+|---|---:|---:|---:|---:|---:|---|---|---|
+| `sr000` on | `0.0` | `0.1 / 0.1 / 2.9` | `23 / 18 / 3` | `0.0850254525` | `1 / 0 / 0` | `outputs/p5e2_teacher_scene_ablation_sr000_narration_on.json` / `3fbeff0e3e6510ec43c0dbe2246710f2ea9facfdee4c0392acaaa75866278469` | `/home/noy/datasets/p5e2_teacher_scene_ablation_sr000_narration_on` | `/home/noy/logs/p5e2/p5e2_teacher_scene_ablation_sr000_narration_on.log` / `8a583b5ceda9112ed3133ef963c51e91eb65e54100e40946ce383be317a346c6` |
+| `sr000` off | `0.0` | `0.0 / 0.0 / 3.0` | `0 / 0 / 0` | `0.2333330363` | `1 / 0 / 0` | `outputs/p5e2_teacher_scene_ablation_sr000_narration_off.json` / `c88809f72b9ecb1a2457532791bac92a9a20198dc2fd27452fa6fc82b9f72398` | `/home/noy/datasets/p5e2_teacher_scene_ablation_sr000_narration_off` | `/home/noy/logs/p5e2/p5e2_teacher_scene_ablation_sr000_narration_off.log` / `e70c3a12001422b36c528a3f5a94e5d2937c9c4c819daca8c6b1a88117e76195` |
+| `sr025` on | `0.0` | `0.3 / 0.3 / 2.7` | `20 / 16 / 2` | `0.0745494029` | `1 / 0 / 0` | `outputs/p5e2_teacher_scene_ablation_sr025_narration_on.json` / `008ab82daefad207c48c32bda0c18bf7c77623487e4bb5bd16f0aa9ac97ee150` | `/home/noy/datasets/p5e2_teacher_scene_ablation_sr025_narration_on` | `/home/noy/logs/p5e2/p5e2_teacher_scene_ablation_sr025_narration_on.log` / `c496d75f0e03bcc988d2591374381ff60db3e6bb3cbe181ed8de35affd820d48` |
+| `sr025` off | `0.0` | `0.0 / 0.0 / 3.0` | `0 / 0 / 0` | `0.2236012592` | `1 / 0 / 0` | `outputs/p5e2_teacher_scene_ablation_sr025_narration_off.json` / `3520455ab2552e91c675255131d39a44367b6c9c34e385bc149d48585978aeb4` | `/home/noy/datasets/p5e2_teacher_scene_ablation_sr025_narration_off` | `/home/noy/logs/p5e2/p5e2_teacher_scene_ablation_sr025_narration_off.log` / `417b3de64febd5654909578dfd0668f5de3f536bf51bc57a68b95ab76c3bd064` |
+| `sr050` on | `0.0` | `0.1 / 0.1 / 2.9` | `25 / 15 / 0` | `0.0737430974` | `1 / 0 / 0` | `outputs/p5e2_teacher_scene_ablation_sr050_narration_on.json` / `1db239af055938b542a82b1392b170e1d4a7eb0ca0affde8d51c7b996594a578` | `/home/noy/datasets/p5e2_teacher_scene_ablation_sr050_narration_on` | `/home/noy/logs/p5e2/p5e2_teacher_scene_ablation_sr050_narration_on.log` / `2686fdda51947e9a1142e435c2b9db5891c1721617990749b442c04e903283dd` |
+| `sr050` off | `0.0` | `0.0 / 0.0 / 3.0` | `0 / 0 / 0` | `0.2250278842` | `1 / 0 / 0` | `outputs/p5e2_teacher_scene_ablation_sr050_narration_off.json` / `d8f5513b3f23e3f80952fd2f0b98e3b7a5d0b4ac72cb158b23cdcf90fcdfab84` | `/home/noy/datasets/p5e2_teacher_scene_ablation_sr050_narration_off` | `/home/noy/logs/p5e2/p5e2_teacher_scene_ablation_sr050_narration_off.log` / `95e558f308b79b61f07b9fbdda48e82c90d8ccfbe8549569ce5060275985684b` |
+
+The streaming path was validated by the non-simulator suite (`170 passed`). Its warmed measured
+episode time was `43.512 s`, versus the former `81–93 s` (`1.86–2.14x` faster); the full 60-episode
+teacher-scene matrix averaged `54.43 s/episode`, including startup and recording overhead.
+
+No ratio wins every gate in either matrix. All teacher-scene and unseen-scene success rates are
+zero. `sr025` has the strongest teacher-scene physical progress (`3` picks and `3` placements over
+10 narration-on episodes), while `sr050` has a marginally better teacher-scene distance and zero
+false task-completed events. Task 8 Step 3 is complete, but Step 4 and Task 9 remain blocked pending
+the user's explicit ratio choice. Evaluation JSON under `outputs/`, recordings, logs, and
+checkpoints remain outside the commit scope.
 
 ## Blocked Task 9 — production and final recorded evaluation
 

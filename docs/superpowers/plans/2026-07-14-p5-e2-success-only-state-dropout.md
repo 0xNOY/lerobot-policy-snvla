@@ -622,7 +622,7 @@ direction.
 Append W&B URLs, exact epoch/step counts, checkpoint paths, load evidence, evaluation JSON paths,
 and selection rationale. Do not commit evaluation recordings or `outputs/`.
 
-Step 3 completed for all six ratio/mode runs: each produced 10 episodes/9980 recorded frames,
+Step 3 completed for all six **unseen-scene** ratio/mode runs: each produced 10 episodes/9980 recorded frames,
 strict-load count 1, forbidden-warning count 0, and fatal count 0, using aligned environment seeds
 `12000000..12000009`. The CLI does not explicitly seed PyTorch's action-sampling RNG, so simulator
 initial conditions are paired but stochastic action draws are not guaranteed to be. All success
@@ -632,6 +632,23 @@ choice is therefore ambiguous and Task 9 must not start without user direction. 
 JSON/log SHA-256, and recording-path table is in the report. The initial `sr025` narration-on
 inference failed because checkpoint training dropout remained active; `fec0293` fixed it and the
 clean retry is the reported result. Keep `outputs/`, recordings, logs, and checkpoints uncommitted.
+
+- [x] **Step 3b: Replay teacher-data scenes after accelerating recorded simulation**
+
+Commit `cacbe32` streams recorded simulator frames and passed 170 non-sim tests. The warmed path
+measured `43.512 s/episode` versus the former `81–93 s` (`1.86–2.14x`), and the full 60-episode
+matrix averaged `54.43 s/episode`. Replay all six ratio/mode combinations on training episode IDs
+`[52,53,54,56,57,58,59,61,62,64]` with their exact collector seeds
+`[20000003,20000004,20000005,20000007,20000008,20000009,20000010,20100001,20100002,20100004]`.
+Collector/replay frame lengths matched; each run recorded 10 episodes/9980 frames and two videos,
+with strict/forbidden/fatal gates `1/0/0`.
+
+All six teacher-scene success rates were 0. Narration-on `sr025` made the most physical progress
+(`mean_picked=mean_placed=0.3`); narration-on `sr050` had the slightly better minimum distance
+(`0.073743 m`) and no false task-completed event. The corresponding `sr025` values were
+`0.074549 m` and two false task-completed events. Thus the teacher-scene replay also leaves the
+ratio decision ambiguous. Full metrics, paths, and JSON/log SHA-256 values are in the report and
+handoff. Keep every `p5e2_teacher_scene_ablation_*` output, recording, and log uncommitted.
 
 ---
 
