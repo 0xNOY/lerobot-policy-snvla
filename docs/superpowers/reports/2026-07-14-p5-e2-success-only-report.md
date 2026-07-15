@@ -413,16 +413,38 @@ checkpoints remain outside the commit scope.
 
 The user has fixed the Task 9 production specification independently of the ambiguous Task 8 gate.
 
-1. Freshly recollect `~/datasets/t1_n3_v7_success500_part50` at seed `30000000` and
-   `~/datasets/t1_n3_v7_success500_part450` at seed `40000000`. Only
-   the initial EEF xyz is seed-randomized; after the final placed
-   ` (done)\n`, return to the fixed canonical home, emit `Task completed.\n` exactly once after
-   arrival, and retain exactly 10 fixed-home hold frames. Strictly validate the policy sidecars,
-   merge into `~/datasets/t1_n3_v7_success500` with 450/50 train/validation and 50 ablation IDs,
-   trim into `~/datasets/t1_n3_v7_success500_trim`, augment once with forward-only window 10 into
-   `~/datasets/t1_n3_v7_success500_aug_w10`, validate, and transfer to DGX. Preserve all v5/Task 8
+Preparation evidence as of the latest preflight:
+
+- v7 part50 saved `50/61` successful episodes from base seed `30000000` and part450 saved `450/545`
+  from base seed `40000000`.
+- The two strict-policy sources were integrated successfully into the raw 500-episode root
+  `~/datasets/t1_n3_v7_success500`.
+- Raw `lerobot/pi05_base` initialization was repaired by `f2a1b6a` (`fix(model): migrate pi05 base
+  checkpoints strictly`), `26acf28` (`fix(model): restore pi05 embedding key`), `b2ba2c9`
+  (`fix(train): rebuild snvla processors for pi05 base`), and `3e0f77b` (`fix(train): recognize path
+  typed pi05 base`).
+- DGX two-rank preflight r5 printed `All keys loaded successfully!` for both ranks and completed one
+  finite training step with loss `18.698`; peak GPU memory was `19.32 GB`.
+- The non-simulator suite passed `207 passed, 12 deselected`.
+
+Trim preserved `399206 -> 399206` frames because collection already met the completion contract.
+Forward-only window-10 narration augmentation completed for all 500 episodes. Local validation plus
+source audit succeeded, as did DGX portable validation after transfer. The final manifest contains
+450 train, 50 validation, and 50 ablation IDs.
+
+Production launched on 2026-07-15. W&B is online at run
+`p5e2-success500-v7-prod-h40-sd025-on025` with artifact upload disabled. The 16.0-epoch request
+resolved to 359552 steps, 22472 steps per epoch, and 44944-step checkpoint intervals. Monitoring is
+delegated to `agy` with Gemini 3.5 Flash (Medium). Strict production load and first-step metrics are
+confirmed: exact success on both ranks, step-10 loss `10.030`, gradient norm `171.500`, and memory
+`28.97 GB`, with no forbidden load warning/OOM/traceback/NaN/Inf. Epoch 0 is intentionally clean, so
+state-dropout/noise fractions are zero. A detached `p5e2-agy-monitor` session continues the
+300-minute health watch; final evaluation remains unexecuted.
+
+1. Production data preparation and transfer are complete; do not rerun them. Preserve all v5/Task 8
    data unchanged.
-2. Run all 450 train IDs for 16.0 epochs from `lerobot/pi05_base`, with `n_action_steps=40`,
+2. Continue the launched 450-train-ID run for 16.0 epochs from `lerobot/pi05_base`, with
+   `n_action_steps=40`,
    state-dropout `0.25`, and observation noise `0.25`/seed `20260715`/scale `0.0..0.5`. Save below
    `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v7_success500_prod`. Enable W&B metrics but disable
    artifacts and Hub uploads; monitor only through `agy` with Gemini 3.5 Flash (medium).

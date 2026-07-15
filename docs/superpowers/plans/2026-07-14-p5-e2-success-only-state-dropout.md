@@ -658,23 +658,46 @@ handoff. Keep every `p5e2_teacher_scene_ablation_*` output, recording, and log u
 - Modify: `docs/superpowers/reports/2026-07-12-p5-e2-report.md`
 - Modify: `docs/superpowers/plans/2026-07-13-p5-e2-handoff.md`
 
-- [ ] **Step 0: Recollect the production dataset with the completion contract**
+- [x] **Step 0: Recollect the production dataset with the completion contract**
 
-Leave the v5 dataset and all Task 8 evidence unchanged. Freshly collect
+Collection, integration, trim, augmentation, validation, and DGX transfer are complete. The v7
+part50 collector
+saved `50/61` successful episodes from base seed `30000000`; part450 saved `450/545` from base seed
+`40000000`. Their strict-policy sources were integrated successfully into the 500-episode raw root
+`$HOME/datasets/t1_n3_v7_success500`.
+
+Leave the v5 dataset and all Task 8 evidence unchanged. The completed collection used
 `$HOME/datasets/t1_n3_v7_success500_part50` with seed `30000000` and
 `$HOME/datasets/t1_n3_v7_success500_part450` with seed `40000000`. Only the initial EEF
 xyz is seed-randomized by an unrecorded pre-roll; the final target is the fixed canonical home. The
 final placed ` (done)\n` must precede the return home, `Task completed.\n` must be emitted exactly
 once only after home arrival, and exactly 10 fixed-home hold frames must follow.
 
-Strictly validate both source policy sidecars, merge only those new sources into
-`$HOME/datasets/t1_n3_v7_success500` with 450 train, 50 validation, and 50 ablation IDs, trim into
+The sources were merged only into `$HOME/datasets/t1_n3_v7_success500`, then trimmed into
 `$HOME/datasets/t1_n3_v7_success500_trim` with `--keep-following-frames 10`, augment once with
 `--window-size 10 --forward-only` into `$HOME/datasets/t1_n3_v7_success500_aug_w10`, then run
 portable validation and transfer the augmented
-root to DGX. Do not mix any v5 source into the production dataset.
+root to DGX. Do not mix any v5 source into the production dataset. The raw data already satisfied
+the 10-frame completion contract, so trim preserved `399206 -> 399206` frames. Forward-only
+window-10 augmentation completed for all 500 episodes. Local source audit and validation succeeded,
+followed by DGX portable validation. The final manifest contains 450 train, 50 validation, and 50
+ablation IDs.
 
 - [ ] **Step 1: Run production training**
+
+The upstream `lerobot/pi05_base` preflight blockers were fixed by commits `f2a1b6a` (strict raw-core
+migration), `26acf28` (non-cloning embedding-key restoration), `b2ba2c9` (fresh SNVLA processors for
+the base checkpoint), and `3e0f77b` (path-typed base recognition). DGX two-rank preflight r5 printed
+`All keys loaded successfully!` on both ranks and completed one finite step with loss `18.698` and
+peak GPU memory `19.32 GB`. The non-simulator suite passed `207 passed, 12 deselected`.
+
+Production launched on 2026-07-15 with online W&B run
+`p5e2-success500-v7-prod-h40-sd025-on025` and artifacts disabled. The resolved duration is 359552
+steps, with 22472 steps per epoch and saves every 44944 steps. Startup monitoring is delegated to
+`agy` using Gemini 3.5 Flash (Medium). `agy` confirmed exact strict-load success on both ranks, no
+forbidden load warning/OOM/traceback/NaN/Inf, and finite step-10 metrics: loss `10.030`, gradient
+norm `171.500`, and memory `28.97 GB`. State-dropout/noise fractions are zero during the intentional
+clean epoch 0. A detached `p5e2-agy-monitor` session continues the 300-minute health watch.
 
 On DGX use all 450 train episode IDs, `--epochs=16.0`, W&B metrics, and
 `CUDA_VISIBLE_DEVICES=2,3`. Use:
