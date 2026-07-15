@@ -4,6 +4,7 @@ import contextlib
 import logging
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,8 @@ class VisualizerConfig:
     animation_interval_ms: int = 1000 // 60
     timestamp_font_size: str = "14px"
     timestamp_height: int = 30
+    image_decode_batch_size: int = 32
+    image_cache_size: int = 96
 
 
 CONFIG = VisualizerConfig()
@@ -73,77 +76,107 @@ def safe_item(val):
     return val
 
 
-def load_data(dataset, episode_index):
-    """Load data for a specific episode."""
-    from_idx = dataset.meta.episodes["dataset_from_index"][episode_index]
-    to_idx = dataset.meta.episodes["dataset_to_index"][episode_index]
+def _frames_to_rgba(frames):
+    """Pack a NCHW uint8 tensor into Bokeh's vertically flipped RGBA format."""
+    frames_np = frames.detach().cpu().numpy()
+    if frames_np.ndim == 3:
+        frames_np = frames_np[None, ...]
+    if frames_np.dtype != np.uint8:
+        frames_np = np.clip(frames_np * 255, 0, 255).astype(np.uint8)
 
-    # Pre-load all data for the episode to avoid latency during interaction
-    # Note: For very large episodes, this might need optimization (lazy loading)
+    _, _, height, width = frames_np.shape
+    packed = np.empty((len(frames_np), height, width), dtype=np.uint32)
+    rgba = packed.view(np.uint8).reshape(len(frames_np), height, width, 4)
+    rgba[..., :3] = frames_np.transpose(0, 2, 3, 1)[:, ::-1]
+    rgba[..., 3] = 255
+    return packed
+
+
+class EpisodeImageLoader:
+    """Decode small chunks on demand and retain recently viewed frames."""
+
+    def __init__(self, dataset, episode_index, timestamps, batch_size, cache_size):
+        self.dataset = dataset
+        self.episode_index = episode_index
+        self.timestamps = timestamps
+        self.camera_keys = list(dataset.meta.camera_keys)
+        self.batch_size = max(1, batch_size)
+        self.cache_size = max(self.batch_size, cache_size)
+        self.cache = OrderedDict()
+
+    def __getitem__(self, frame_index):
+        if frame_index not in self.cache:
+            self._load_chunk(frame_index)
+        images = self.cache.pop(frame_index)
+        self.cache[frame_index] = images
+        return images
+
+    def _load_chunk(self, frame_index):
+        start = frame_index // self.batch_size * self.batch_size
+        stop = min(start + self.batch_size, len(self.timestamps))
+        chunk_timestamps = self.timestamps[start:stop]
+        reader = self.dataset._ensure_reader()
+        video_frames = reader._query_videos(
+            {key: chunk_timestamps for key in self.camera_keys}, self.episode_index
+        )
+        packed_frames = {key: _frames_to_rgba(video_frames[key]) for key in self.camera_keys}
+
+        for offset, index in enumerate(range(start, stop)):
+            self.cache.pop(index, None)
+            self.cache[index] = {key: packed_frames[key][offset] for key in self.camera_keys}
+        while len(self.cache) > self.cache_size:
+            self.cache.popitem(last=False)
+
+
+def load_data(dataset, episode_index, image_decode_batch_size, image_cache_size):
+    """Load lightweight episode columns and set up lazy image decoding."""
+    from_idx = int(dataset.meta.episodes["dataset_from_index"][episode_index])
+    to_idx = int(dataset.meta.episodes["dataset_to_index"][episode_index])
+    reader = dataset._ensure_reader()
+    if reader.hf_dataset is None:
+        reader.load_and_activate()
+    rows = reader.hf_dataset[from_idx:to_idx]
+
+    def values(key, default):
+        column = rows.get(key)
+        if column is None:
+            return [default] * (to_idx - from_idx)
+        return [safe_item(value) for value in column]
+
+    current_narrations = [
+        str(value).replace("\n", "<span style='color: #aaa;'>↵</span><br>")
+        for value in values("current_narration", "")
+    ]
+    previous_narrations = []
+    previous = ""
+    for narration in current_narrations:
+        previous_narrations.append(previous)
+        previous += narration
+
+    timestamp_column = rows.get("real_timestamp")
+    if timestamp_column is None:
+        timestamp_column = values("timestamp", 0.0)
+    timestamps = [float(safe_item(value)) for value in timestamp_column]
+
+    task_indices = values("task_index", 0)
+    task_instruction = "Execute the task."
+    if task_indices:
+        with contextlib.suppress(Exception):
+            task_instruction = dataset.meta.tasks.iloc[int(task_indices[0])].name
+
     data = {
         "index": np.arange(to_idx - from_idx),
-        "prob_bon": [],
-        "prob_boa": [],
-        "current_narration": [],
-        "previous_narrations": [],
-        "images": {},  # key: list of rgba arrays
-        "timestamp": [],
-        "task_instruction": "",
+        "prob_bon": [float(value) for value in values("prob_bon", 0.0)],
+        "prob_boa": [float(value) for value in values("prob_boa", 0.0)],
+        "current_narration": current_narrations,
+        "previous_narrations": previous_narrations,
+        "timestamp": timestamps,
+        "task_instruction": task_instruction,
     }
-
-    # Get task instruction from the first frame of the episode
-    first_frame = dataset[from_idx]
-    if "task" in first_frame:
-        data["task_instruction"] = first_frame["task"]
-    elif "language_instruction" in first_frame:
-        data["task_instruction"] = first_frame["language_instruction"]
-    else:
-        # Fallback: check metadata if available
-        data["task_instruction"] = "Execute the task."
-
-    camera_keys = dataset.meta.camera_keys
-    for key in camera_keys:
-        data["images"][key] = []
-
-    prev_narrations = ""
-    for idx in range(from_idx, to_idx):
-        frame = dataset[idx]
-
-        # Metrics
-        data["prob_bon"].append(safe_item(frame["prob_bon"]) if "prob_bon" in frame else 0.0)
-        data["prob_boa"].append(safe_item(frame["prob_boa"]) if "prob_boa" in frame else 0.0)
-        data["current_narration"].append(
-            frame.get("current_narration", "").replace("\n", "<span style='color: #aaa;'>↵</span><br>")
-        )
-        data["timestamp"].append(float(safe_item(frame.get("real_timestamp", 0.0))))
-
-        data["previous_narrations"].append(prev_narrations)
-        prev_narrations += data["current_narration"][-1]
-
-        # Images
-        for key in camera_keys:
-            if key in frame:
-                # CHW float32 -> HWC uint8 RGBA for Bokeh
-                img_tensor = frame[key]
-                img_np = (img_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-
-                # Add Alpha channel
-                h, w, c = img_np.shape
-                if c == 3:
-                    alpha = np.full((h, w, 1), 255, dtype=np.uint8)
-                    img_rgba = np.concatenate([img_np, alpha], axis=2)
-                else:
-                    img_rgba = img_np
-
-                # Flip vertically because Bokeh origin is bottom-left
-                img_rgba = np.ascontiguousarray(np.flipud(img_rgba))
-
-                # Convert to 32-bit integer array for Bokeh
-                # (M, N) array of RGBA values packed into 32-bit integers
-                view = img_rgba.view(dtype=np.uint32).reshape((h, w))
-                data["images"][key].append(view)
-
-    return data, camera_keys
+    image_loader = EpisodeImageLoader(
+        dataset, episode_index, timestamps, image_decode_batch_size, image_cache_size
+    )
+    return data, list(dataset.meta.camera_keys), image_loader
 
 
 def create_visualization(doc):
@@ -152,6 +185,8 @@ def create_visualization(doc):
     parser.add_argument("--repo-id", type=str, required=True)
     parser.add_argument("--episode-index", type=int, default=0)
     parser.add_argument("--root", type=str, default=None)
+    parser.add_argument("--image-decode-batch-size", type=int, default=CONFIG.image_decode_batch_size)
+    parser.add_argument("--image-cache-size", type=int, default=CONFIG.image_cache_size)
 
     # Parse only known args to avoid issues if bokeh injects others (though --args should isolate)
     args, _ = parser.parse_known_args(sys.argv[1:])
@@ -167,19 +202,26 @@ def create_visualization(doc):
     logging.info(f"Loading dataset: {repo_id}, Episode: {episode_index}")
 
     try:
-        dataset = LeRobotDataset(repo_id, root=root)
+        # uint8 avoids creating a float32 copy of every decoded video frame.
+        dataset = LeRobotDataset(repo_id, root=root, return_uint8=True)
     except Exception as e:
         doc.add_root(Div(text=f"Error loading dataset: {e}"))
         return
 
-    data, camera_keys = load_data(dataset, episode_index)
+    data, camera_keys, image_loader = load_data(
+        dataset,
+        episode_index,
+        args.image_decode_batch_size,
+        args.image_cache_size,
+    )
     num_frames = len(data["index"])
+    first_images = image_loader[0]
 
     # --- Data Sources ---
     # Add image sources
     image_sources = {}
     for key in camera_keys:
-        image_sources[key] = ColumnDataSource(data={"image": [data["images"][key][0]]})
+        image_sources[key] = ColumnDataSource(data={"image": [first_images[key]]})
 
     # Source for the full timeline (BON graph)
     timeline_source = ColumnDataSource(
@@ -235,7 +277,7 @@ def create_visualization(doc):
     total_width = 0
     for key in camera_keys:
         # Get dimensions from the first frame
-        h, w = data["images"][key][0].shape
+        h, w = first_images[key].shape
         width = CONFIG.image_height * w // h
         total_width += width
         p = figure(
@@ -277,7 +319,7 @@ def create_visualization(doc):
         legend_label="BOA",
     )
     # Plot points where BON > BOA
-    bon_plot.circle(
+    bon_plot.scatter(
         "index",
         "prob_bon",
         source=bon_gt_boa_source,
@@ -335,8 +377,9 @@ def create_visualization(doc):
         )
 
         # Update images
+        images = image_loader[idx]
         for key in camera_keys:
-            image_sources[key].data = {"image": [data["images"][key][idx]]}
+            image_sources[key].data = {"image": [images[key]]}
 
         # Update time line
         time_line.location = idx
@@ -350,7 +393,7 @@ def create_visualization(doc):
     slider.on_change("value", update)
 
     def change_episode(attr, old, new):
-        nonlocal data, num_frames, episode_index
+        nonlocal data, num_frames, episode_index, image_loader
         new_ep_idx = int(new)
         logging.info(f"Switching to Episode: {new_ep_idx}")
 
@@ -360,20 +403,27 @@ def create_visualization(doc):
 
         # Load new data
         try:
-            new_data, _ = load_data(dataset, new_ep_idx)
+            new_data, _, new_image_loader = load_data(
+                dataset,
+                new_ep_idx,
+                args.image_decode_batch_size,
+                args.image_cache_size,
+            )
+            new_images = new_image_loader[0]
         except Exception as e:
             logging.error(f"Error loading episode {new_ep_idx}: {e}")
             return
 
         # Update outer state variables
         data = new_data
+        image_loader = new_image_loader
         episode_index = new_ep_idx
         num_frames = len(data["index"])
 
         # Update data sources
         for key in camera_keys:
-            if key in data["images"] and len(data["images"][key]) > 0:
-                image_sources[key].data = {"image": [data["images"][key][0]]}
+            if key in new_images:
+                image_sources[key].data = {"image": [new_images[key]]}
 
         timeline_source.data = {
             "index": data["index"],
@@ -476,7 +526,7 @@ def create_visualization(doc):
         save_dir.mkdir(parents=True, exist_ok=True)
 
         for key in camera_keys:
-            img_array = data["images"][key][slider.value]
+            img_array = image_loader[slider.value][key]
             h, w = img_array.shape
 
             # Convert back to RGBA uint8
