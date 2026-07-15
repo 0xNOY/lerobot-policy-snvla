@@ -65,7 +65,12 @@ _SNVLA_PROCESSOR_CONFIG_FIELDS = (
 def _is_pi05_base_pretrained_path(pretrained_path: object) -> bool:
     """Match only the upstream base identifier whose processors are not SNVLA processors."""
 
-    return pretrained_path == _PI05_BASE_PRETRAINED_PATH
+    if pretrained_path is None:
+        return False
+    try:
+        return os.fspath(pretrained_path) == _PI05_BASE_PRETRAINED_PATH
+    except TypeError:
+        return False
 
 
 @dataclass(frozen=True)

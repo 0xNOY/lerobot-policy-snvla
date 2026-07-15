@@ -1,6 +1,7 @@
 import json
 import re
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -412,8 +413,9 @@ def test_processor_factory_patch_does_not_change_non_snvla(monkeypatch):
 
 
 @pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("pretrained_path", ["lerobot/pi05_base", Path("lerobot/pi05_base")])
 def test_processor_factory_bypasses_only_pi05_base_processors_and_preserves_dataset_stats(
-    monkeypatch, positional
+    monkeypatch, positional, pretrained_path
 ):
     import lerobot_policy_snvla.processor_snvla as processor_snvla
 
@@ -436,7 +438,7 @@ def test_processor_factory_bypasses_only_pi05_base_processors_and_preserves_data
         if positional:
             result = train_bf16_fsdp.lerobot_train.make_pre_post_processors(
                 policy_cfg,
-                "lerobot/pi05_base",
+                pretrained_path,
                 dataset_stats=dataset_stats,
                 preprocessor_overrides=overrides,
             )
@@ -444,7 +446,7 @@ def test_processor_factory_bypasses_only_pi05_base_processors_and_preserves_data
         else:
             result = train_bf16_fsdp.lerobot_train.make_pre_post_processors(
                 policy_cfg,
-                pretrained_path="lerobot/pi05_base",
+                pretrained_path=pretrained_path,
                 dataset_stats=dataset_stats,
                 preprocessor_overrides=overrides,
             )
