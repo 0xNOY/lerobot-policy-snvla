@@ -102,6 +102,9 @@ Partial loading, warning suppression, and `strict=False` are not acceptable subs
   completed successfully after the visual-stats and processor-configuration fixes were synced.
 - Task 8 checkpoint transfer and all six recorded 10-episode evaluations completed, but they do not
   identify an unambiguous efficacy winner. No production dropout ratio is claimed.
+- The completed v5 50+150 dataset remains unchanged as Task 8 evidence. It predates the new
+  completion contract and must not be used for Task 9 production training. Task 9 requires fresh
+  50-episode and 150-episode sources and new v6 merge/trim/augmentation roots.
 - Task 9 production training and final recorded 30-on/30-off evaluation have not run.
 - The DGX code destination is an rsynced working directory without `.git`, so this report does not
   claim a DGX branch or commit identity. The hashes below describe the historical pre-fix Task 7
@@ -409,13 +412,21 @@ checkpoints remain outside the commit scope.
 
 Task 9 must not start until the user selects a ratio from the ambiguous Task 8 evidence.
 
-1. With the user-approved Task 8 ratio and all 180 manifest train IDs, run DGX production at
+1. Freshly recollect ordered 50+150 successful demonstrations under v6 roots with fixed, disjoint
+   recorded seed bands. Only the initial EEF xyz is seed-randomized; after the final placed
+   ` (done)\n`, return to the fixed canonical home, emit `Task completed.\n` exactly once after
+   arrival, and retain exactly 10 fixed-home hold frames. Strictly validate the policy sidecars,
+   merge into `~/datasets/t1_n3_v6_success200`, trim into
+   `~/datasets/t1_n3_v6_success200_trim`, augment once into
+   `~/datasets/t1_n3_v6_success200_aug`, validate, and transfer to DGX. Preserve all v5/Task 8 data
+   unchanged and do not mix it into v6.
+2. With the user-approved Task 8 ratio and all 180 v6 manifest train IDs, run DGX production at
    `--epochs=16.0 --save-every-epochs=2.0`. Save epochs 2, 4, 6, 8, 10, 12, 14, and 16 below
-   `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_success200_prod`. Require W&B and GPUs 2,3.
-2. Transfer and load epoch 16 first; inspect intermediate checkpoints only if the final adoption
+   `/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v6_success200_prod`. Require W&B and GPUs 2,3.
+3. Transfer and load epoch 16 first; inspect intermediate checkpoints only if the final adoption
    decision is unclear.
-3. At seed `13000000` and `n_action_steps=10`, record 30 narration-on plus the same 30 narration-off
+4. At seed `13000000` and `n_action_steps=10`, record 30 narration-on plus the same 30 narration-off
    episodes. Require exact loader gates and preserve videos/JSON outside git.
-4. Record duration, W&B run, checkpoint paths, success, picked/placed, approach distance, false
+5. Record duration, W&B run, checkpoint paths, success, picked/placed, approach distance, false
    pick/place/task-completed counters, and the adoption decision. Run final non-sim tests/Ruff and
    commit reports only.

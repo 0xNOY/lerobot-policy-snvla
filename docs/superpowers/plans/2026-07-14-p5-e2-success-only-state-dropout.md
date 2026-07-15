@@ -659,13 +659,27 @@ handoff. Keep every `p5e2_teacher_scene_ablation_*` output, recording, and log u
 - Modify: `docs/superpowers/reports/2026-07-12-p5-e2-report.md`
 - Modify: `docs/superpowers/plans/2026-07-13-p5-e2-handoff.md`
 
+- [ ] **Step 0: Recollect the production dataset with the completion contract**
+
+Leave the v5 dataset and all Task 8 evidence unchanged. Freshly collect ordered 50-episode and
+150-episode sources under v6 roots using fixed, disjoint recorded seed bands. Only the initial EEF
+xyz is seed-randomized by an unrecorded pre-roll; the final target is the fixed canonical home. The
+final placed ` (done)\n` must precede the return home, `Task completed.\n` must be emitted exactly
+once only after home arrival, and exactly 10 fixed-home hold frames must follow.
+
+Strictly validate both source policy sidecars, merge only those new sources into
+`$HOME/datasets/t1_n3_v6_success200`, trim into
+`$HOME/datasets/t1_n3_v6_success200_trim`, augment once with `--window-size 5 --forward-only` into
+`$HOME/datasets/t1_n3_v6_success200_aug`, then run portable validation and transfer the augmented
+root to DGX. Do not mix any v5 source into the production dataset.
+
 - [ ] **Step 1: Run production training**
 
 On DGX use the selected ratio, all 180 train episode IDs, `--epochs=16.0`, W&B, and
 `CUDA_VISIBLE_DEVICES=2,3`. Use:
 
 ```text
-output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_success200_prod
+output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v6_success200_prod
 ```
 
 Keep max dimensions 32/32, bf16 FULL_SHARD, fixed padding 256, and `n_action_steps=10`. Save at
@@ -678,7 +692,7 @@ Run with the user-approved `SELECTED_RATIO` from Task 8:
 ```bash
 : "${SELECTED_RATIO:?export the user-approved ratio from Task 8}"
 case "$SELECTED_RATIO" in 0|0.0|0.25|0.5|0.50) ;; *) echo "invalid SELECTED_RATIO" >&2; exit 2;; esac
-TRAIN_EPISODES=$(jq -c '.train_episode_ids' "$HOME/datasets/t1_n3_v5_success200_aug/meta/success_dataset_manifest.json")
+TRAIN_EPISODES=$(jq -c '.train_episode_ids' "$HOME/datasets/t1_n3_v6_success200_aug/meta/success_dataset_manifest.json")
 CUDA_VISIBLE_DEVICES=2,3 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_OFFLINE=1 \
 SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_success200 \
 .venv/bin/accelerate launch \
@@ -690,8 +704,8 @@ SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_s
   --fsdp_state_dict_type=SHARDED_STATE_DICT \
   --fsdp_use_orig_params=true --mixed_precision=no \
   --module lerobot_policy_snvla.scripts.train_bf16_fsdp \
-  --dataset.repo_id=local/t1_n3_v5_success200_aug \
-  --dataset.root=$HOME/datasets/t1_n3_v5_success200_aug \
+  --dataset.repo_id=local/t1_n3_v6_success200_aug \
+  --dataset.root=$HOME/datasets/t1_n3_v6_success200_aug \
   --dataset.episodes="$TRAIN_EPISODES" \
   --policy.type=snvla \
   --policy.pretrained_path=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v3_aug_p2/015000/pretrained_model \
@@ -705,9 +719,9 @@ SNVLA_REQUIRE_WANDB=1 TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor_snvla_s
   --policy.state_dropout_seed=20260714 --seed=20260714 \
   --epochs=16.0 --save-every-epochs=2.0 \
   --batch_size=8 --log_freq=10 --num_workers=8 \
-  --output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v5_success200_prod \
+  --output_dir=/raid/takenaka/snvla/checkpoints/snvla_t1_n3_v6_success200_prod \
   --wandb.enable=true --wandb.project=snvla-p5 \
-  --wandb.run_id=p5e2-success200-prod-h10
+  --wandb.run_id=p5e2-success200-v6-prod-h10
 ```
 
 - [ ] **Step 2: Evaluate intermediate checkpoints only if the final gate is unclear**
