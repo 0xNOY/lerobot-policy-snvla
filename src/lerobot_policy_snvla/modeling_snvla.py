@@ -239,6 +239,85 @@ def initialize_state_projection_keys(state_dict, *, max_state_dim=None):
     return migrated
 
 
+def _is_unprefixed_pi05_core_state_dict(state_dict: dict[str, Tensor]) -> bool:
+    """Identify the upstream pi05_base core checkpoint without matching SNVLA saves."""
+
+    return (
+        "action_in_proj.weight" in state_dict
+        and "state_proj.weight" not in state_dict
+        and "model.action_in_proj.weight" not in state_dict
+        and not any(key.startswith("model.") for key in state_dict)
+    )
+
+
+def _remap_joint_layers_and_fused_qkv(state_dict, model_config):
+    remapped_state_dict = {}
+    for key, value in state_dict.items():
+        key = re.sub(
+            r"(model\.)?paligemma_with_expert\.paligemma\.model\.language_model\.layers\.(\d+)\.",
+            lambda match: (
+                f"{match.group(1) or ''}paligemma_with_expert.joint_layers."
+                f"{match.group(2)}.paligemma_layer."
+            ),
+            key,
+        )
+        key = re.sub(
+            r"(model\.)?paligemma_with_expert\.gemma_expert\.model\.layers\.(\d+)\.",
+            lambda match: (
+                f"{match.group(1) or ''}paligemma_with_expert.joint_layers."
+                f"{match.group(2)}.expert_layer."
+            ),
+            key,
+        )
+        remapped_state_dict[key] = value
+    if not getattr(model_config, "fuse_qkv", False):
+        return remapped_state_dict
+
+    qkv_parts = {}
+    qkv_pattern = re.compile(
+        r"^(model\.)?paligemma_with_expert\.joint_layers\.(\d+)\."
+        r"(paligemma|expert)_layer\.self_attn\.([qkv])_proj\.(weight|bias)$"
+    )
+    for key in list(remapped_state_dict):
+        match = qkv_pattern.match(key)
+        if match is None:
+            continue
+        prefix, layer_index, branch, projection, parameter = match.groups()
+        group = (prefix or "", layer_index, branch, parameter)
+        qkv_parts.setdefault(group, {})[projection] = remapped_state_dict.pop(key)
+
+    for (prefix, layer_index, branch, parameter), parts in qkv_parts.items():
+        if set(parts) != {"q", "k", "v"}:
+            raise ValueError(
+                f"Incomplete QKV checkpoint group for layer {layer_index} {branch} {parameter}"
+            )
+        fused_key = (
+            f"{prefix}paligemma_with_expert.joint_layers.{layer_index}."
+            f"{branch}_qkv.{parameter}"
+        )
+        remapped_state_dict[fused_key] = torch.cat(
+            [parts["q"], parts["k"], parts["v"]], dim=0
+        )
+    return remapped_state_dict
+
+
+def migrate_unprefixed_pi05_base_keys(state_dict, model_config):
+    """Migrate a raw upstream pi05 core checkpoint without cloning tied LM weights."""
+
+    renamed = {}
+    for key, value in state_dict.items():
+        if key.startswith("action_time_mlp_in."):
+            key = key.replace("action_time_mlp_in.", "time_mlp_in.", 1)
+        elif key.startswith("action_time_mlp_out."):
+            key = key.replace("action_time_mlp_out.", "time_mlp_out.", 1)
+        renamed[key] = value
+    renamed = initialize_state_projection_keys(
+        renamed, max_state_dim=model_config.max_state_dim
+    )
+    renamed = _remap_joint_layers_and_fused_qkv(renamed, model_config)
+    return {f"model.{key}": value for key, value in renamed.items()}
+
+
 class FusedQKVProjection(nn.Module):
     """A single GEMM containing a layer's query, key, and value projections."""
 
@@ -886,8 +965,8 @@ class SNVLAPolicy(PI05Policy):
     @classmethod
     def _load_as_safetensor(cls, model, model_file, map_location, strict):
         """Load safetensors after migrating legacy SN-VLA checkpoint keys."""
-        del strict  # SN-VLA checkpoints are always loaded exactly after migration.
-        state_dict = load_safetensors_file(model_file, device=map_location)
+        del map_location, strict  # Migration is CPU-staged and every load is strict.
+        state_dict = load_safetensors_file(model_file, device="cpu")
         state_dict = model._fix_pytorch_state_dict_keys(state_dict, model.config)
         state_dict = restore_shared_state_dict_aliases(model, state_dict)
         load_result = model.load_state_dict(state_dict, strict=True)
@@ -896,56 +975,14 @@ class SNVLAPolicy(PI05Policy):
         return model
 
     def _fix_pytorch_state_dict_keys(self, state_dict, model_config):
+        if _is_unprefixed_pi05_core_state_dict(state_dict):
+            return migrate_unprefixed_pi05_base_keys(state_dict, model_config)
+
         fixed_state_dict = super()._fix_pytorch_state_dict_keys(state_dict, model_config)
         fixed_state_dict = initialize_state_projection_keys(
             fixed_state_dict, max_state_dim=model_config.max_state_dim
         )
-        remapped_state_dict = {}
-        for key, value in fixed_state_dict.items():
-            key = re.sub(
-                r"(model\.)?paligemma_with_expert\.paligemma\.model\.language_model\.layers\.(\d+)\.",
-                lambda match: (
-                    f"{match.group(1) or ''}paligemma_with_expert.joint_layers."
-                    f"{match.group(2)}.paligemma_layer."
-                ),
-                key,
-            )
-            key = re.sub(
-                r"(model\.)?paligemma_with_expert\.gemma_expert\.model\.layers\.(\d+)\.",
-                lambda match: (
-                    f"{match.group(1) or ''}paligemma_with_expert.joint_layers."
-                    f"{match.group(2)}.expert_layer."
-                ),
-                key,
-            )
-            remapped_state_dict[key] = value
-        if getattr(model_config, "fuse_qkv", False):
-            qkv_parts = {}
-            qkv_pattern = re.compile(
-                r"^(model\.)?paligemma_with_expert\.joint_layers\.(\d+)\."
-                r"(paligemma|expert)_layer\.self_attn\.([qkv])_proj\.(weight|bias)$"
-            )
-            for key in list(remapped_state_dict):
-                match = qkv_pattern.match(key)
-                if match is None:
-                    continue
-                prefix, layer_index, branch, projection, parameter = match.groups()
-                group = (prefix or "", layer_index, branch, parameter)
-                qkv_parts.setdefault(group, {})[projection] = remapped_state_dict.pop(key)
-
-            for (prefix, layer_index, branch, parameter), parts in qkv_parts.items():
-                if set(parts) != {"q", "k", "v"}:
-                    raise ValueError(
-                        f"Incomplete QKV checkpoint group for layer {layer_index} {branch} {parameter}"
-                    )
-                fused_key = (
-                    f"{prefix}paligemma_with_expert.joint_layers.{layer_index}."
-                    f"{branch}_qkv.{parameter}"
-                )
-                remapped_state_dict[fused_key] = torch.cat(
-                    [parts["q"], parts["k"], parts["v"]], dim=0
-                )
-        return remapped_state_dict
+        return _remap_joint_layers_and_fused_qkv(fixed_state_dict, model_config)
 
     def __init__(self, config: SNVLAConfig, **kwargs):
         # `PI05Policy` の __init__ を意図的にスキップ。`PreTrainedPolicy` の __init__ を呼び出す

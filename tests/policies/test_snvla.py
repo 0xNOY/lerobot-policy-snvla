@@ -26,7 +26,9 @@ from lerobot_policy_snvla.modeling_snvla import (
     SNVLAPolicy,
     compute_grouped_text_metrics,
     initialize_state_projection_keys,
+    migrate_unprefixed_pi05_base_keys,
     reduce_training_losses,
+    restore_shared_state_dict_aliases,
     select_text_loss_inputs,
 )
 from lerobot_policy_snvla.processor_snvla import (
@@ -868,6 +870,116 @@ def test_from_pretrained_migrates_old_safetensors_and_loads_strictly(
     torch.testing.assert_close(loaded.model.tied_source.weight, tied_weight)
     assert loaded.model.tied_alias.weight is loaded.model.tied_source.weight
     assert "All keys loaded successfully!" in capsys.readouterr().out
+
+
+def test_pi05_base_core_migration_prefixes_and_remaps_without_cloning_tied_lm():
+    action_weight = torch.randn(4, 2)
+    action_bias = torch.randn(4)
+    tied_lm = torch.randn(8, 4)
+    q = torch.randn(4, 4)
+    k = torch.randn(2, 4)
+    v = torch.randn(2, 4)
+    raw = {
+        "action_in_proj.weight": action_weight,
+        "action_in_proj.bias": action_bias,
+        "action_time_mlp_in.weight": torch.randn(4, 4),
+        "paligemma_with_expert.paligemma.lm_head.weight": tied_lm,
+        "paligemma_with_expert.paligemma.model.language_model.layers.0.self_attn.q_proj.weight": q,
+        "paligemma_with_expert.paligemma.model.language_model.layers.0.self_attn.k_proj.weight": k,
+        "paligemma_with_expert.paligemma.model.language_model.layers.0.self_attn.v_proj.weight": v,
+    }
+    config = SimpleNamespace(max_state_dim=2, fuse_qkv=True)
+
+    migrated = migrate_unprefixed_pi05_base_keys(raw, config)
+
+    assert "model.time_mlp_in.weight" in migrated
+    assert "model.action_time_mlp_in.weight" not in migrated
+    assert "model.state_proj.weight" in migrated
+    assert "model.paligemma_with_expert.joint_layers.0.paligemma_qkv.weight" in migrated
+    assert all(key.startswith("model.") for key in migrated)
+    assert migrated["model.paligemma_with_expert.paligemma.lm_head.weight"] is tied_lm
+    assert not any("embed_tokens.weight" in key for key in migrated)
+    torch.testing.assert_close(
+        migrated["model.paligemma_with_expert.joint_layers.0.paligemma_qkv.weight"],
+        torch.cat([q, k, v]),
+    )
+
+
+def test_restore_shared_aliases_reuses_loaded_tensor_without_clone():
+    model = torch.nn.Module()
+    model.source = torch.nn.Linear(4, 4, bias=False)
+    model.alias = torch.nn.Linear(4, 4, bias=False)
+    model.alias.weight = model.source.weight
+    loaded_tensor = torch.randn_like(model.source.weight)
+
+    restored = restore_shared_state_dict_aliases(
+        model, {"source.weight": loaded_tensor}
+    )
+
+    assert restored["source.weight"] is loaded_tensor
+    assert restored["alias.weight"] is loaded_tensor
+
+
+def test_from_pretrained_strictly_loads_unprefixed_pi05_base_core(
+    monkeypatch, tmp_path, capsys
+):
+    class TinyCore(torch.nn.Module):
+        def __init__(self, *, with_state):
+            super().__init__()
+            self.action_in_proj = torch.nn.Linear(2, 4)
+            if with_state:
+                self.state_proj = torch.nn.Linear(2, 4)
+            self.tied_source = torch.nn.Linear(4, 4, bias=False)
+            self.tied_alias = torch.nn.Linear(4, 4, bias=False)
+            self.tied_alias.weight = self.tied_source.weight
+
+    def tiny_init(self, config, **_kwargs):
+        torch.nn.Module.__init__(self)
+        self.config = config
+        self.model = TinyCore(with_state=True)
+
+    monkeypatch.setattr(SNVLAPolicy, "__init__", tiny_init)
+    source = TinyCore(with_state=False)
+    expected_action = source.action_in_proj.weight.detach().clone()
+    expected_tied = source.tied_source.weight.detach().clone()
+    save_safetensors_model(source, tmp_path / "model.safetensors")
+    config = SimpleNamespace(device="cpu", max_state_dim=2, fuse_qkv=False)
+
+    loaded = SNVLAPolicy.from_pretrained(tmp_path, config=config)
+
+    torch.testing.assert_close(loaded.model.action_in_proj.weight, expected_action)
+    torch.testing.assert_close(loaded.model.state_proj.weight, expected_action)
+    torch.testing.assert_close(loaded.model.tied_source.weight, expected_tied)
+    assert loaded.model.tied_alias.weight is loaded.model.tied_source.weight
+    assert "All keys loaded successfully!" in capsys.readouterr().out
+
+
+def test_safetensors_loader_always_stages_on_cpu(monkeypatch):
+    class TinyCore(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.action_in_proj = torch.nn.Linear(2, 4)
+            self.state_proj = torch.nn.Linear(2, 4)
+
+    policy = SNVLAPolicy.__new__(SNVLAPolicy)
+    torch.nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(max_state_dim=2, fuse_qkv=False)
+    policy.model = TinyCore()
+    captured = {}
+
+    def fake_load(_path, *, device):
+        captured["device"] = device
+        return {key: value.detach().clone() for key, value in policy.state_dict().items()}
+
+    monkeypatch.setattr(
+        "lerobot_policy_snvla.modeling_snvla.load_safetensors_file", fake_load
+    )
+
+    SNVLAPolicy._load_as_safetensor(
+        policy, "model.safetensors", map_location="cuda:0", strict=False
+    )
+
+    assert captured["device"] == "cpu"
 
 
 def test_from_pretrained_round_trips_new_save_model_with_tied_weights(
