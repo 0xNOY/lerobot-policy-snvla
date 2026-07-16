@@ -17,6 +17,11 @@ from typing import Protocol
 
 import numpy as np
 
+from ..runtime import (
+    SNVLAOutput,
+    SNVLARuntime,
+    prepare_observation_for_snvla_inference,
+)
 from . import collect
 from .collect import (
     MAX_STEPS_PER_BLOCK,
@@ -474,7 +479,7 @@ class PolicyStepper:
 
     def act(self, obs, task: str) -> np.ndarray:
         import torch
-        from lerobot.common.control_utils import predict_action
+        from lerobot.policies import prepare_observation_for_inference
 
         from .collect import _images, _state8
 
@@ -493,25 +498,32 @@ class PolicyStepper:
             with torch.inference_mode():
                 action = self.postprocessor(self.policy.select_action({}))
         else:
-            observation = {"observation.state": _state8(obs), **_images(obs)}
-            action = predict_action(
+            observation = prepare_observation_for_inference(
+                {"observation.state": _state8(obs), **_images(obs)},
+                self.device,
+                task,
+                "panda_libero",
+            )
+            observation = prepare_observation_for_snvla_inference(
                 observation,
                 self.policy,
-                self.device,
-                self.preprocessor,
-                self.postprocessor,
-                use_amp=False,
-                task=task,
-                robot_type="panda_libero",
             )
+            observation = self.preprocessor(observation)
+            with torch.inference_mode():
+                action = self.postprocessor(self.policy.select_action(observation))
         # predict_actionはバッチ次元付き(1, action_dim)で返す。bf16はnumpy非対応
         return action.float().squeeze(0).cpu().numpy()
 
     def narrations(self) -> list[str]:
-        return list(getattr(self.policy, "_previous_narrations", []))
+        return list(self._snvla_output().narration_history)
 
     def metrics(self) -> dict[str, float | str | list]:
-        return dict(getattr(self.policy, "latest_metrics", {}))
+        return dict(self._snvla_output().metrics)
+
+    def _snvla_output(self) -> SNVLAOutput:
+        if isinstance(self.policy, SNVLARuntime):
+            return self.policy.get_snvla_output()
+        return SNVLAOutput()
 
 
 def build_arg_parser():

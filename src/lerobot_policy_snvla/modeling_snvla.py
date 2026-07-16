@@ -43,6 +43,7 @@ from .processor_snvla import (
     discretize_state,
     make_prefix_prompt,
 )
+from .runtime import SNVLARuntimeMixin
 
 
 def select_text_loss_inputs(language_out, language_tokens, language_loss_masks, max_tokens):
@@ -959,7 +960,7 @@ class SNVLACore(nn.Module):
         return loss, info
 
 
-class SNVLAPolicy(PI05Policy):
+class SNVLAPolicy(SNVLARuntimeMixin, PI05Policy):
     """SN-VLA Policy for LeRobot."""
 
     config_class = SNVLAConfig

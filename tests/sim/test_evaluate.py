@@ -553,6 +553,7 @@ def test_policy_stepper_queue_fast_path_skips_observation_preprocessing(monkeypa
 
     import torch
 
+    from lerobot_policy_snvla.runtime import SNVLAOutput
     from lerobot_policy_snvla.sim import collect
     from lerobot_policy_snvla.sim.evaluate import PolicyStepper
 
@@ -574,6 +575,12 @@ def test_policy_stepper_queue_fast_path_skips_observation_preprocessing(monkeypa
             self._action_queue.clear()
             self._previous_narrations = []
             self.latest_metrics = {}
+
+        def get_snvla_output(self):
+            return SNVLAOutput(
+                narration_history=tuple(self._previous_narrations),
+                metrics=dict(self.latest_metrics),
+            )
 
     stepper = PolicyStepper.__new__(PolicyStepper)
     stepper.device = torch.device("cpu")
@@ -599,6 +606,7 @@ def test_policy_stepper_queue_fast_path_matches_normal_postprocessing(monkeypatc
 
     import torch
 
+    from lerobot_policy_snvla.runtime import SNVLAOutput
     from lerobot_policy_snvla.sim.evaluate import PolicyStepper
 
     queued = torch.tensor([[0.25, -0.5]], dtype=torch.float32)
@@ -612,6 +620,9 @@ def test_policy_stepper_queue_fast_path_matches_normal_postprocessing(monkeypatc
         def select_action(self, _batch):
             self.latest_metrics = {"current_narration": ""}
             return self._action_queue.popleft()
+
+        def get_snvla_output(self):
+            return SNVLAOutput(metrics=dict(self.latest_metrics))
 
     def postprocess(action):
         return action * torch.tensor([[2.0, 4.0]]) + torch.tensor([[1.0, -1.0]])
@@ -633,7 +644,6 @@ def test_policy_stepper_relative_actions_use_observation_preprocessing(monkeypat
     from collections import deque
 
     import torch
-    from lerobot.common import control_utils
 
     from lerobot_policy_snvla.sim import collect
     from lerobot_policy_snvla.sim.evaluate import PolicyStepper
@@ -645,21 +655,9 @@ def test_policy_stepper_relative_actions_use_observation_preprocessing(monkeypat
             self._action_queue = deque([torch.tensor([[1.0, 2.0]])])
             self.latest_metrics = {}
 
-    calls = []
-
-    def fake_predict_action(
-        observation,
-        policy,
-        device,
-        preprocessor,
-        postprocessor,
-        **kwargs,
-    ):
-        calls.append((observation, policy, device, kwargs))
-        processed = preprocessor(observation)
-        return postprocessor(processed["queued_action"])
-
-    monkeypatch.setattr(control_utils, "predict_action", fake_predict_action)
+        def select_action(self, observation):
+            assert observation["task"] == "task"
+            return observation["queued_action"]
     monkeypatch.setattr(
         collect, "_state8", lambda _obs: np.array([3.0], dtype=np.float32)
     )
@@ -681,13 +679,47 @@ def test_policy_stepper_relative_actions_use_observation_preprocessing(monkeypat
     np.testing.assert_array_equal(
         stepper.act(object(), "task"), np.array([1.25, 0.5], dtype=np.float32)
     )
-    assert len(calls) == 1
-    observation, policy, device, kwargs = calls[0]
-    np.testing.assert_array_equal(observation["observation.state"], np.array([3.0]))
-    assert "observation.images.image" in observation
-    assert policy is stepper.policy
-    assert device == torch.device("cpu")
-    assert kwargs["task"] == "task"
+
+
+def test_policy_stepper_injects_generated_history_at_next_chunk(monkeypatch):
+    from collections import deque
+
+    import torch
+
+    from lerobot_policy_snvla.runtime import SNVLAOutput
+    from lerobot_policy_snvla.sim import collect
+    from lerobot_policy_snvla.sim.evaluate import PolicyStepper
+
+    class FakePolicy:
+        config = SimpleNamespace(use_relative_actions=False)
+
+        def __init__(self):
+            self._action_queue = deque()
+            self.history = []
+
+        def get_snvla_output(self):
+            return SNVLAOutput(narration_history=tuple(self.history))
+
+        def select_action(self, observation):
+            seen_histories.append(json.loads(observation["previous_narrations"]))
+            if not self.history:
+                self.history.append("Picking up the object.")
+            return torch.zeros(1, 2)
+
+    seen_histories = []
+    monkeypatch.setattr(collect, "_state8", lambda _obs: np.zeros(8, dtype=np.float32))
+    monkeypatch.setattr(collect, "_images", lambda _obs: {})
+
+    stepper = PolicyStepper.__new__(PolicyStepper)
+    stepper.device = torch.device("cpu")
+    stepper.policy = FakePolicy()
+    stepper.preprocessor = lambda observation: observation
+    stepper.postprocessor = lambda action: action
+
+    stepper.act(object(), "task")
+    stepper.act(object(), "task")
+
+    assert seen_histories == [[], ["Picking up the object."]]
 
 
 @pytest.mark.parametrize(

@@ -425,6 +425,63 @@ def test_processor_factory_patch_does_not_change_non_snvla(monkeypatch):
     }
 
 
+def test_processor_factory_uses_molmoact2_snvla_factory(monkeypatch):
+    from lerobot_policy_snvla.configuration_molmoact2_snvla import (
+        MolmoAct2SNVLAConfig,
+    )
+
+    policy_cfg = MolmoAct2SNVLAConfig()
+    processors = (object(), object())
+    seen = {}
+
+    def fake_molmo_factory(inner_cfg, *, dataset_stats=None, dataset_meta=None):
+        seen.update(
+            policy_cfg=inner_cfg,
+            dataset_stats=dataset_stats,
+            dataset_meta=dataset_meta,
+        )
+        return processors
+
+    monkeypatch.setattr(
+        train_bf16_fsdp,
+        "make_snvla_molmoact2_pre_post_processors",
+        fake_molmo_factory,
+    )
+    monkeypatch.setattr(
+        train_bf16_fsdp,
+        "_assert_current_molmoact2_snvla_processor_config",
+        lambda preprocessor, inner_cfg: seen.update(
+            asserted_preprocessor=preprocessor,
+            asserted_config=inner_cfg,
+        ),
+    )
+    monkeypatch.setattr(
+        train_bf16_fsdp.lerobot_train,
+        "make_pre_post_processors",
+        lambda *_args, **_kwargs: pytest.fail("upstream MolmoAct2 processor was used"),
+    )
+    dataset_stats = {"observation.state": {"mean": torch.zeros(1)}}
+    dataset_meta = object()
+
+    with train_bf16_fsdp._epoch_training_patches(
+        TrainingDuration(None, None, []), SimpleNamespace(num_processes=1)
+    ):
+        result = train_bf16_fsdp.lerobot_train.make_pre_post_processors(
+            policy_cfg,
+            dataset_stats=dataset_stats,
+            dataset_meta=dataset_meta,
+        )
+
+    assert result == processors
+    assert seen == {
+        "policy_cfg": policy_cfg,
+        "dataset_stats": dataset_stats,
+        "dataset_meta": dataset_meta,
+        "asserted_preprocessor": processors[0],
+        "asserted_config": policy_cfg,
+    }
+
+
 @pytest.mark.parametrize("positional", [False, True])
 @pytest.mark.parametrize("pretrained_path", ["lerobot/pi05_base", Path("lerobot/pi05_base")])
 def test_processor_factory_bypasses_only_pi05_base_processors_and_preserves_dataset_stats(

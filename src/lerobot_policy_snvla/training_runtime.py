@@ -1,4 +1,4 @@
-"""Pure runtime configuration helpers for SNVLA training."""
+"""Policy-independent runtime configuration helpers for SNVLA training."""
 
 from __future__ import annotations
 
@@ -10,7 +10,12 @@ from lerobot.optim import CosineDecayWithWarmupSchedulerConfig
 
 @dataclass(frozen=True)
 class AutomaticLRScheduleConfig:
-    """Ratios used to fit the PI cosine schedule to a complete training run."""
+    """Ratios used to fit LeRobot's cosine schedule to a complete training run.
+
+    The resulting scheduler applies one multiplier to every optimizer parameter
+    group.  Consequently a backbone may use distinct VLM, vision, connector,
+    and action-expert learning rates without losing their relative scales.
+    """
 
     enabled: bool = False
     warmup_ratio: float = 1.0 / 30.0

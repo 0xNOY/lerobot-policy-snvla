@@ -10,7 +10,8 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
 dependencies = [
-    "lerobot[dataset,pi]>=0.6.0,<0.7.0",
+    "lerobot[dataset,molmoact2,pi]>=0.6.0,<0.7.0",
+    "peft>=0.18.0,<0.20.0",
     "transformers>=5.4.0,<5.6.0",
     "numpy>=1.26.0",
     "torch>=2.8.0",

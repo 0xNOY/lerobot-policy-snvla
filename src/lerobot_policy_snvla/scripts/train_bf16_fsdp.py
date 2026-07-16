@@ -32,7 +32,12 @@ from lerobot_policy_snvla.constants import (
     GROUP_METRIC_NUMERATOR_PREFIX,
     TRAINING_EPOCH,
 )
+from lerobot_policy_snvla.configuration_molmoact2_snvla import MolmoAct2SNVLAConfig
 from lerobot_policy_snvla.configuration_snvla import SNVLAConfig
+from lerobot_policy_snvla.processor_molmoact2_snvla import (
+    MolmoAct2SNVLAPackInputsProcessorStep,
+    make_snvla_molmoact2_pre_post_processors,
+)
 from lerobot_policy_snvla.processor_snvla import SNVLAPrepareTrainingTokenizerProcessorStep
 from lerobot_policy_snvla.training_runtime import (
     AutomaticLRScheduleConfig,
@@ -572,6 +577,44 @@ def _assert_current_snvla_processor_config(preprocessor, policy_cfg: SNVLAConfig
         )
 
 
+def _assert_current_molmoact2_snvla_processor_config(
+    preprocessor,
+    policy_cfg: MolmoAct2SNVLAConfig,
+) -> None:
+    steps = [
+        step
+        for step in preprocessor.steps
+        if isinstance(step, MolmoAct2SNVLAPackInputsProcessorStep)
+    ]
+    if len(steps) != 1:
+        raise AssertionError(
+            "MolmoAct2 SNVLA preprocessor must contain exactly one packing step; "
+            f"found {len(steps)}"
+        )
+    step = steps[0]
+    fields = (
+        "state_dropout_enabled",
+        "state_dropout_ratio",
+        "state_dropout_seed",
+        "state_dropout_start_epoch",
+        "observation_noise_enabled",
+        "observation_noise_ratio",
+        "observation_noise_seed",
+        "observation_noise_start_epoch",
+        "observation_noise_scale_min",
+        "observation_noise_scale_max",
+        "observation_noise_standard_normal_clip",
+    )
+    mismatches = [
+        field for field in fields if getattr(step, field) != getattr(policy_cfg, field)
+    ]
+    if mismatches:
+        raise AssertionError(
+            "MolmoAct2 SNVLA processor config does not match the active policy config: "
+            + ", ".join(mismatches)
+        )
+
+
 def configure_epoch_duration(
     cfg: TrainPipelineConfig,
     duration: TrainingDuration,
@@ -593,8 +636,15 @@ def configure_epoch_duration(
 
 
 def configure_automatic_lr_scheduler(cfg: TrainPipelineConfig) -> SchedulerMetricContext | None:
-    """Fit SNVLA's cosine preset to the resolved total training steps."""
-    if not isinstance(cfg.policy, SNVLAConfig) or not cfg.policy.scheduler_auto_steps_enabled:
+    """Fit a policy's cosine preset to the resolved total training steps.
+
+    The runtime deliberately uses a small attribute-based contract here instead
+    of depending on a concrete policy class.  This keeps checkpoint/resume and
+    schedule fitting identical for PI05 SNVLA, MolmoAct2 SNVLA, and future
+    backbones while leaving optimizer parameter groups owned by each policy.
+    """
+    policy = cfg.policy
+    if not bool(getattr(policy, "scheduler_auto_steps_enabled", False)):
         return None
     if not cfg.use_policy_training_preset:
         raise ValueError(
@@ -605,19 +655,20 @@ def configure_automatic_lr_scheduler(cfg: TrainPipelineConfig) -> SchedulerMetri
 
     automatic = AutomaticLRScheduleConfig(
         enabled=True,
-        warmup_ratio=cfg.policy.scheduler_warmup_ratio,
-        decay_ratio=cfg.policy.scheduler_decay_ratio,
-        final_lr_ratio=cfg.policy.scheduler_final_lr_ratio,
+        warmup_ratio=getattr(policy, "scheduler_warmup_ratio"),
+        decay_ratio=getattr(policy, "scheduler_decay_ratio"),
+        final_lr_ratio=getattr(policy, "scheduler_final_lr_ratio"),
     )
     resolved = resolve_cosine_decay_with_warmup_scheduler(
         cfg.scheduler,
         total_steps=cfg.steps,
         automatic=automatic,
     )
-    if resolved.peak_lr != cfg.policy.optimizer_lr:
+    policy_peak_lr = getattr(policy, "optimizer_lr", resolved.peak_lr)
+    if resolved.peak_lr != policy_peak_lr:
         raise ValueError(
             "Automatic LR scheduler peak_lr must match policy.optimizer_lr: "
-            f"{resolved.peak_lr} != {cfg.policy.optimizer_lr}"
+            f"{resolved.peak_lr} != {policy_peak_lr}"
         )
     if cfg.resume:
         fields = ("num_warmup_steps", "num_decay_steps", "peak_lr", "decay_lr")
@@ -634,9 +685,9 @@ def configure_automatic_lr_scheduler(cfg: TrainPipelineConfig) -> SchedulerMetri
 
     # Preserve the actual derived schedule in policy/train checkpoint config,
     # while retaining ratios as the source of truth for resume validation.
-    cfg.policy.scheduler_warmup_steps = resolved.num_warmup_steps
-    cfg.policy.scheduler_decay_steps = resolved.num_decay_steps
-    cfg.policy.scheduler_decay_lr = resolved.decay_lr
+    policy.scheduler_warmup_steps = resolved.num_warmup_steps
+    policy.scheduler_decay_steps = resolved.num_decay_steps
+    policy.scheduler_decay_lr = resolved.decay_lr
     metrics = SchedulerMetricContext(
         warmup_steps=resolved.num_warmup_steps,
         decay_steps=resolved.num_decay_steps,
@@ -757,10 +808,9 @@ def _epoch_training_patches(
             _log_epoch_duration(duration, inner_cfg, steps_per_epoch, initial_step)
         elif (
             steps_per_epoch is None
-            and isinstance(inner_cfg.policy, SNVLAConfig)
             and (
-                inner_cfg.policy.state_dropout_enabled
-                or inner_cfg.policy.observation_noise_enabled
+                bool(getattr(inner_cfg.policy, "state_dropout_enabled", False))
+                or bool(getattr(inner_cfg.policy, "observation_noise_enabled", False))
             )
         ):
             steps_per_epoch = epochs_to_steps(
@@ -802,6 +852,14 @@ def _epoch_training_patches(
         return {"epoch": step // steps_per_epoch, "start_index": 0}
 
     def make_processors_with_current_snvla_config(policy_cfg, *args, **kwargs):
+        if isinstance(policy_cfg, MolmoAct2SNVLAConfig):
+            preprocessor, postprocessor = make_snvla_molmoact2_pre_post_processors(
+                policy_cfg,
+                dataset_stats=kwargs.get("dataset_stats"),
+                dataset_meta=kwargs.get("dataset_meta"),
+            )
+            _assert_current_molmoact2_snvla_processor_config(preprocessor, policy_cfg)
+            return preprocessor, postprocessor
         if not isinstance(policy_cfg, SNVLAConfig):
             return original_make_processors(policy_cfg, *args, **kwargs)
 
@@ -877,14 +935,10 @@ def main(accelerator: Accelerator | None = None) -> None:
                 "Signal checkpoints are unsupported for remote jobs because the staged "
                 "lerobot-train command cannot install the SNVLA signal controller"
             )
-        if (
-            isinstance(cfg.policy, SNVLAConfig)
-            and cfg.policy.scheduler_auto_steps_enabled
-            and cfg.job.is_remote
-        ):
+        if bool(getattr(cfg.policy, "scheduler_auto_steps_enabled", False)) and cfg.job.is_remote:
             raise ValueError(
                 "Automatic LR scheduler adjustment is unsupported for remote jobs because "
-                "the staged lerobot-train command cannot resolve the SNVLA runtime schedule"
+                "the staged lerobot-train command cannot resolve the runtime schedule"
             )
         original_update_policy = lerobot_train.update_policy
         try:

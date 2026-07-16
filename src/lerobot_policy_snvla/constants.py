@@ -11,6 +11,8 @@ OBSERVATION_NOISE_MASK = "observation_noise_mask"
 OBSERVATION_NOISE_SCALE = "observation_noise_scale"
 TRAINING_EPOCH = "training_epoch"
 NARRATION_TARGET_MASK = "narration_target_mask"
+SNVLA_NARRATION_LABELS = "snvla_narration_labels"
+SNVLA_STATE_HIDDEN_PREFIX = "snvla_state_hidden."
 
 GROUP_METRIC_NUMERATOR_PREFIX = "__metric_numerator__/"
 GROUP_METRIC_COUNT_PREFIX = "__metric_count__/"
