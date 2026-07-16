@@ -3,7 +3,9 @@ import base64
 import bisect
 import concurrent.futures
 import contextlib
+import html
 import io
+import json
 import logging
 import sys
 import time
@@ -47,12 +49,34 @@ CONFIG = VisualizerConfig()
 
 
 NARRATION_DIV_TEMPLATE = """
+<style>
+@keyframes snvla-narration-highlight {{
+    0% {{
+        background-color: #fff19c;
+        color: #000;
+        font-weight: 700;
+        box-shadow: 0 0 0 3px rgba(255, 193, 7, 0.35);
+    }}
+    70% {{
+        background-color: #fff7cf;
+        color: #222;
+        font-weight: 600;
+        box-shadow: 0 0 0 1px rgba(255, 193, 7, 0.15);
+    }}
+    100% {{
+        background-color: transparent;
+        color: #444;
+        font-weight: 400;
+        box-shadow: none;
+    }}
+}}
+</style>
 <div style="width: 100%; height: 100%; display: flex; flex-direction: column; gap: 10px; font-family: sans-serif;">
     <div style="display: flex; flex-direction: row; align-items: flex-start; gap: 10px;">
         <div style="font-size: 20px;">🤖</div>
         <div style="font-size: {font_size}; background-color: #e9e9eb; padding: 10px; border-radius: 15px; border-top-left-radius: 0; max-width: 90%;">
             <span style="color: #444;">{previous_narrations}</span>
-            <span style="font-weight: bold; color: #000;">{current_narration}</span>
+            <span style="{current_style}">{current_narration}</span>
         </div>
     </div>
 </div>
@@ -80,6 +104,40 @@ def safe_item(val):
     if hasattr(val, "item"):
         return val.item()
     return val
+
+
+def _format_narration_html(value):
+    """Escape model text and preserve visible line-break markers."""
+    return html.escape(value).replace("\n", "<span style='color: #aaa;'>↵</span><br>")
+
+
+def _parse_previous_narrations(value, fallback):
+    """Return the recorded narration history, falling back if it is unusable."""
+    if not isinstance(value, str) or not value:
+        return fallback, False
+    try:
+        narrations = json.loads(value)
+    except json.JSONDecodeError:
+        return fallback, False
+    if not isinstance(narrations, list) or not all(isinstance(item, str) for item in narrations):
+        return fallback, False
+    return "".join(narrations), True
+
+
+def _render_narration(previous, current, font_size):
+    """Render history and animate only a newly generated fragment."""
+    current_style = (
+        "display: inline; border-radius: 3px; "
+        "animation: snvla-narration-highlight 500ms ease-out forwards;"
+        if current
+        else "color: #444; font-weight: 400;"
+    )
+    return NARRATION_DIV_TEMPLATE.format(
+        font_size=font_size,
+        previous_narrations=_format_narration_html(previous),
+        current_narration=_format_narration_html(current),
+        current_style=current_style,
+    )
 
 
 def _frames_to_rgba(frames):
@@ -245,15 +303,22 @@ def load_data(
             return [default] * (to_idx - from_idx)
         return [safe_item(value) for value in column]
 
-    current_narrations = [
-        str(value).replace("\n", "<span style='color: #aaa;'>↵</span><br>")
-        for value in values("current_narration", "")
-    ]
+    current_narrations = [str(value or "") for value in values("current_narration", "")]
+    recorded_previous = values("previous_narrations", "")
     previous_narrations = []
-    previous = ""
-    for narration in current_narrations:
+    reconstructed_previous = ""
+    fallback_count = 0
+    for narration, recorded in zip(current_narrations, recorded_previous, strict=True):
+        previous, used_recorded = _parse_previous_narrations(recorded, reconstructed_previous)
         previous_narrations.append(previous)
-        previous += narration
+        fallback_count += not used_recorded
+        reconstructed_previous += narration
+    if fallback_count:
+        logging.warning(
+            "Used reconstructed narration history for %d/%d frames because previous_narrations was missing or invalid.",
+            fallback_count,
+            len(current_narrations),
+        )
 
     timestamp_column = rows.get("real_timestamp")
     if timestamp_column is None:
@@ -430,10 +495,10 @@ def create_visualization(doc):
     # 2. Narration Box (Robot)
     # We combine previous and current narration into one chat-like interface
     narration_div = Div(
-        text=NARRATION_DIV_TEMPLATE.format(
-            font_size=CONFIG.narration_font_size,
-            previous_narrations=data["previous_narrations"][0],
-            current_narration=data["current_narration"][0],
+        text=_render_narration(
+            data["previous_narrations"][0],
+            data["current_narration"][0],
+            CONFIG.narration_font_size,
         ),
         width=CONFIG.narration_width,
         height=CONFIG.narration_height - 100,  # Substract instruction height
@@ -549,7 +614,9 @@ def create_visualization(doc):
     )
 
     # --- Callbacks ---
-    last_narration = {"value": None}
+    last_narration = {
+        "value": data["previous_narrations"][0] + data["current_narration"][0],
+    }
 
     def update(attr, old, new):
         idx = int(new)
@@ -558,12 +625,15 @@ def create_visualization(doc):
         # sending the growing conversation history through the WebSocket.
         prev = data["previous_narrations"][idx]
         curr = data["current_narration"][idx]
-        narration_value = (prev, curr)
+        # At the next frame, the current fragment moves into the recorded
+        # history. The combined text is unchanged, so retain the DOM long
+        # enough for the 500 ms highlight animation to finish.
+        narration_value = prev + curr
         if narration_value != last_narration["value"]:
-            narration_div.text = NARRATION_DIV_TEMPLATE.format(
-                font_size=CONFIG.narration_font_size,
-                previous_narrations=prev,
-                current_narration=curr,
+            narration_div.text = _render_narration(
+                prev,
+                curr,
+                CONFIG.narration_font_size,
             )
             last_narration["value"] = narration_value
 

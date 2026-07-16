@@ -8,6 +8,8 @@ from PIL import Image
 from lerobot_policy_snvla.scripts.visualize_snvla_eval import (
     EpisodeImageLoader,
     _frames_to_data_urls,
+    _parse_previous_narrations,
+    _render_narration,
 )
 
 
@@ -22,6 +24,25 @@ def test_frames_to_data_urls_encodes_browser_decodable_webp():
     with Image.open(io.BytesIO(payload)) as image:
         assert image.format == "WEBP"
         assert image.size == (16, 16)
+
+
+def test_previous_narrations_uses_recorded_json_and_falls_back_safely():
+    recorded, used_recorded = _parse_previous_narrations('["first", " (done)\\n"]', "fallback")
+    invalid, used_invalid = _parse_previous_narrations("{invalid", "fallback")
+
+    assert recorded == "first (done)\n"
+    assert used_recorded is True
+    assert invalid == "fallback"
+    assert used_invalid is False
+
+
+def test_new_narration_highlight_fades_to_normal_in_half_a_second():
+    rendered = _render_narration("<history>\n", "new & current", "14px")
+
+    assert "&lt;history&gt;" in rendered
+    assert "new &amp; current" in rendered
+    assert "snvla-narration-highlight 500ms" in rendered
+    assert "font-weight: 400" in rendered
 
 
 def test_episode_image_loader_prefetches_next_compressed_chunk():
