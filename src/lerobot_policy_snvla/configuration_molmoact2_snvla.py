@@ -16,6 +16,10 @@ class MolmoAct2SNVLAConfig(MolmoAct2Config):
     max_state_dim: int = 32
     max_action_dim: int = 32
     expected_max_action_dim: int = 32
+    # The official inferred cap budgets only a short task string. SNVLA also
+    # carries natural-language narration history; the current 500-episode
+    # curriculum reaches 605 tokens, so retain a rounded safety margin.
+    max_sequence_length: int | None = 768
 
     # Preserve the VLM with parameter-efficient adaptation while training the
     # native continuous action expert in full.

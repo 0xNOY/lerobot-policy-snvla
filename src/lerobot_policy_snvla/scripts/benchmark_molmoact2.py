@@ -420,6 +420,14 @@ def _run_optimizer_step(
 
 
 def _infer_micro_batch_size(batch: dict[str, Any]) -> int:
+    # MolmoAct2 flattens image patches across the batch, so tensors such as
+    # pixel_values and image_input_idx do not have the batch size as their
+    # leading dimension. The padded text rows remain one-to-one with examples.
+    for key in ("attention_mask", "input_ids"):
+        value = batch.get(key)
+        if isinstance(value, Tensor) and value.ndim > 0:
+            return int(value.shape[0])
+
     sizes = {
         int(value.shape[0])
         for key, value in batch.items()

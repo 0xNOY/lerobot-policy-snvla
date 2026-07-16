@@ -5,6 +5,7 @@ import torch
 
 from lerobot_policy_snvla.scripts.benchmark_molmoact2 import (
     CaseSpec,
+    _infer_micro_batch_size,
     annotate_accumulation_efficiency,
     apply_parity_gates,
     default_plan,
@@ -30,6 +31,17 @@ def make_trial(_case):
     model = ScalarLossModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     return model, {"x": torch.ones(2)}, optimizer
+
+
+def test_micro_batch_inference_ignores_flattened_molmo_image_dimensions():
+    batch = {
+        "attention_mask": torch.ones(2, 640, dtype=torch.bool),
+        "input_ids": torch.ones(2, 640, dtype=torch.long),
+        "pixel_values": torch.ones(4, 3, 378, 378),
+        "image_input_idx": torch.ones(784, 2, dtype=torch.long),
+    }
+
+    assert _infer_micro_batch_size(batch) == 2
 
 
 def test_default_plan_has_separate_parity_groups_for_different_flow_targets():

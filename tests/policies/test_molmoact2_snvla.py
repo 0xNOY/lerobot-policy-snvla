@@ -51,6 +51,7 @@ def test_molmoact2_snvla_defaults_avoid_discrete_action_tokens():
     assert config.enable_lora_vlm is True
     assert config.enable_lora_action_expert is False
     assert config.train_action_expert_only is False
+    assert config.max_sequence_length == 768
     assert config.state_dropout_start_epoch == 0
     assert config.observation_noise_start_epoch == 0
 
