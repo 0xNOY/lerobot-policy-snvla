@@ -130,7 +130,7 @@ def _make_dataset(dataset_root: Path, chunk_size: int) -> LeRobotDataset:
     )
 
 
-def _config(case: dict[str, Any]) -> MolmoAct2SNVLAConfig:
+def _config(case: dict[str, Any], *, image_keys: list[str]) -> MolmoAct2SNVLAConfig:
     overrides = case["overrides"]
     device = case["device"]
     return MolmoAct2SNVLAConfig(
@@ -155,10 +155,7 @@ def _config(case: dict[str, Any]) -> MolmoAct2SNVLAConfig:
         observation_noise_enabled=False,
         setup_type="single franka robotic arm in libero",
         control_mode="delta end-effector pose",
-        image_keys=[
-            "observation.images.image",
-            "observation.images.wrist_image",
-        ],
+        image_keys=image_keys,
         push_to_hub=False,
     )
 
@@ -169,8 +166,11 @@ def make_molmoact2_benchmark_trial(
     """Build one real MolmoAct2 SNVLA training trial for benchmark_molmoact2."""
 
     dataset_root = _dataset_root()
-    config = _config(case)
-    dataset = _make_dataset(dataset_root, config.chunk_size)
+    dataset = _make_dataset(dataset_root, chunk_size=10)
+    image_keys = list(dataset.meta.camera_keys)
+    if not image_keys:
+        raise ValueError("MolmoAct2 benchmark dataset must expose at least one camera key.")
+    config = _config(case, image_keys=image_keys)
     micro_batch_size = int(case["overrides"]["micro_batch_size"])
     rows = _load_or_create_manifest(dataset_root, len(dataset), int(case["seed"]))
     frame_ids = [int(value) for value in dataset.hf_dataset["index"]]
