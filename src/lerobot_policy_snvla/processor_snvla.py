@@ -104,8 +104,15 @@ def _apply_observation_noise(
             stream="state",
             device=state.device,
             dtype=state.dtype,
+        ).clamp(
+            -config.observation_noise_standard_normal_clip,
+            config.observation_noise_standard_normal_clip,
         )
-        state[row] = (state[row] + scales[row].to(state.device) * noise).clamp(-1.0, 1.0)
+        # QUANTILES normalization legitimately leaves q01/q99 outliers outside
+        # [-1, 1].  Clamping the resulting state would snap those observations
+        # to a quantile boundary even when the sampled scale is almost zero.
+        # Bound the perturbation instead and preserve the original observation.
+        state[row] = state[row] + scales[row].to(state.device) * noise
     result[OBS_STATE] = state
 
     for image_key in sorted(config.image_features):
@@ -122,6 +129,9 @@ def _apply_observation_noise(
                 stream=f"image:{image_key}",
                 device=image.device,
                 dtype=image.dtype,
+            ).clamp(
+                -config.observation_noise_standard_normal_clip,
+                config.observation_noise_standard_normal_clip,
             )
             image[row] = (image[row] + scales[row].to(image.device) * noise).clamp(0.0, 1.0)
         result[image_key] = image

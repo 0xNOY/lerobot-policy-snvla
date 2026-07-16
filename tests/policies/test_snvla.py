@@ -159,7 +159,8 @@ def test_observation_noise_config_defaults_and_validation():
     assert cfg.observation_noise_ratio == pytest.approx(0.25)
     assert cfg.observation_noise_seed == 0
     assert cfg.observation_noise_scale_min == pytest.approx(0.0)
-    assert cfg.observation_noise_scale_max == pytest.approx(0.5)
+    assert cfg.observation_noise_scale_max == pytest.approx(0.025)
+    assert cfg.observation_noise_standard_normal_clip == pytest.approx(2.0)
     for changes in (
         {"observation_noise_ratio": -0.01},
         {"observation_noise_ratio": 0.51},
@@ -167,6 +168,8 @@ def test_observation_noise_config_defaults_and_validation():
         {"observation_noise_scale_min": float("nan")},
         {"observation_noise_scale_max": float("inf")},
         {"observation_noise_scale_min": 0.3, "observation_noise_scale_max": 0.2},
+        {"observation_noise_standard_normal_clip": 0.0},
+        {"observation_noise_standard_normal_clip": float("inf")},
     ):
         with pytest.raises(ValueError, match="observation_noise"):
             dataclasses.replace(cfg, **changes)
@@ -322,7 +325,8 @@ def test_processor_observation_noise_is_row_keyed_clipped_and_shared_with_prompt
     assert complementary[OBSERVATION_NOISE_MASK].tolist() == [True, False]
     assert 0.1 <= complementary[OBSERVATION_NOISE_SCALE][0] <= 0.4
     assert complementary[OBSERVATION_NOISE_SCALE][1] == 0
-    assert observation[OBS_STATE].min() >= -1 and observation[OBS_STATE].max() <= 1
+    max_state_delta = complementary[OBSERVATION_NOISE_SCALE][0] * cfg.observation_noise_standard_normal_clip
+    assert torch.all((observation[OBS_STATE][0] - 0.9).abs() <= max_state_delta + 1e-6)
     for key in (image1, image2):
         assert observation[key].min() >= 0 and observation[key].max() <= 1
     assert not torch.equal(observation[image1][0], observation[image2][0])
@@ -372,6 +376,27 @@ def test_observation_noise_scale_and_realization_are_order_independent():
     torch.testing.assert_close(permuted_scales, scales[permutation])
     torch.testing.assert_close(permuted[OBS_STATE], noisy[OBS_STATE][permutation])
     torch.testing.assert_close(permuted[image_key], noisy[image_key][permutation])
+
+
+def test_zero_scale_noise_preserves_quantile_state_outliers():
+    cfg = dataclasses.replace(
+        make_test_config(),
+        observation_noise_enabled=True,
+        observation_noise_scale_min=0.0,
+        observation_noise_scale_max=0.0,
+    )
+    original = torch.tensor([[1.4, -1.3, 0.0, 0.2, -0.2, 0.5]])
+
+    noisy, scales = _apply_observation_noise(
+        {OBS_STATE: original},
+        torch.tensor([17]),
+        0,
+        torch.tensor([True]),
+        cfg,
+    )
+
+    torch.testing.assert_close(scales, torch.zeros(1))
+    torch.testing.assert_close(noisy[OBS_STATE], original)
 
 
 def test_observation_noise_can_overlap_state_dropout_without_masking_losses(monkeypatch):

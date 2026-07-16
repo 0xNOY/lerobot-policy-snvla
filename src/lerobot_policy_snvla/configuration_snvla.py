@@ -71,7 +71,11 @@ class SNVLAConfig(PreTrainedConfig):
     observation_noise_ratio: float = 0.25
     observation_noise_seed: int = 0
     observation_noise_scale_min: float = 0.0
-    observation_noise_scale_max: float = 0.5
+    # Noise is applied in normalized coordinates.  Keep the default deliberately
+    # small: for the T1 state statistics, 0.025 with a 2-sigma cap bounds the
+    # largest xyz perturbation to roughly 7/14/10 mm.
+    observation_noise_scale_max: float = 0.025
+    observation_noise_standard_normal_clip: float = 2.0
 
     # 実況トークンの損失重み（1.0 = 通常、>1.0 = より重要視）
     narration_loss_weight: float = 5.0
@@ -109,6 +113,10 @@ class SNVLAConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
+    scheduler_auto_steps_enabled: bool = False
+    scheduler_warmup_ratio: float = 1.0 / 30.0
+    scheduler_decay_ratio: float = 1.0
+    scheduler_final_lr_ratio: float = 0.1
 
     def __post_init__(self):
         super().__post_init__()
@@ -149,6 +157,25 @@ class SNVLAConfig(PreTrainedConfig):
                 "observation_noise_scale_max must be finite and greater than or equal to "
                 "observation_noise_scale_min"
             )
+        if (
+            not math.isfinite(self.observation_noise_standard_normal_clip)
+            or self.observation_noise_standard_normal_clip <= 0
+        ):
+            raise ValueError("observation_noise_standard_normal_clip must be finite and positive")
+        if not math.isfinite(self.scheduler_warmup_ratio) or not (
+            0.0 <= self.scheduler_warmup_ratio < 1.0
+        ):
+            raise ValueError("scheduler_warmup_ratio must be finite and in [0.0, 1.0)")
+        if not math.isfinite(self.scheduler_decay_ratio) or not (
+            0.0 < self.scheduler_decay_ratio <= 1.0
+        ):
+            raise ValueError("scheduler_decay_ratio must be finite and in (0.0, 1.0]")
+        if self.scheduler_warmup_ratio >= self.scheduler_decay_ratio:
+            raise ValueError("scheduler_warmup_ratio must be smaller than scheduler_decay_ratio")
+        if not math.isfinite(self.scheduler_final_lr_ratio) or not (
+            0.0 < self.scheduler_final_lr_ratio <= 1.0
+        ):
+            raise ValueError("scheduler_final_lr_ratio must be finite and in (0.0, 1.0]")
         if self.gradient_checkpointing_interval <= 0:
             raise ValueError("gradient_checkpointing_interval must be positive")
         if self.attention_backend not in {"eager", "sdpa"}:

@@ -10,6 +10,8 @@ import json
 import logging
 import math
 import os
+import signal
+import socket
 import sys
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -32,9 +34,15 @@ from lerobot_policy_snvla.constants import (
 )
 from lerobot_policy_snvla.configuration_snvla import SNVLAConfig
 from lerobot_policy_snvla.processor_snvla import SNVLAPrepareTrainingTokenizerProcessorStep
+from lerobot_policy_snvla.training_runtime import (
+    AutomaticLRScheduleConfig,
+    resolve_cosine_decay_with_warmup_scheduler,
+)
 
 _lerobot_update_policy = lerobot_train.update_policy
 _active_epoch_metrics: "EpochMetricContext | None" = None
+_active_signal_checkpoint: "SignalCheckpointController | None" = None
+_active_scheduler_metrics: "SchedulerMetricContext | None" = None
 
 _SNVLA_TOKENIZER_STEP = "snvla_prepare_training_tokenizer_processor_step"
 _PI05_BASE_PRETRAINED_PATH = "lerobot/pi05_base"
@@ -48,6 +56,7 @@ _SNVLA_PROCESSOR_CONFIG_FIELDS = (
     "observation_noise_seed",
     "observation_noise_scale_min",
     "observation_noise_scale_max",
+    "observation_noise_standard_normal_clip",
     "n_action_steps",
     "max_state_dim",
     "max_action_dim",
@@ -79,6 +88,14 @@ class EpochMetricContext:
     calculated_steps: int
     steps_per_epoch: int
     initial_step: int
+
+
+@dataclass(frozen=True)
+class SchedulerMetricContext:
+    warmup_steps: int
+    decay_steps: int
+    peak_lr: float
+    final_lr: float
 
 
 def _record_globally_weighted_metrics(
@@ -143,10 +160,14 @@ def record_output_metrics(
 
 def update_policy(*args, **kwargs):
     """Delegate optimization to LeRobot and register its scalar policy outputs."""
+    if _active_signal_checkpoint is not None:
+        _active_signal_checkpoint.restore_original_save_frequency()
     train_metrics, output_dict = _lerobot_update_policy(*args, **kwargs)
     accelerator = kwargs.get("accelerator")
     if accelerator is None and len(args) > 5:
         accelerator = args[5]
+    if _active_signal_checkpoint is not None:
+        _active_signal_checkpoint.sync_after_update(train_metrics.steps + 1)
     if _active_epoch_metrics is not None:
         if output_dict is None:
             output_dict = {}
@@ -160,6 +181,22 @@ def update_policy(*args, **kwargs):
                 "effective_epoch_progress": torch.tensor(
                     current_step / _active_epoch_metrics.steps_per_epoch
                 ),
+            }
+        )
+    if _active_scheduler_metrics is not None:
+        if output_dict is None:
+            output_dict = {}
+        output_dict.update(
+            {
+                "lr_scheduler_auto_adjusted": torch.tensor(1.0),
+                "lr_scheduler_warmup_steps": torch.tensor(
+                    _active_scheduler_metrics.warmup_steps
+                ),
+                "lr_scheduler_decay_steps": torch.tensor(
+                    _active_scheduler_metrics.decay_steps
+                ),
+                "lr_scheduler_peak_lr": torch.tensor(_active_scheduler_metrics.peak_lr),
+                "lr_scheduler_final_lr": torch.tensor(_active_scheduler_metrics.final_lr),
             }
         )
     record_output_metrics(train_metrics, output_dict, accelerator)
@@ -213,6 +250,181 @@ class TrainingDuration:
     epochs: float | None
     save_every_epochs: float | None
     remaining_argv: list[str]
+
+
+@dataclass(frozen=True)
+class SignalCheckpointOptions:
+    """Entrypoint-only signal checkpoint flags removed before Draccus parsing."""
+
+    signal_name: str | None
+    pid_file: Path | None
+    remaining_argv: list[str]
+
+
+def parse_signal_checkpoint_options(argv: Sequence[str]) -> SignalCheckpointOptions:
+    """Parse opt-in checkpoint signaling without intercepting termination signals."""
+
+    values: dict[str, str | None] = {
+        "--checkpoint-on-signal": None,
+        "--signal-checkpoint-pid-file": None,
+    }
+    seen: set[str] = set()
+    remaining: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        matched = False
+        for option in values:
+            raw_value: str | None = None
+            if argument == option:
+                raw_value = argv[index + 1] if index + 1 < len(argv) else None
+                consumed = 2
+            elif argument.startswith(f"{option}="):
+                raw_value = argument.split("=", 1)[1]
+                consumed = 1
+            else:
+                continue
+            if option in seen:
+                raise ValueError(f"Duplicate {option} is not allowed")
+            if raw_value is None or not raw_value.strip():
+                raise ValueError(f"{option} requires a value")
+            seen.add(option)
+            values[option] = raw_value.strip()
+            index += consumed
+            matched = True
+            break
+        if not matched:
+            remaining.append(argument)
+            index += 1
+
+    signal_name = values["--checkpoint-on-signal"]
+    if signal_name is not None:
+        signal_name = signal_name.upper()
+        if signal_name in {"DISABLED", "NONE", "OFF"}:
+            signal_name = None
+        allowed = {name for name in ("SIGUSR1", "SIGUSR2") if hasattr(signal, name)}
+        if signal_name is not None and signal_name not in allowed:
+            raise ValueError(
+                "--checkpoint-on-signal must be SIGUSR1 or SIGUSR2; "
+                "termination signals are intentionally unsupported"
+            )
+    raw_pid_file = values["--signal-checkpoint-pid-file"]
+    if raw_pid_file is not None and signal_name is None:
+        raise ValueError("--signal-checkpoint-pid-file requires --checkpoint-on-signal")
+    return SignalCheckpointOptions(
+        signal_name=signal_name,
+        pid_file=Path(raw_pid_file).expanduser() if raw_pid_file is not None else None,
+        remaining_argv=remaining,
+    )
+
+
+class SignalCheckpointController:
+    """Turn a process-local Unix signal into an all-rank safe-step save request."""
+
+    def __init__(self, cfg: TrainPipelineConfig, accelerator: Accelerator, signum: int, pid_file: Path | None):
+        if not cfg.save_checkpoint:
+            raise ValueError("--checkpoint-on-signal requires --save_checkpoint=true")
+        if cfg.save_freq <= 0:
+            raise ValueError("Signal checkpoints require a positive save_freq")
+        self.cfg = cfg
+        self.accelerator = accelerator
+        self.signum = signum
+        self.original_save_freq = cfg.save_freq
+        self.pid_file = pid_file
+        self.pid_file_published = False
+        self.request_generation = 0
+        self.observed_generation = 0
+        self.trigger_step: int | None = None
+
+    def handle_signal(self, signum, _frame) -> None:
+        if signum == self.signum:
+            # Signal handlers must stay async-safe at the Python level: no
+            # logging, filesystem work, CUDA calls, or distributed collectives.
+            self.request_generation += 1
+
+    def restore_original_save_frequency(self) -> None:
+        if self.trigger_step is not None:
+            self.cfg.save_freq = self.original_save_freq
+            self.trigger_step = None
+
+    def refresh_original_save_frequency(self) -> None:
+        """Capture save_freq after epoch-based duration resolution."""
+        if self.trigger_step is not None:
+            raise RuntimeError("Cannot refresh save frequency while a signal save is armed")
+        if self.cfg.save_freq <= 0:
+            raise ValueError("Signal checkpoints require a positive resolved save_freq")
+        self.original_save_freq = self.cfg.save_freq
+
+    def sync_after_update(self, completed_step: int) -> bool:
+        """Synchronize requests and arm the existing checkpoint branch for this step."""
+        generation_snapshot = self.request_generation
+        local_pending = generation_snapshot != self.observed_generation
+        request = torch.tensor(
+            int(local_pending),
+            device=getattr(self.accelerator, "device", torch.device("cpu")),
+            dtype=torch.int32,
+        )
+        request = self.accelerator.reduce(request, reduction="max")
+        if local_pending:
+            # A signal arriving after the snapshot increments the generation and
+            # remains pending for the next step instead of being cleared here.
+            self.observed_generation = generation_snapshot
+        if not bool(request.item()):
+            return False
+
+        scheduled = completed_step % self.original_save_freq == 0 or completed_step == self.cfg.steps
+        if not scheduled:
+            # LeRobot calculates `is_saving_step` immediately after this wrapped
+            # update returns.  Restore before serializing cfg in save_checkpoint.
+            self.cfg.save_freq = completed_step
+            self.trigger_step = completed_step
+        if getattr(self.accelerator, "is_main_process", False):
+            logging.info(
+                "External checkpoint request accepted after step %s%s",
+                completed_step,
+                " (coalesced with scheduled save)" if scheduled else "",
+            )
+        return True
+
+    def publish_pid_file(self) -> Path | None:
+        if not getattr(self.accelerator, "is_main_process", False):
+            return None
+        path = self.pid_file or (Path(self.cfg.output_dir) / "signal_checkpoint_rank0.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "process_index": getattr(self.accelerator, "process_index", 0),
+            "num_processes": getattr(self.accelerator, "num_processes", 1),
+            "signal": signal.Signals(self.signum).name,
+        }
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+        self.pid_file = path
+        self.pid_file_published = True
+        logging.info(
+            "Signal checkpoint ready: kill -%s %s (metadata: %s)",
+            payload["signal"].removeprefix("SIG"),
+            payload["pid"],
+            path,
+        )
+        return path
+
+    def remove_pid_file(self) -> None:
+        if (
+            self.pid_file is None
+            or not self.pid_file_published
+            or not getattr(self.accelerator, "is_main_process", False)
+        ):
+            return
+        try:
+            payload = json.loads(self.pid_file.read_text())
+            if payload.get("pid") == os.getpid():
+                self.pid_file.unlink(missing_ok=True)
+                self.pid_file_published = False
+        except (OSError, json.JSONDecodeError, AttributeError):
+            logging.warning("Could not safely remove signal checkpoint metadata: %s", self.pid_file)
 
 
 def _positive_finite_float(value: str | None, option: str) -> float:
@@ -378,6 +590,69 @@ def configure_epoch_duration(
     return steps_per_epoch, initial_step
 
 
+def configure_automatic_lr_scheduler(cfg: TrainPipelineConfig) -> SchedulerMetricContext | None:
+    """Fit SNVLA's cosine preset to the resolved total training steps."""
+    if not isinstance(cfg.policy, SNVLAConfig) or not cfg.policy.scheduler_auto_steps_enabled:
+        return None
+    if not cfg.use_policy_training_preset:
+        raise ValueError(
+            "scheduler_auto_steps_enabled requires --use_policy_training_preset=true"
+        )
+    if cfg.scheduler is None:
+        raise ValueError("Automatic LR scheduling requires a resolved scheduler preset")
+
+    automatic = AutomaticLRScheduleConfig(
+        enabled=True,
+        warmup_ratio=cfg.policy.scheduler_warmup_ratio,
+        decay_ratio=cfg.policy.scheduler_decay_ratio,
+        final_lr_ratio=cfg.policy.scheduler_final_lr_ratio,
+    )
+    resolved = resolve_cosine_decay_with_warmup_scheduler(
+        cfg.scheduler,
+        total_steps=cfg.steps,
+        automatic=automatic,
+    )
+    if resolved.peak_lr != cfg.policy.optimizer_lr:
+        raise ValueError(
+            "Automatic LR scheduler peak_lr must match policy.optimizer_lr: "
+            f"{resolved.peak_lr} != {cfg.policy.optimizer_lr}"
+        )
+    if cfg.resume:
+        fields = ("num_warmup_steps", "num_decay_steps", "peak_lr", "decay_lr")
+        mismatches = [
+            name for name in fields if getattr(cfg.scheduler, name) != getattr(resolved, name)
+        ]
+        if mismatches:
+            raise ValueError(
+                "Automatic LR scheduler cannot change across resume; start a fresh run or "
+                "use the original total steps and ratios. Mismatched: " + ", ".join(mismatches)
+            )
+    else:
+        cfg.scheduler = resolved
+
+    # Preserve the actual derived schedule in policy/train checkpoint config,
+    # while retaining ratios as the source of truth for resume validation.
+    cfg.policy.scheduler_warmup_steps = resolved.num_warmup_steps
+    cfg.policy.scheduler_decay_steps = resolved.num_decay_steps
+    cfg.policy.scheduler_decay_lr = resolved.decay_lr
+    metrics = SchedulerMetricContext(
+        warmup_steps=resolved.num_warmup_steps,
+        decay_steps=resolved.num_decay_steps,
+        peak_lr=resolved.peak_lr,
+        final_lr=resolved.decay_lr,
+    )
+    logging.info(
+        "Automatic LR schedule: total_steps=%s, warmup_steps=%s, decay_steps=%s, "
+        "peak_lr=%s, final_lr=%s",
+        cfg.steps,
+        resolved.num_warmup_steps,
+        resolved.num_decay_steps,
+        resolved.peak_lr,
+        resolved.decay_lr,
+    )
+    return metrics
+
+
 def _log_epoch_duration(
     duration: TrainingDuration,
     cfg: TrainPipelineConfig,
@@ -403,23 +678,62 @@ def _parse_train_config(cfg: TrainPipelineConfig) -> TrainPipelineConfig:
 
 
 @contextmanager
+def _signal_checkpoint_patches(
+    options: SignalCheckpointOptions,
+    cfg: TrainPipelineConfig,
+    accelerator: Accelerator,
+):
+    """Install a scoped Unix-signal controller around LeRobot's save path."""
+    global _active_signal_checkpoint
+    if options.signal_name is None:
+        yield None
+        return
+
+    signum = int(getattr(signal, options.signal_name))
+    controller = SignalCheckpointController(cfg, accelerator, signum, options.pid_file)
+    previous_handler = signal.getsignal(signum)
+    previous_controller = _active_signal_checkpoint
+    original_save_checkpoint = lerobot_train.save_checkpoint
+
+    def save_checkpoint_with_original_frequency(*args, **kwargs):
+        controller.restore_original_save_frequency()
+        return original_save_checkpoint(*args, **kwargs)
+
+    signal.signal(signum, controller.handle_signal)
+    _active_signal_checkpoint = controller
+    lerobot_train.save_checkpoint = save_checkpoint_with_original_frequency
+    try:
+        yield controller
+    finally:
+        controller.restore_original_save_frequency()
+        controller.remove_pid_file()
+        lerobot_train.save_checkpoint = original_save_checkpoint
+        _active_signal_checkpoint = previous_controller
+        signal.signal(signum, previous_handler)
+
+
+@contextmanager
 def _epoch_training_patches(
     duration: TrainingDuration,
     accelerator: Accelerator,
+    signal_checkpoint: SignalCheckpointController | None = None,
 ):
     """Scope LeRobot hooks to this entrypoint, including exceptional exits."""
-    global _active_epoch_metrics
+    global _active_epoch_metrics, _active_scheduler_metrics
     original_cycle = lerobot_train.cycle
     original_make_datasets = lerobot_train.make_train_eval_datasets
     original_make_processors = lerobot_train.make_pre_post_processors
     original_sampler_state = lerobot_train.compute_sampler_state
     original_epoch_metrics = _active_epoch_metrics
+    original_scheduler_metrics = _active_scheduler_metrics
     initial_step = 0
     steps_per_epoch: int | None = None
+    pid_file_published = False
+    scheduler_configured = False
 
     def make_datasets_and_set_duration(inner_cfg):
-        global _active_epoch_metrics
-        nonlocal initial_step, steps_per_epoch
+        global _active_epoch_metrics, _active_scheduler_metrics
+        nonlocal initial_step, steps_per_epoch, pid_file_published, scheduler_configured
         dataset, eval_dataset = original_make_datasets(inner_cfg)
         if duration.epochs is not None and steps_per_epoch is None:
             steps_per_epoch, initial_step = configure_epoch_duration(
@@ -460,6 +774,13 @@ def _epoch_training_patches(
                 steps_per_epoch,
                 initial_step,
             )
+        if not scheduler_configured:
+            _active_scheduler_metrics = configure_automatic_lr_scheduler(inner_cfg)
+            scheduler_configured = True
+        if signal_checkpoint is not None and not pid_file_published:
+            signal_checkpoint.refresh_original_save_frequency()
+            signal_checkpoint.publish_pid_file()
+            pid_file_published = True
         return dataset, eval_dataset
 
     def cycle_with_epochs(dataloader):
@@ -511,6 +832,7 @@ def _epoch_training_patches(
         yield
     finally:
         _active_epoch_metrics = original_epoch_metrics
+        _active_scheduler_metrics = original_scheduler_metrics
         lerobot_train.make_pre_post_processors = original_make_processors
         lerobot_train.compute_sampler_state = original_sampler_state
         lerobot_train.cycle = original_cycle
@@ -530,9 +852,10 @@ class NativeBF16FSDPAccelerator(Accelerator):
 def main(accelerator: Accelerator | None = None) -> None:
     require_wandb_cli_args(sys.argv)
     duration = parse_training_duration(sys.argv[1:])
+    signal_options = parse_signal_checkpoint_options(duration.remaining_argv)
     original_argv = sys.argv[:]
     try:
-        sys.argv[1:] = duration.remaining_argv
+        sys.argv[1:] = signal_options.remaining_argv
         lerobot_train.register_third_party_plugins()
         cfg = _parse_train_config()
         if accelerator is None:
@@ -547,11 +870,26 @@ def main(accelerator: Accelerator | None = None) -> None:
                 "command cannot install SNVLA epoch annotation; run this entrypoint locally or "
                 "use explicit --steps"
             )
+        if signal_options.signal_name is not None and cfg.job.is_remote:
+            raise ValueError(
+                "Signal checkpoints are unsupported for remote jobs because the staged "
+                "lerobot-train command cannot install the SNVLA signal controller"
+            )
+        if (
+            isinstance(cfg.policy, SNVLAConfig)
+            and cfg.policy.scheduler_auto_steps_enabled
+            and cfg.job.is_remote
+        ):
+            raise ValueError(
+                "Automatic LR scheduler adjustment is unsupported for remote jobs because "
+                "the staged lerobot-train command cannot resolve the SNVLA runtime schedule"
+            )
         original_update_policy = lerobot_train.update_policy
         try:
             lerobot_train.update_policy = update_policy
-            with _epoch_training_patches(duration, accelerator):
-                lerobot_train.train(cfg, accelerator=accelerator)
+            with _signal_checkpoint_patches(signal_options, cfg, accelerator) as signal_checkpoint:
+                with _epoch_training_patches(duration, accelerator, signal_checkpoint):
+                    lerobot_train.train(cfg, accelerator=accelerator)
         finally:
             lerobot_train.update_policy = original_update_policy
     finally:
