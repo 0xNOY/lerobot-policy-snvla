@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
@@ -19,8 +18,6 @@ from .constants import (
     STATE_DROPOUT_MASK,
 )
 from .runtime import SNVLARuntimeMixin
-
-logger = logging.getLogger(__name__)
 
 
 def narration_ce_per_example(
@@ -74,7 +71,7 @@ class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
 
     def __init__(self, config: MolmoAct2SNVLAConfig, *args, **kwargs) -> None:
         super().__init__(config, *args, **kwargs)
-        logger.info("All keys loaded successfully!")
+        print("All keys loaded successfully!", flush=True)
         self.latest_metrics: dict[str, Any] = {}
         self._previous_narrations: list[str] = []
         self._snvla_text_processor: Any | None = None
