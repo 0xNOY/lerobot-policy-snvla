@@ -287,6 +287,7 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
                 epoch=training_epoch,
                 ratio=self.config.state_dropout_ratio,
                 seed=self.config.state_dropout_seed,
+                start_epoch=self.config.state_dropout_start_epoch,
             )
         if self.config.observation_noise_enabled:
             assert frame_ids is not None and training_epoch is not None
@@ -295,6 +296,7 @@ class SNVLAPrepareTrainingTokenizerProcessorStep(ProcessorStep):
                 epoch=training_epoch,
                 ratio=self.config.observation_noise_ratio,
                 seed=self.config.observation_noise_seed,
+                start_epoch=self.config.observation_noise_start_epoch,
             )
             observation, noise_scales = _apply_observation_noise(
                 observation,

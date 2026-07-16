@@ -147,9 +147,13 @@ def test_state_dropout_config_defaults_and_validation():
     assert cfg.state_dropout_enabled is False
     assert cfg.state_dropout_ratio == pytest.approx(0.25)
     assert cfg.state_dropout_seed == 0
+    assert cfg.state_dropout_start_epoch == 1
     for invalid_ratio in (-0.01, 0.51):
         with pytest.raises(ValueError, match="state_dropout_ratio"):
             dataclasses.replace(cfg, state_dropout_ratio=invalid_ratio)
+    for invalid_epoch in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="state_dropout_start_epoch"):
+            dataclasses.replace(cfg, state_dropout_start_epoch=invalid_epoch)
 
 
 def test_observation_noise_config_defaults_and_validation():
@@ -158,12 +162,16 @@ def test_observation_noise_config_defaults_and_validation():
     assert cfg.observation_noise_enabled is False
     assert cfg.observation_noise_ratio == pytest.approx(0.25)
     assert cfg.observation_noise_seed == 0
+    assert cfg.observation_noise_start_epoch == 1
     assert cfg.observation_noise_scale_min == pytest.approx(0.0)
     assert cfg.observation_noise_scale_max == pytest.approx(0.025)
     assert cfg.observation_noise_standard_normal_clip == pytest.approx(2.0)
     for changes in (
         {"observation_noise_ratio": -0.01},
         {"observation_noise_ratio": 0.51},
+        {"observation_noise_start_epoch": -1},
+        {"observation_noise_start_epoch": True},
+        {"observation_noise_start_epoch": 1.5},
         {"observation_noise_scale_min": -0.01},
         {"observation_noise_scale_min": float("nan")},
         {"observation_noise_scale_max": float("inf")},
@@ -249,6 +257,40 @@ def test_state_dropout_schedule_is_deterministic_and_never_consecutive():
     assert torch.equal(masks[3], state_dropout_mask(frame_ids, 3, ratio=0.5, seed=7))
 
 
+def test_training_augmentations_can_start_at_epoch_zero_without_consecutive_rows():
+    frame_ids = torch.arange(1000)
+    dropout = [
+        state_dropout_mask(frame_ids, epoch, ratio=0.25, seed=7, start_epoch=0)
+        for epoch in range(3)
+    ]
+    noise = [
+        observation_noise_mask(frame_ids, epoch, ratio=0.25, seed=7, start_epoch=0)
+        for epoch in range(3)
+    ]
+
+    assert dropout[0].float().mean().item() == pytest.approx(0.25, abs=0.02)
+    assert noise[0].float().mean().item() == pytest.approx(0.25, abs=0.02)
+    for masks in (dropout, noise):
+        for previous, current in zip(masks[:-1], masks[1:], strict=True):
+            assert not (previous & current).any()
+
+
+def test_training_augmentation_start_epoch_shifts_schedule_phase():
+    frame_ids = torch.arange(257)
+
+    delayed = state_dropout_mask(
+        frame_ids, epoch=3, ratio=0.25, seed=19, start_epoch=3
+    )
+    first_legacy = state_dropout_mask(
+        frame_ids, epoch=1, ratio=0.25, seed=19, start_epoch=1
+    )
+
+    torch.testing.assert_close(delayed, first_legacy)
+    assert not state_dropout_mask(
+        frame_ids, epoch=2, ratio=0.25, seed=19, start_epoch=3
+    ).any()
+
+
 def test_state_dropout_schedule_is_rank_independent():
     frame_ids = torch.arange(257)
     full_mask = state_dropout_mask(frame_ids, epoch=4, ratio=0.25, seed=19)
@@ -307,7 +349,7 @@ def test_processor_observation_noise_is_row_keyed_clipped_and_shared_with_prompt
     monkeypatch.setattr(
         processor_snvla,
         "observation_noise_mask",
-        lambda frame_ids, epoch, ratio, seed: torch.tensor([True, False]),
+        lambda frame_ids, epoch, ratio, seed, start_epoch: torch.tensor([True, False]),
     )
 
     def process(order):
@@ -470,8 +512,14 @@ def test_processor_omits_state_line_but_keeps_all_training(monkeypatch, with_nar
     original_action = transition[TransitionKey.ACTION].clone()
     schedule_call = {}
 
-    def capture_schedule(frame_ids, epoch, ratio, seed):
-        schedule_call.update(frame_ids=frame_ids.clone(), epoch=epoch, ratio=ratio, seed=seed)
+    def capture_schedule(frame_ids, epoch, ratio, seed, start_epoch):
+        schedule_call.update(
+            frame_ids=frame_ids.clone(),
+            epoch=epoch,
+            ratio=ratio,
+            seed=seed,
+            start_epoch=start_epoch,
+        )
         return torch.tensor([True])
 
     monkeypatch.setattr(processor_snvla, "state_dropout_mask", capture_schedule)
@@ -490,6 +538,7 @@ def test_processor_omits_state_line_but_keeps_all_training(monkeypatch, with_nar
     assert schedule_call["epoch"] == 1
     assert schedule_call["ratio"] == pytest.approx(0.5)
     assert schedule_call["seed"] == 0
+    assert schedule_call["start_epoch"] == 1
     torch.testing.assert_close(observation[OBS_STATE], original_state)
     torch.testing.assert_close(result[TransitionKey.ACTION], original_action)
 

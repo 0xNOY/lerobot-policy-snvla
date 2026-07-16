@@ -66,10 +66,14 @@ class SNVLAConfig(PreTrainedConfig):
     state_dropout_enabled: bool = False
     state_dropout_ratio: float = 0.25
     state_dropout_seed: int = 0
+    # Keep the legacy schedule by default for checkpoint/config compatibility.
+    # Fresh runs can opt into augmentation from their first epoch with 0.
+    state_dropout_start_epoch: int = 1
 
     observation_noise_enabled: bool = False
     observation_noise_ratio: float = 0.25
     observation_noise_seed: int = 0
+    observation_noise_start_epoch: int = 1
     observation_noise_scale_min: float = 0.0
     # Noise is applied in normalized coordinates.  Keep the default deliberately
     # small: for the T1 state statistics, 0.025 with a 2-sigma cap bounds the
@@ -147,8 +151,20 @@ class SNVLAConfig(PreTrainedConfig):
             raise ValueError("max_text_loss_tokens must be positive")
         if not 0.0 <= self.state_dropout_ratio <= 0.5:
             raise ValueError("state_dropout_ratio must be between 0.0 and 0.5")
+        if (
+            isinstance(self.state_dropout_start_epoch, bool)
+            or not isinstance(self.state_dropout_start_epoch, int)
+            or self.state_dropout_start_epoch < 0
+        ):
+            raise ValueError("state_dropout_start_epoch must be a non-negative integer")
         if not 0.0 <= self.observation_noise_ratio <= 0.5:
             raise ValueError("observation_noise_ratio must be between 0.0 and 0.5")
+        if (
+            isinstance(self.observation_noise_start_epoch, bool)
+            or not isinstance(self.observation_noise_start_epoch, int)
+            or self.observation_noise_start_epoch < 0
+        ):
+            raise ValueError("observation_noise_start_epoch must be a non-negative integer")
         if not math.isfinite(self.observation_noise_scale_min) or self.observation_noise_scale_min < 0:
             raise ValueError("observation_noise_scale_min must be finite and non-negative")
         if (

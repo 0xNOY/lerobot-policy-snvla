@@ -33,19 +33,23 @@ def state_dropout_mask(
     epoch: int,
     ratio: float,
     seed: int,
+    start_epoch: int = 1,
 ) -> torch.Tensor:
     """Select deterministic language-state dropout rows for one integer training epoch."""
     frame_ids = torch.as_tensor(frame_ids)
     if isinstance(epoch, bool) or not isinstance(epoch, Integral):
         raise TypeError("epoch must be an integer scalar")
+    if isinstance(start_epoch, bool) or not isinstance(start_epoch, Integral) or start_epoch < 0:
+        raise ValueError("start_epoch must be a non-negative integer scalar")
     if not 0.0 <= ratio <= 0.5:
         raise ValueError("ratio must be between 0.0 and 0.5")
-    if epoch <= 0 or ratio == 0.0:
+    if epoch < start_epoch or ratio == 0.0:
         return torch.zeros_like(frame_ids, dtype=torch.bool)
 
+    active_epoch = epoch - start_epoch + 1
     phase = stable_unit_phases(frame_ids, seed)
-    previous = torch.floor((epoch - 1) * ratio + phase)
-    current = torch.floor(epoch * ratio + phase)
+    previous = torch.floor((active_epoch - 1) * ratio + phase)
+    current = torch.floor(active_epoch * ratio + phase)
     return current > previous
 
 
@@ -54,6 +58,7 @@ def observation_noise_mask(
     epoch: int,
     ratio: float,
     seed: int,
+    start_epoch: int = 1,
 ) -> torch.Tensor:
     """Select deterministic observation-noise rows on a dropout-independent stream."""
 
@@ -62,4 +67,5 @@ def observation_noise_mask(
         epoch=epoch,
         ratio=ratio,
         seed=seed ^ _OBSERVATION_NOISE_MASK_SALT,
+        start_epoch=start_epoch,
     )

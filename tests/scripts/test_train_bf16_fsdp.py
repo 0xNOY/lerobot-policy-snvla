@@ -263,7 +263,12 @@ def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches
         for step in saved["steps"]
         if step.get("registry_name") == "snvla_prepare_training_tokenizer_processor_step"
     )
-    for field in ("state_dropout_enabled", "state_dropout_ratio", "state_dropout_seed"):
+    for field in (
+        "state_dropout_enabled",
+        "state_dropout_ratio",
+        "state_dropout_seed",
+        "state_dropout_start_epoch",
+    ):
         tokenizer_step["config"]["config"].pop(field)
     config_path.write_text(json.dumps(saved))
 
@@ -273,10 +278,12 @@ def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches
         state_dropout_enabled=True,
         state_dropout_ratio=0.25,
         state_dropout_seed=83,
+        state_dropout_start_epoch=0,
         narration_loss_weight=7.0,
         observation_noise_enabled=True,
         observation_noise_ratio=0.25,
         observation_noise_seed=91,
+        observation_noise_start_epoch=0,
         observation_noise_scale_min=0.05,
         observation_noise_scale_max=0.4,
     )
@@ -297,11 +304,13 @@ def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches
     assert tokenizer_processor.config.state_dropout_enabled is True
     assert tokenizer_processor.config.state_dropout_ratio == pytest.approx(0.25)
     assert tokenizer_processor.config.state_dropout_seed == 83
+    assert tokenizer_processor.config.state_dropout_start_epoch == 0
     assert tokenizer_processor.config.n_action_steps == 10
     assert tokenizer_processor.config.narration_loss_weight == pytest.approx(7.0)
     assert tokenizer_processor.config.observation_noise_enabled is True
     assert tokenizer_processor.config.observation_noise_ratio == pytest.approx(0.25)
     assert tokenizer_processor.config.observation_noise_seed == 91
+    assert tokenizer_processor.config.observation_noise_start_epoch == 0
     assert tokenizer_processor.config.observation_noise_scale_min == pytest.approx(0.05)
     assert tokenizer_processor.config.observation_noise_scale_max == pytest.approx(0.4)
     device_processor = next(
@@ -335,9 +344,11 @@ def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches
         next(epoch_aware_cycle(SingleBatch(), start_step=1, expected_steps_per_epoch=1))
     )
 
-    assert not epoch_zero[STATE_DROPOUT_MASK].any()
+    assert epoch_zero[STATE_DROPOUT_MASK].any()
     assert epoch_one[STATE_DROPOUT_MASK].any()
+    assert not (epoch_zero[STATE_DROPOUT_MASK] & epoch_one[STATE_DROPOUT_MASK]).any()
     torch.testing.assert_close(epoch_one[STATE_DROPOUT_MASK], repeated_epoch_one[STATE_DROPOUT_MASK])
+    assert epoch_zero[STATE_DROPOUT_MASK].float().mean().item() == pytest.approx(0.25, abs=0.1)
     assert epoch_one[STATE_DROPOUT_MASK].float().mean().item() == pytest.approx(0.25, abs=0.1)
 
     reconciled_path = tmp_path / "reconciled"
@@ -352,11 +363,13 @@ def test_pretrained_snvla_processor_uses_active_dropout_config_and_epoch_batches
     assert reloaded_cfg.state_dropout_enabled is True
     assert reloaded_cfg.state_dropout_ratio == pytest.approx(0.25)
     assert reloaded_cfg.state_dropout_seed == 83
+    assert reloaded_cfg.state_dropout_start_epoch == 0
     assert reloaded_cfg.n_action_steps == 10
     assert reloaded_cfg.narration_loss_weight == pytest.approx(7.0)
     assert reloaded_cfg.observation_noise_enabled is True
     assert reloaded_cfg.observation_noise_ratio == pytest.approx(0.25)
     assert reloaded_cfg.observation_noise_seed == 91
+    assert reloaded_cfg.observation_noise_start_epoch == 0
 
 
 def test_snvla_processor_config_assertion_reports_mismatch(monkeypatch):
