@@ -496,22 +496,41 @@ def collect_curriculum_episodes(
     shards_root = root.parent / f"{root.name}_shards"
     if shards_root.exists():
         raise FileExistsError(f"{shards_root} already exists; refusing to overwrite")
-    jobs = []
+    jobs_by_scenario: list[list[dict]] = []
     for scenario_index, (count, category, scenario_episodes) in enumerate(scenarios):
-        jobs.append(
-            {
-                "shard_id": scenario_index,
-                "repo_id": f"{repo_id}_n{count}_{category}",
-                "root": shards_root / f"scenario_{scenario_index:02d}",
-                "n_episodes": scenario_episodes,
-                "n_blocks": count,
-                "seed0": seed0 + scenario_index * 1_000_000,
-                "camera_hw": camera_hw,
-                "fps": fps,
-                "category": category,
-                "object_name": category_display_name(category),
-            }
-        )
+        n_parts = (scenario_episodes + 9) // 10
+        base, remainder = divmod(scenario_episodes, n_parts)
+        scenario_jobs = []
+        for part_index in range(n_parts):
+            part_episodes = base + int(part_index < remainder)
+            scenario_jobs.append(
+                {
+                    "shard_id": f"{scenario_index:02d}.{part_index:02d}",
+                    "repo_id": f"{repo_id}_n{count}_{category}_p{part_index:02d}",
+                    "root": (
+                        shards_root
+                        / f"scenario_{scenario_index:02d}_part_{part_index:02d}"
+                    ),
+                    "n_episodes": part_episodes,
+                    "n_blocks": count,
+                    "seed0": (
+                        seed0 + scenario_index * 1_000_000 + part_index * 100_000
+                    ),
+                    "camera_hw": camera_hw,
+                    "fps": fps,
+                    "category": category,
+                    "object_name": category_display_name(category),
+                }
+            )
+        jobs_by_scenario.append(scenario_jobs)
+    # Interleave scenario parts so slow high-count strata enter the worker pool
+    # immediately instead of waiting behind all low-count shards.
+    jobs = [
+        scenario_jobs[part_index]
+        for part_index in range(max(map(len, jobs_by_scenario)))
+        for scenario_jobs in jobs_by_scenario
+        if part_index < len(scenario_jobs)
+    ]
     t0 = time.perf_counter()
     with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as pool:
         shard_stats = list(pool.map(_collect_shard_worker, jobs))
