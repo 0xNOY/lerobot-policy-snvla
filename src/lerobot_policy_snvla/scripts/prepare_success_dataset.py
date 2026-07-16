@@ -42,6 +42,7 @@ _DONE_PICK_RE = re.compile(r"^ \(done\)\nPicking up .+ (\d+) of (\d+)\.\.\.\s*$"
 _DONE_PLACE_RE = re.compile(
     r"^ \(done\)\nPutting .+ (\d+) of (\d+) into the basket\.\.\.\s*$"
 )
+_TASK_COUNT_RE = re.compile(r"^Put (\d+) .+ into the basket\.$")
 
 
 def _read_completion_timing_policy(root: Path) -> dict[str, Any] | None:
@@ -648,8 +649,8 @@ def validate_success_dataset(
     """Validate dataset identity, success event semantics, narration timing, and manifest."""
 
     root = _canonical(root)
-    if expected_episodes <= 0 or blocks <= 0:
-        raise ValueError("expected_episodes and blocks must be positive")
+    if expected_episodes <= 0 or blocks < 0:
+        raise ValueError("expected_episodes must be positive and blocks non-negative")
     info = _read_info(root)
     sidecar_completion_policy = _read_completion_timing_policy(root)
     manifest_path = root / MANIFEST_PATH
@@ -772,8 +773,19 @@ def validate_success_dataset(
             raise ValueError(f"episode {current_episode} dataset_to_index is invalid")
         if set(metadata["tasks"]) != episode_task_names:
             raise ValueError(f"episode {current_episode} task text mapping is invalid")
+        if len(episode_task_names) != 1:
+            raise ValueError(f"episode {current_episode} must map to exactly one task")
+        episode_blocks = blocks
+        if episode_blocks == 0:
+            task = next(iter(episode_task_names))
+            match = _TASK_COUNT_RE.fullmatch(task)
+            if match is None:
+                raise ValueError(f"episode {current_episode} task count cannot be inferred")
+            episode_blocks = int(match.group(1))
+            if episode_blocks <= 0:
+                raise ValueError(f"episode {current_episode} task count must be positive")
         observed_completion_frames.append(
-            _validate_success_episode(current_episode, sim_events, narrations, blocks)
+            _validate_success_episode(current_episode, sim_events, narrations, episode_blocks)
         )
         if completion_policy is not None:
             _validate_completion_timing_episode(
@@ -782,7 +794,7 @@ def validate_success_dataset(
                 narrations,
                 previous_narrations,
                 states,
-                blocks,
+                episode_blocks,
             )
         observed_episode_lengths.append(current_frame)
         current_episode += 1
@@ -1097,7 +1109,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dst-repo-id")
     parser.add_argument("--expected-episodes", required=True, type=int)
     parser.add_argument("--ablation-episodes", type=int, default=50)
-    parser.add_argument("--blocks", type=int, default=3)
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        default=3,
+        help="fixed task count, or 0 to infer the count from each episode task string",
+    )
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument(
         "--allow-legacy-completion",

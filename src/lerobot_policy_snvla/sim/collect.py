@@ -32,7 +32,10 @@ from .events import BasketRegion, EventTracker, NarrationFormat
 from .scripted_expert import ExpertConfig, T1Expert, get_body_pos
 from .t1_count_blocks import (
     BASKET_BODY,
+    CURRICULUM_TARGET_CATEGORIES_BY_COUNT,
     DEFAULT_CATEGORY,
+    DISTRACTOR_CATEGORIES,
+    TARGET_CATEGORIES,
     category_display_name,
     make_t1_env,
     object_body_names,
@@ -88,6 +91,9 @@ def _features(camera_hw: int) -> dict:
         "current_narration": {"dtype": "string", "shape": (1,), "names": None},
         "previous_narrations": {"dtype": "string", "shape": (1,), "names": None},
         "sim_event": {"dtype": "string", "shape": (1,), "names": None},
+        "scene_object_count": {"dtype": "float32", "shape": (1,), "names": None},
+        "initial_basket_object_count": {"dtype": "float32", "shape": (1,), "names": None},
+        "distractor_object_count": {"dtype": "float32", "shape": (1,), "names": None},
     }
 
 
@@ -153,6 +159,8 @@ def _run_episode(
     category: str,
     rng: np.random.Generator | None = None,
     initial_pose_rng: np.random.Generator | None = None,
+    initial_basket_objects: int = 0,
+    distractor_object_count: int = 0,
 ) -> tuple[list[dict], bool, bool]:
     """1エピソード実行。(frames, success, narration_ok) を返す。
 
@@ -175,7 +183,14 @@ def _run_episode(
         half_extents=BASKET_HALF_EXTENTS,
     )
     tracker = EventTracker(region, bodies, pick_height=PICK_HEIGHT)
-    expert = T1Expert(env, n_blocks, category=category, rng=rng)
+    scene_object_count = n_blocks + initial_basket_objects
+    expert = T1Expert(
+        env,
+        n_blocks,
+        category=category,
+        rng=rng,
+        n_scene_objects=scene_object_count,
+    )
     history: list[str] = []
     frames: list[dict] = []
     # (narration_fragment, sim_event_json) のFIFO
@@ -218,6 +233,13 @@ def _run_episode(
                 "current_narration": narration,
                 "previous_narrations": json.dumps(history),
                 "sim_event": sim_event,
+                "scene_object_count": np.array([scene_object_count], dtype=np.float32),
+                "initial_basket_object_count": np.array(
+                    [initial_basket_objects], dtype=np.float32
+                ),
+                "distractor_object_count": np.array(
+                    [distractor_object_count], dtype=np.float32
+                ),
                 "task": task_str,
             }
         )
@@ -260,6 +282,9 @@ def collect_episodes(
     push_to_hub: bool = False,
     category: str = DEFAULT_CATEGORY,
     object_name: str | None = None,
+    initial_basket_probability: float = 0.75,
+    distractor_count_min: int = 2,
+    distractor_count_max: int = 4,
 ) -> CollectStats:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -273,15 +298,32 @@ def collect_episodes(
     seed = seed0
     while saved < n_episodes:
         attempted += 1
+        seed_sequence = np.random.SeedSequence(seed)
+        initial_pose_sequence, aliasing_sequence = seed_sequence.spawn(2)
+        aliasing_rng = np.random.default_rng(aliasing_sequence)
+        # Keep at most one prefilled target: LIBERO's stock In-site sampler
+        # places multiple objects at the same center and can hang on collisions.
+        initial_basket_objects = int(
+            n_blocks <= 3 and aliasing_rng.random() < initial_basket_probability
+        )
+        distractor_count = int(
+            aliasing_rng.integers(distractor_count_min, distractor_count_max + 1)
+        )
+        distractor_pool = [name for name in DISTRACTOR_CATEGORIES if name != category]
+        distractors = tuple(
+            aliasing_rng.choice(distractor_pool, size=distractor_count, replace=False).tolist()
+        )
         env = make_t1_env(
             n_blocks=n_blocks,
             seed=seed,
             camera_hw=camera_hw,
             object_category=category,
             horizon=COLLECTION_HORIZON,
+            initial_basket_objects=initial_basket_objects,
+            distractor_categories=distractors,
         )
         rng = np.random.default_rng(seed)  # 既存の置き順シャッフルstreamは変更しない
-        initial_pose_rng = np.random.default_rng(np.random.SeedSequence(seed).spawn(1)[0])
+        initial_pose_rng = np.random.default_rng(initial_pose_sequence)
         seed += 1
         try:
             frames, success, stream_ok = _run_episode(
@@ -292,11 +334,29 @@ def collect_episodes(
                 category,
                 rng=rng,
                 initial_pose_rng=initial_pose_rng,
+                initial_basket_objects=initial_basket_objects,
+                distractor_object_count=distractor_count,
             )
         finally:
             env.close()
         if not success or not stream_ok:
-            logging.warning("episode rejected (success=%s, narration_stream_ok=%s)", success, stream_ok)
+            event_kinds = [
+                json.loads(frame["sim_event"])["kind"]
+                for frame in frames
+                if frame["sim_event"]
+            ]
+            logging.warning(
+                "episode rejected (success=%s, narration_stream_ok=%s, frames=%d, "
+                "picked=%d, placed=%d, task_count=%d, category=%s, prefilled=%d)",
+                success,
+                stream_ok,
+                len(frames),
+                event_kinds.count("picked"),
+                event_kinds.count("placed"),
+                n_blocks,
+                category,
+                initial_basket_objects,
+            )
             continue
         for frame in frames:
             dataset.add_frame(frame)
@@ -331,6 +391,9 @@ def collect_episodes_parallel(
     push_to_hub: bool = False,
     category: str = DEFAULT_CATEGORY,
     object_name: str | None = None,
+    initial_basket_probability: float = 0.75,
+    distractor_count_min: int = 2,
+    distractor_count_max: int = 4,
 ) -> CollectStats:
     """ワーカープロセスでシャードを並列収集し、aggregate_datasetsで1つに結合する。
 
@@ -366,6 +429,9 @@ def collect_episodes_parallel(
                 "fps": fps,
                 "category": category,
                 "object_name": object_name,
+                "initial_basket_probability": initial_basket_probability,
+                "distractor_count_min": distractor_count_min,
+                "distractor_count_max": distractor_count_max,
             }
         )
     t0 = time.perf_counter()
@@ -389,15 +455,93 @@ def collect_episodes_parallel(
     )
 
 
+def collect_curriculum_episodes(
+    repo_id: str,
+    root: Path,
+    n_episodes: int,
+    block_counts: tuple[int, ...],
+    target_categories: tuple[str, ...],
+    seed0: int,
+    workers: int,
+    camera_hw: int = 256,
+    fps: int = LIBERO_FPS,
+) -> CollectStats:
+    """Collect a balanced count/category curriculum and aggregate its shards."""
+
+    import shutil
+    from concurrent.futures import ProcessPoolExecutor
+    from multiprocessing import get_context
+
+    from lerobot.datasets.aggregate import aggregate_datasets
+
+    if not block_counts or n_episodes % len(block_counts):
+        raise ValueError("episodes must be divisible by the number of task counts")
+    episodes_per_count = n_episodes // len(block_counts)
+    scenarios: list[tuple[int, str, int]] = []
+    for count in block_counts:
+        supported = [
+            category
+            for category in CURRICULUM_TARGET_CATEGORIES_BY_COUNT.get(count, ())
+            if category in target_categories
+        ]
+        if not supported:
+            raise ValueError(f"no validated target category is configured for task count {count}")
+        base, remainder = divmod(episodes_per_count, len(supported))
+        scenarios.extend(
+            (count, category, base + int(index < remainder))
+            for index, category in enumerate(supported)
+        )
+    if root.exists():
+        raise FileExistsError(f"{root} already exists; refusing to overwrite")
+    shards_root = root.parent / f"{root.name}_shards"
+    if shards_root.exists():
+        raise FileExistsError(f"{shards_root} already exists; refusing to overwrite")
+    jobs = []
+    for scenario_index, (count, category, scenario_episodes) in enumerate(scenarios):
+        jobs.append(
+            {
+                "shard_id": scenario_index,
+                "repo_id": f"{repo_id}_n{count}_{category}",
+                "root": shards_root / f"scenario_{scenario_index:02d}",
+                "n_episodes": scenario_episodes,
+                "n_blocks": count,
+                "seed0": seed0 + scenario_index * 1_000_000,
+                "camera_hw": camera_hw,
+                "fps": fps,
+                "category": category,
+                "object_name": category_display_name(category),
+            }
+        )
+    t0 = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as pool:
+        shard_stats = list(pool.map(_collect_shard_worker, jobs))
+    aggregate_datasets(
+        repo_ids=[job["repo_id"] for job in jobs],
+        aggr_repo_id=repo_id,
+        roots=[job["root"] for job in jobs],
+        aggr_root=root,
+    )
+    shutil.rmtree(shards_root)
+    write_completion_timing_policy(root)
+    return CollectStats(
+        episodes_saved=sum(stat.episodes_saved for stat in shard_stats),
+        episodes_attempted=sum(stat.episodes_attempted for stat in shard_stats),
+        wall_time_s=time.perf_counter() - t0,
+        narration_counts_ok=sum(stat.narration_counts_ok for stat in shard_stats),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--blocks", type=int, default=3)
+    parser.add_argument("--block-counts", nargs="+", type=int)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--camera-hw", type=int, default=256)
     parser.add_argument("--category", default=DEFAULT_CATEGORY, help="LIBERO object category for T1")
+    parser.add_argument("--target-categories", nargs="+", default=list(TARGET_CATEGORIES))
     parser.add_argument(
         "--object-name",
         default=None,
@@ -412,7 +556,20 @@ def main():
     parser.add_argument("--push-to-hub", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    if args.workers > 1:
+    if args.block_counts:
+        if args.root is None:
+            parser.error("--block-counts requires --root")
+        stats = collect_curriculum_episodes(
+            args.repo_id,
+            args.root,
+            args.episodes,
+            tuple(args.block_counts),
+            tuple(args.target_categories),
+            args.seed,
+            workers=args.workers,
+            camera_hw=args.camera_hw,
+        )
+    elif args.workers > 1:
         if args.root is None:
             parser.error("--workers > 1 requires --root")
         stats = collect_episodes_parallel(

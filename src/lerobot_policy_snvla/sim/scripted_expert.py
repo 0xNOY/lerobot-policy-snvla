@@ -143,22 +143,59 @@ def get_body_pos(env, body_name: str) -> np.ndarray:
     return sim.data.body_xpos[sim.model.body_name2id(body_name)].copy()
 
 
-# かご内の置き位置オフセット。同一地点に置くと積み重なってcontain_regionを外れるため
-# ブロックごとに横へずらす。かご内寸（壁内側half≈0.064）と缶footprint（half≈0.025）から
-# 中心は±0.04以内、缶間距離は0.05以上を確保する。
+# かご内の置き位置オフセット。同一地点への積み重ねは避けつつ、壁との衝突で
+# 物体が外へ転がらないよう旧±0.03 mより中央側へ寄せる。±0.025 mなら、
+# かご内壁half≈0.064 mと物体footprint half≈0.025 mに対して約14 mmの余裕を
+# 保ちつつ、5個配置時の中心間隔を確保できる。
 PLACE_OFFSETS = [
-    np.array([-0.03, -0.03, 0.0]),
-    np.array([0.03, 0.03, 0.0]),
-    np.array([0.03, -0.03, 0.0]),
-    np.array([-0.03, 0.03, 0.0]),
+    np.array([-0.025, -0.025, 0.0]),
+    np.array([0.025, 0.025, 0.0]),
+    np.array([0.025, -0.025, 0.0]),
+    np.array([-0.025, 0.025, 0.0]),
     np.array([0.0, 0.0, 0.0]),
 ]
+
+
+def select_place_offsets(
+    n_blocks: int,
+    occupied_xy: np.ndarray,
+    rng: np.random.Generator | None = None,
+) -> list[np.ndarray]:
+    """Choose central release slots farthest from objects already inside the basket."""
+
+    candidates = [offset.copy() for offset in PLACE_OFFSETS]
+    if rng is not None:
+        rng.shuffle(candidates)
+    occupied = [np.asarray(xy, dtype=np.float64) for xy in np.asarray(occupied_xy).reshape(-1, 2)]
+    selected: list[np.ndarray] = []
+    for _ in range(n_blocks):
+        if not candidates:
+            candidates = [offset.copy() for offset in PLACE_OFFSETS]
+        references = occupied + [offset[:2] for offset in selected]
+        if references:
+            index = max(
+                range(len(candidates)),
+                key=lambda i: min(
+                    np.linalg.norm(candidates[i][:2] - reference) for reference in references
+                ),
+            )
+        else:
+            index = 0
+        selected.append(candidates.pop(index))
+    return selected
 
 
 class T1Expert:
     """Sequentially pick-and-place each block into the basket using privileged state."""
 
-    def __init__(self, env, n_blocks: int, category: str | None = None, rng=None):
+    def __init__(
+        self,
+        env,
+        n_blocks: int,
+        category: str | None = None,
+        rng=None,
+        n_scene_objects: int | None = None,
+    ):
         from .t1_count_blocks import BASKET_BODY, DEFAULT_CATEGORY, object_body_names
 
         self.env = env
@@ -169,11 +206,16 @@ class T1Expert:
         self._initial_eef_pos: np.ndarray | None = None
         self._home_pos = np.asarray(CANONICAL_HOME_EEF_POSITION_M, dtype=np.float64)
         self._finished = False
-        # かご内の置き位置の割当。rngを与えると順序がエピソードごとにシャッフルされ、
-        # 最終配置とアプローチ軌道に多様性が出る
-        self._offsets = [PLACE_OFFSETS[i % len(PLACE_OFFSETS)] for i in range(n_blocks)]
-        if rng is not None:
-            rng.shuffle(self._offsets)
+        scene_objects = n_blocks if n_scene_objects is None else n_scene_objects
+        if scene_objects < n_blocks:
+            raise ValueError("n_scene_objects cannot be smaller than n_blocks")
+        basket_xy = get_body_pos(self.env, self.basket_body)[:2]
+        distractor_bodies = object_body_names(scene_objects, category or DEFAULT_CATEGORY)[n_blocks:]
+        occupied_xy = np.asarray(
+            [get_body_pos(self.env, body)[:2] - basket_xy for body in distractor_bodies],
+            dtype=np.float64,
+        ).reshape(-1, 2)
+        self._offsets = select_place_offsets(n_blocks, occupied_xy, rng=rng)
 
     @property
     def finished(self) -> bool:

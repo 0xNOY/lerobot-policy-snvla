@@ -1,10 +1,35 @@
 import numpy as np
 import pytest
 
-from lerobot_policy_snvla.sim.scripted_expert import ExpertConfig, Phase, PickPlaceStateMachine, T1Expert
+from lerobot_policy_snvla.sim.scripted_expert import (
+    PLACE_OFFSETS,
+    ExpertConfig,
+    Phase,
+    PickPlaceStateMachine,
+    T1Expert,
+    select_place_offsets,
+)
 
 OBJ = np.array([0.1, -0.2, 0.02])
 PLACE = np.array([0.0, 0.2, 0.10])
+
+
+def test_place_offsets_keep_release_targets_near_basket_center():
+    xy = np.stack(PLACE_OFFSETS)[:, :2]
+
+    assert np.max(np.abs(xy)) == pytest.approx(0.025)
+    assert np.max(np.linalg.norm(xy, axis=1)) < 0.036
+    assert any(np.array_equal(offset, np.zeros(3)) for offset in PLACE_OFFSETS)
+
+
+def test_place_offsets_avoid_objects_already_inside_basket():
+    occupied = np.array([[-0.025, -0.025]])
+
+    selected = select_place_offsets(3, occupied, rng=np.random.default_rng(0))
+
+    assert len(selected) == 3
+    assert all(np.max(np.abs(offset[:2])) <= 0.025 for offset in selected)
+    assert np.linalg.norm(selected[0][:2] - occupied[0]) >= 0.07
 
 
 def run_until_phase(sm, eef, obj, place, phase, max_iters=500):

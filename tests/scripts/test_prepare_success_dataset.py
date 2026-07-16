@@ -56,7 +56,14 @@ FEATURES = {
 }
 
 
-def _source(root: Path, repo_id: str, episode_values: list[int], *, use_videos: bool = False) -> None:
+def _source(
+    root: Path,
+    repo_id: str,
+    episode_values: list[int],
+    *,
+    use_videos: bool = False,
+    blocks: int = 3,
+) -> None:
     features = deepcopy(FEATURES)
     image_size = 64 if use_videos else 4
     if use_videos:
@@ -70,26 +77,16 @@ def _source(root: Path, repo_id: str, episode_values: list[int], *, use_videos: 
         robot_type="test_robot",
         use_videos=use_videos,
     )
-    narrations = [
-        "Picking up block 1 of 3...",
-        "",
-        "Putting block 1 of 3 into the basket...",
-        "Picking up block 2 of 3...",
-        "Putting block 2 of 3 into the basket...",
-        "Picking up block 3 of 3...",
-        "Putting block 3 of 3 into the basket...",
-        "Task completed.\n",
-    ]
-    events = [
-        "",
-        ("picked", 1),
-        ("placed", 1),
-        ("picked", 2),
-        ("placed", 2),
-        ("picked", 3),
-        ("placed", 3),
-        "",
-    ]
+    narrations = [f"Picking up block 1 of {blocks}...", ""]
+    events: list[str | tuple[str, int]] = ["", ("picked", 1)]
+    for ordinal in range(1, blocks + 1):
+        narrations.append(f"Putting block {ordinal} of {blocks} into the basket...")
+        events.append(("placed", ordinal))
+        if ordinal < blocks:
+            narrations.append(f"Picking up block {ordinal + 1} of {blocks}...")
+            events.append(("picked", ordinal + 1))
+    narrations.append("Task completed.\n")
+    events.append("")
     for value in episode_values:
         history: list[str] = []
         for frame_index, (narration, event) in enumerate(zip(narrations, events, strict=True)):
@@ -108,13 +105,20 @@ def _source(root: Path, repo_id: str, episode_values: list[int], *, use_videos: 
                     "current_narration": narration,
                     "previous_narrations": json.dumps(history),
                     "sim_event": event_json,
-                    "task": "Put 3 blocks into the basket.",
+                    "task": f"Put {blocks} blocks into the basket.",
                 }
             )
             if narration:
                 history.append(narration)
         dataset.save_episode()
     dataset.finalize()
+
+
+def test_validator_can_infer_mixed_episode_task_count(tmp_path):
+    source = tmp_path / "source"
+    _source(source, "local/source", [1], blocks=2)
+
+    validate_success_dataset(source, expected_episodes=1, blocks=0, require_manifest=False)
 
 
 def _production_source(

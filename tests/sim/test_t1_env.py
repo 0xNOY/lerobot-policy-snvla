@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 pytestmark = pytest.mark.sim
@@ -12,6 +13,20 @@ def test_make_t1_bddl_creates_parseable_file(tmp_path):
     text = path.read_text()
     assert "basket" in text
     assert text.count("basket_1_contain_region") == 3  # goal に3ブロック分の In 述語
+
+
+def test_make_t1_bddl_separates_task_objects_from_initial_basket_distractors(tmp_path):
+    from lerobot_policy_snvla.sim.t1_count_blocks import make_t1_bddl
+
+    text = make_t1_bddl(n_blocks=3, initial_basket_objects=1, out_dir=tmp_path).read_text()
+
+    assert "chocolate_pudding_1 chocolate_pudding_2 chocolate_pudding_3 chocolate_pudding_4" in text
+    assert text.count("(On chocolate_pudding_") == 3
+    init = text.split("(:init", maxsplit=1)[1].split("(:goal", maxsplit=1)[0]
+    assert init.count("    (In chocolate_pudding_") == 1
+    goal = text.split("(:goal", maxsplit=1)[1]
+    assert goal.count("basket_1_contain_region") == 3
+    assert "chocolate_pudding_4 basket_1_contain_region" not in goal
 
 
 def test_layout_randomized_per_seed_and_deterministic(tmp_path):
@@ -75,5 +90,30 @@ def test_make_t1_env_has_n_blocks_and_basket(tmp_path):
             sim.model.body_name2id(name)  # raises if missing
         sim.model.body_name2id(BASKET_BODY)
         assert obs["agentview_image"].shape == (128, 128, 3)
+    finally:
+        env.close()
+
+
+def test_make_t1_env_can_start_with_identical_objects_inside_basket(tmp_path):
+    from lerobot_policy_snvla.sim.scripted_expert import get_body_pos
+    from lerobot_policy_snvla.sim.t1_count_blocks import (
+        BASKET_BODY,
+        make_t1_env,
+        object_body_names,
+    )
+
+    env = make_t1_env(
+        n_blocks=3,
+        initial_basket_objects=1,
+        seed=7,
+        camera_hw=128,
+        out_dir=tmp_path,
+    )
+    try:
+        env.reset()
+        basket = get_body_pos(env, BASKET_BODY)
+        distractors = [get_body_pos(env, body) for body in object_body_names(4)[3:]]
+        assert all(np.linalg.norm(position[:2] - basket[:2]) < 0.09 for position in distractors)
+        assert not env.check_success()
     finally:
         env.close()
