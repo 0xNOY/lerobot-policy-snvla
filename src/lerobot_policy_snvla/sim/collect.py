@@ -28,10 +28,9 @@ from .completion import (
     POST_TASK_HOLD_FRAMES,
     write_completion_timing_policy,
 )
-from .events import BasketRegion, EventTracker, NarrationFormat
+from .events import EventTracker, NarrationFormat
 from .scripted_expert import ExpertConfig, T1Expert, get_body_pos
 from .t1_count_blocks import (
-    BASKET_BODY,
     CURRICULUM_TARGET_CATEGORIES_BY_COUNT,
     DEFAULT_CATEGORY,
     DISTRACTOR_CATEGORIES,
@@ -42,11 +41,13 @@ from .t1_count_blocks import (
 )
 
 BASKET_HALF_EXTENTS = np.array([0.09, 0.09, 0.09])
+BASKET_CONTAIN_REGION = "basket_1_contain_region"
 MAX_STEPS_PER_BLOCK = 750
 LIBERO_FPS = 20  # OffScreenRenderEnv の control_freq
 # pickedイベントの持ち上げ閾値。床上の物体(z≈0.02)とかご内静止(z≈0.063)より十分高く、
 # LIFT高度(0.30)より十分低い
 PICK_HEIGHT = 0.12
+MAX_ATTEMPTS_PER_EPISODE = 20
 
 
 @dataclass
@@ -81,6 +82,34 @@ def _images(obs) -> dict[str, np.ndarray]:
     }
 
 
+def _libero_in_basket(env, body_name: str) -> bool:
+    """Use exactly the LIBERO ``In`` predicate used by the BDDL goal."""
+
+    from libero.libero.envs.predicates import get_predicate_fn
+
+    object_name = body_name.removesuffix("_main")
+    inner = env.env
+    return bool(
+        get_predicate_fn("in")(
+            inner.object_states_dict[object_name],
+            inner.object_states_dict[BASKET_CONTAIN_REGION],
+        )
+    )
+
+
+def _robosuite_grasping(env, body_name: str) -> bool:
+    """Use robosuite's canonical two-finger contact-based grasp check."""
+
+    object_name = body_name.removesuffix("_main")
+    inner = env.env
+    return bool(
+        inner._check_grasp(
+            gripper=inner.robots[0].gripper,
+            object_geoms=inner.get_object(object_name),
+        )
+    )
+
+
 def _features(camera_hw: int) -> dict:
     img = {"dtype": "video", "shape": (camera_hw, camera_hw, 3), "names": ["height", "width", "channels"]}
     return {
@@ -94,6 +123,8 @@ def _features(camera_hw: int) -> dict:
         "scene_object_count": {"dtype": "float32", "shape": (1,), "names": None},
         "initial_basket_object_count": {"dtype": "float32", "shape": (1,), "names": None},
         "distractor_object_count": {"dtype": "float32", "shape": (1,), "names": None},
+        "distractor_categories": {"dtype": "string", "shape": (1,), "names": None},
+        "collector_seed": {"dtype": "int64", "shape": (1,), "names": None},
     }
 
 
@@ -140,6 +171,7 @@ def _completion_contract_satisfied(
     home_hold_ok: bool,
     task_completed_emitted: bool,
     post_task_hold_frames: int,
+    goal_hold_ok: bool = True,
 ) -> bool:
     """Require the complete stream and exactly the contracted post-task hold."""
 
@@ -148,6 +180,7 @@ def _completion_contract_satisfied(
         and home_hold_ok
         and task_completed_emitted
         and post_task_hold_frames == POST_TASK_HOLD_FRAMES
+        and goal_hold_ok
     )
 
 
@@ -161,6 +194,8 @@ def _run_episode(
     initial_pose_rng: np.random.Generator | None = None,
     initial_basket_objects: int = 0,
     distractor_object_count: int = 0,
+    distractor_categories: tuple[str, ...] = (),
+    collector_seed: int = -1,
 ) -> tuple[list[dict], bool, bool]:
     """1エピソード実行。(frames, success, narration_ok) を返す。
 
@@ -178,18 +213,20 @@ def _run_episode(
     if pre_roll is None:
         return [], False, False
     obs, pre_roll_steps = pre_roll
-    region = BasketRegion(
-        center=get_body_pos(env, BASKET_BODY) + np.array([0.0, 0.0, 0.05]),
-        half_extents=BASKET_HALF_EXTENTS,
+    tracker = EventTracker(
+        None,
+        bodies,
+        placed_predicate=lambda body_name: _libero_in_basket(env, body_name),
+        picked_predicate=lambda body_name: _robosuite_grasping(env, body_name),
+        pick_height=PICK_HEIGHT,
     )
-    tracker = EventTracker(region, bodies, pick_height=PICK_HEIGHT)
-    scene_object_count = n_blocks + initial_basket_objects
+    scene_object_count = n_blocks + initial_basket_objects + distractor_object_count
     expert = T1Expert(
         env,
         n_blocks,
         category=category,
         rng=rng,
-        n_scene_objects=scene_object_count,
+        n_scene_objects=n_blocks + initial_basket_objects,
     )
     history: list[str] = []
     frames: list[dict] = []
@@ -199,6 +236,7 @@ def _run_episode(
     task_completed_frame_written = False
     post_task_hold_frames = 0
     home_hold_ok = True
+    goal_hold_ok = True
     # robosuiteはhorizon到達後のstepで例外を出すため、必ず手前で打ち切る
     horizon = getattr(env.env, "horizon", 1000)
     max_steps = min(MAX_STEPS_PER_BLOCK * n_blocks, horizon - pre_roll_steps - 2)
@@ -218,6 +256,7 @@ def _run_episode(
         if (
             expert.finished
             and tracker.count("placed") == n_blocks
+            and env.check_success()
             and not pending
             and not task_completed_emitted
         ):
@@ -240,6 +279,8 @@ def _run_episode(
                 "distractor_object_count": np.array(
                     [distractor_object_count], dtype=np.float32
                 ),
+                "distractor_categories": json.dumps(distractor_categories),
+                "collector_seed": np.array([collector_seed], dtype=np.int64),
                 "task": task_str,
             }
         )
@@ -258,6 +299,8 @@ def _run_episode(
                 <= HOME_POSITION_TOLERANCE_M
             )
         obs, reward, done, info = env.step(action)
+        if task_completed_frame_written:
+            goal_hold_ok &= bool(env.check_success())
         if post_task_hold_frames >= POST_TASK_HOLD_FRAMES:
             break
     narration_ok = _completion_contract_satisfied(
@@ -267,6 +310,7 @@ def _run_episode(
         home_hold_ok=home_hold_ok,
         task_completed_emitted=task_completed_emitted,
         post_task_hold_frames=post_task_hold_frames,
+        goal_hold_ok=goal_hold_ok,
     )
     return frames, bool(env.check_success()), narration_ok
 
@@ -285,8 +329,23 @@ def collect_episodes(
     initial_basket_probability: float = 0.75,
     distractor_count_min: int = 2,
     distractor_count_max: int = 4,
+    max_attempts: int | None = None,
 ) -> CollectStats:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    if n_episodes <= 0 or n_blocks <= 0:
+        raise ValueError("n_episodes and n_blocks must be positive")
+    if not 0.0 <= initial_basket_probability <= 1.0:
+        raise ValueError("initial_basket_probability must be in [0, 1]")
+    if not 0 <= distractor_count_min <= distractor_count_max:
+        raise ValueError("distractor count bounds are invalid")
+    if distractor_count_max > len(DISTRACTOR_CATEGORIES) - int(category in DISTRACTOR_CATEGORIES):
+        raise ValueError("distractor_count_max exceeds the available category pool")
+    attempt_limit = (
+        n_episodes * MAX_ATTEMPTS_PER_EPISODE if max_attempts is None else max_attempts
+    )
+    if attempt_limit < n_episodes or attempt_limit >= 100_000:
+        raise ValueError("max_attempts must be >= n_episodes and < 100000")
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id, fps=fps, features=_features(camera_hw), root=root, robot_type="panda_libero"
@@ -297,6 +356,11 @@ def collect_episodes(
     saved = attempted = narration_ok = 0
     seed = seed0
     while saved < n_episodes:
+        if attempted >= attempt_limit:
+            raise RuntimeError(
+                f"collection exhausted max_attempts={attempt_limit}: "
+                f"saved={saved}/{n_episodes}, category={category}, n_blocks={n_blocks}"
+            )
         attempted += 1
         seed_sequence = np.random.SeedSequence(seed)
         initial_pose_sequence, aliasing_sequence = seed_sequence.spawn(2)
@@ -336,6 +400,8 @@ def collect_episodes(
                 initial_pose_rng=initial_pose_rng,
                 initial_basket_objects=initial_basket_objects,
                 distractor_object_count=distractor_count,
+                distractor_categories=distractors,
+                collector_seed=seed - 1,
             )
         finally:
             env.close()
@@ -394,6 +460,7 @@ def collect_episodes_parallel(
     initial_basket_probability: float = 0.75,
     distractor_count_min: int = 2,
     distractor_count_max: int = 4,
+    max_attempts: int | None = None,
 ) -> CollectStats:
     """ワーカープロセスでシャードを並列収集し、aggregate_datasetsで1つに結合する。
 
@@ -408,6 +475,8 @@ def collect_episodes_parallel(
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     root = Path(root)
+    if workers <= 0:
+        raise ValueError("workers must be positive")
     if root.exists():
         raise FileExistsError(f"{root} already exists; refusing to overwrite")
     shards_root = root.parent / f"{root.name}_shards"
@@ -432,6 +501,11 @@ def collect_episodes_parallel(
                 "initial_basket_probability": initial_basket_probability,
                 "distractor_count_min": distractor_count_min,
                 "distractor_count_max": distractor_count_max,
+                "max_attempts": (
+                    n_w * MAX_ATTEMPTS_PER_EPISODE
+                    if max_attempts is None
+                    else max_attempts
+                ),
             }
         )
     t0 = time.perf_counter()
@@ -520,6 +594,7 @@ def collect_curriculum_episodes(
                     "fps": fps,
                     "category": category,
                     "object_name": category_display_name(category),
+                    "max_attempts": part_episodes * MAX_ATTEMPTS_PER_EPISODE,
                 }
             )
         jobs_by_scenario.append(scenario_jobs)

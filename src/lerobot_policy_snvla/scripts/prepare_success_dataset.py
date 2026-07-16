@@ -25,7 +25,13 @@ from lerobot_policy_snvla.sim.completion import (
     COMPLETION_TIMING_POLICY,
     COMPLETION_TIMING_POLICY_PATH,
     LEGACY_COMPLETION_TIMING_POLICY,
+    PREVIOUS_COMPLETION_TIMING_POLICY,
     write_completion_timing_policy,
+)
+from lerobot_policy_snvla.sim.t1_count_blocks import (
+    CURRICULUM_TARGET_CATEGORIES_BY_COUNT,
+    DISTRACTOR_CATEGORIES,
+    category_display_name,
 )
 
 CORRECTIVE_FEATURES = {
@@ -35,15 +41,23 @@ CORRECTIVE_FEATURES = {
 }
 MANIFEST_PATH = Path("meta/success_dataset_manifest.json")
 DEFAULT_SPLIT_SEED = 20260715
-_PICK_RE = re.compile(r"^Picking up .+ (\d+) of (\d+)\.\.\.\s*$")
-_PLACE_RE = re.compile(r"^Putting .+ (\d+) of (\d+) into the basket\.\.\.\s*$")
+_PICK_RE = re.compile(r"^Picking up (.+) (\d+) of (\d+)\.\.\.\s*$")
+_PLACE_RE = re.compile(r"^Putting (.+) (\d+) of (\d+) into the basket\.\.\.\s*$")
 _DONE_FRAGMENT = " (done)\n"
 _TASK_COMPLETED_FRAGMENT = "Task completed.\n"
-_DONE_PICK_RE = re.compile(r"^ \(done\)\nPicking up .+ (\d+) of (\d+)\.\.\.\s*$")
+_DONE_PICK_RE = re.compile(r"^ \(done\)\nPicking up (.+) (\d+) of (\d+)\.\.\.\s*$")
 _DONE_PLACE_RE = re.compile(
-    r"^ \(done\)\nPutting .+ (\d+) of (\d+) into the basket\.\.\.\s*$"
+    r"^ \(done\)\nPutting (.+) (\d+) of (\d+) into the basket\.\.\.\s*$"
 )
-_TASK_COUNT_RE = re.compile(r"^Put (\d+) .+ into the basket\.$")
+_TASK_RE = re.compile(r"^Put (\d+) (.+) into the basket\.$")
+
+
+def _singular_task_noun(noun: str, count: int) -> str:
+    if count == 1:
+        return noun
+    if not noun.endswith("s"):
+        raise ValueError(f"plural task noun must end in 's': {noun!r}")
+    return noun[:-1]
 
 
 def _read_completion_timing_policy(root: Path) -> dict[str, Any] | None:
@@ -59,7 +73,11 @@ def _read_completion_timing_policy(root: Path) -> dict[str, Any] | None:
 
 
 def _validate_completion_timing_policy(policy: Any) -> None:
-    if policy not in (LEGACY_COMPLETION_TIMING_POLICY, COMPLETION_TIMING_POLICY):
+    if policy not in (
+        LEGACY_COMPLETION_TIMING_POLICY,
+        PREVIOUS_COMPLETION_TIMING_POLICY,
+        COMPLETION_TIMING_POLICY,
+    ):
         raise ValueError(
             "completion timing policy is invalid; expected a supported production completion contract"
         )
@@ -135,12 +153,26 @@ def _validate_success_episode(
     sim_events: Sequence[str],
     narrations: Sequence[str],
     blocks: int,
+    *,
+    object_name: str | None = None,
+    object_instance_prefix: str | None = None,
 ) -> int:
     events = _event_transitions(sim_events)
     observed = [(event.get("kind"), event.get("ordinal")) for _, event in events]
     expected = [(kind, ordinal) for ordinal in range(1, blocks + 1) for kind in ("picked", "placed")]
     if observed != expected:
         raise ValueError(f"episode {episode_index} is not a canonical success: {observed!r} != {expected!r}")
+    if object_instance_prefix is not None:
+        expected_instances = [
+            f"{object_instance_prefix}_{ordinal}_main"
+            for ordinal in range(1, blocks + 1)
+            for _kind in ("picked", "placed")
+        ]
+        observed_instances = [event.get("object_name") for _, event in events]
+        if observed_instances != expected_instances:
+            raise ValueError(
+                f"episode {episode_index} sim_event object identities are invalid"
+            )
 
     narration_events = _narration_transitions(narrations)
     picks: list[tuple[int, int, int]] = []
@@ -149,17 +181,25 @@ def _validate_success_episode(
     completions: list[int] = []
     for frame_index, narration in narration_events:
         if match := _PICK_RE.fullmatch(narration):
-            picks.append((frame_index, int(match.group(1)), int(match.group(2))))
-            ordered_centers.append(("picked", int(match.group(1)), int(match.group(2))))
+            if object_name is not None and match.group(1) != object_name:
+                raise ValueError(f"episode {episode_index} pick narration object is invalid")
+            picks.append((frame_index, int(match.group(2)), int(match.group(3))))
+            ordered_centers.append(("picked", int(match.group(2)), int(match.group(3))))
         elif match := _PLACE_RE.fullmatch(narration):
-            places.append((frame_index, int(match.group(1)), int(match.group(2))))
-            ordered_centers.append(("placed", int(match.group(1)), int(match.group(2))))
+            if object_name is not None and match.group(1) != object_name:
+                raise ValueError(f"episode {episode_index} place narration object is invalid")
+            places.append((frame_index, int(match.group(2)), int(match.group(3))))
+            ordered_centers.append(("placed", int(match.group(2)), int(match.group(3))))
         elif match := _DONE_PICK_RE.fullmatch(narration):
-            picks.append((frame_index, int(match.group(1)), int(match.group(2))))
-            ordered_centers.append(("picked", int(match.group(1)), int(match.group(2))))
+            if object_name is not None and match.group(1) != object_name:
+                raise ValueError(f"episode {episode_index} pick narration object is invalid")
+            picks.append((frame_index, int(match.group(2)), int(match.group(3))))
+            ordered_centers.append(("picked", int(match.group(2)), int(match.group(3))))
         elif match := _DONE_PLACE_RE.fullmatch(narration):
-            places.append((frame_index, int(match.group(1)), int(match.group(2))))
-            ordered_centers.append(("placed", int(match.group(1)), int(match.group(2))))
+            if object_name is not None and match.group(1) != object_name:
+                raise ValueError(f"episode {episode_index} place narration object is invalid")
+            places.append((frame_index, int(match.group(2)), int(match.group(3))))
+            ordered_centers.append(("placed", int(match.group(2)), int(match.group(3))))
         elif narration.strip() == "Task completed.":
             completions.append(frame_index)
     canonical = [(ordinal, blocks) for ordinal in range(1, blocks + 1)]
@@ -203,12 +243,12 @@ def _validate_completion_timing_episode(
         if len(fragments) != expected_fragments:
             raise ValueError(f"episode {episode_index} narration stream is not canonical")
         first = _PICK_RE.fullmatch(fragments[0])
-        if first is None or (int(first.group(1)), int(first.group(2))) != (1, blocks):
+        if first is None or (int(first.group(2)), int(first.group(3))) != (1, blocks):
             raise ValueError(f"episode {episode_index} narration stream is not canonical")
         cursor = 1
         for ordinal in range(1, blocks + 1):
             place = _DONE_PLACE_RE.fullmatch(fragments[cursor])
-            if place is None or (int(place.group(1)), int(place.group(2))) != (
+            if place is None or (int(place.group(2)), int(place.group(3))) != (
                 ordinal,
                 blocks,
             ):
@@ -216,7 +256,7 @@ def _validate_completion_timing_episode(
             cursor += 1
             if ordinal < blocks:
                 pick = _DONE_PICK_RE.fullmatch(fragments[cursor])
-                if pick is None or (int(pick.group(1)), int(pick.group(2))) != (
+                if pick is None or (int(pick.group(2)), int(pick.group(3))) != (
                     ordinal + 1,
                     blocks,
                 ):
@@ -409,7 +449,11 @@ def _validate_manifest(manifest: dict[str, Any], expected_episodes: int) -> None
     if not set(ablation).issubset(set(sources[-1]["destination_episode_ids"])):
         raise ValueError("manifest ablation IDs are not eligible episodes from the last source")
     policy = manifest.get("partition_policy")
-    if not isinstance(policy, dict) or policy.get("name") != "numpy-pcg64-permutation":
+    valid_policy_names = {
+        "numpy-pcg64-permutation",
+        "task-stratified-numpy-pcg64",
+    }
+    if not isinstance(policy, dict) or policy.get("name") not in valid_policy_names:
         raise ValueError("manifest partition policy name is invalid")
     seed = policy.get("seed")
     if type(seed) is not int:
@@ -420,11 +464,22 @@ def _validate_manifest(manifest: dict[str, Any], expected_episodes: int) -> None
         raise ValueError("manifest ablation source policy is invalid")
     if policy.get("episode_order") != "source argument order, then source episode index":
         raise ValueError("manifest episode ordering policy is invalid")
+    policy_strata = policy.get("strata")
+    if policy.get("name") == "task-stratified-numpy-pcg64":
+        if (
+            not isinstance(policy_strata, list)
+            or len(policy_strata) != expected_episodes
+            or not all(isinstance(value, str) for value in policy_strata)
+        ):
+            raise ValueError("manifest partition strata are invalid")
+    elif policy_strata is not None:
+        raise ValueError("unstratified manifest must not contain partition strata")
     expected_train, expected_validation, expected_ablation = _partitions(
         expected_episodes,
         sources[-1]["destination_episode_ids"],
         requested_ablation,
         seed,
+        policy_strata,
     )
     if (train, validation, ablation) != (
         expected_train,
@@ -697,6 +752,17 @@ def validate_success_dataset(
     missing_features = required_features.difference(info.get("features", {}))
     if missing_features:
         raise ValueError(f"dataset is missing validation features: {sorted(missing_features)}")
+    numeric_scene_features = {
+        "scene_object_count",
+        "initial_basket_object_count",
+        "distractor_object_count",
+        "collector_seed",
+    }
+    scene_features = numeric_scene_features | {"distractor_categories"}
+    present_scene_features = scene_features.intersection(info.get("features", {}))
+    if present_scene_features and present_scene_features != scene_features:
+        raise ValueError("dataset has an incomplete scene-aliasing metadata schema")
+    has_scene_metadata = present_scene_features == scene_features
 
     tasks_table = pq.read_table(root / "meta/tasks.parquet", columns=["task_index", "task"]).to_pydict()
     task_names: dict[int, str] = {}
@@ -746,6 +812,8 @@ def validate_success_dataset(
     ]
     if completion_policy is not None:
         data_columns.extend(["observation.state", "previous_narrations"])
+    if has_scene_metadata:
+        data_columns.extend(sorted(scene_features))
     expected_global_index = 0
     current_episode = 0
     current_frame = 0
@@ -753,14 +821,16 @@ def validate_success_dataset(
     narrations: list[str] = []
     states: list[Any] = []
     previous_narrations: list[str] = []
+    scene_metadata: dict[str, list[Any]] = {name: [] for name in scene_features}
     episode_task_names: set[str] = set()
     data_file_episodes: dict[tuple[int, int], set[int]] = {}
     observed_episode_lengths: list[int] = []
     observed_completion_frames: list[int] = []
+    observed_task_counts: dict[int, int] = {}
 
     def finish_episode() -> None:
         nonlocal current_episode, current_frame, sim_events, narrations, states, previous_narrations
-        nonlocal episode_task_names
+        nonlocal episode_task_names, scene_metadata, observed_task_counts
         if current_episode >= expected_episodes:
             raise ValueError("data contains too many episodes")
         metadata = episode_rows[current_episode]
@@ -776,17 +846,89 @@ def validate_success_dataset(
             raise ValueError(f"episode {current_episode} task text mapping is invalid")
         if len(episode_task_names) != 1:
             raise ValueError(f"episode {current_episode} must map to exactly one task")
-        episode_blocks = blocks
-        if episode_blocks == 0:
-            task = next(iter(episode_task_names))
-            match = _TASK_COUNT_RE.fullmatch(task)
-            if match is None:
-                raise ValueError(f"episode {current_episode} task count cannot be inferred")
-            episode_blocks = int(match.group(1))
-            if episode_blocks <= 0:
-                raise ValueError(f"episode {current_episode} task count must be positive")
+        task = next(iter(episode_task_names))
+        match = _TASK_RE.fullmatch(task)
+        if match is None:
+            raise ValueError(f"episode {current_episode} task count/object cannot be inferred")
+        task_blocks = int(match.group(1))
+        if task_blocks <= 0:
+            raise ValueError(f"episode {current_episode} task count must be positive")
+        episode_blocks = task_blocks if blocks == 0 else blocks
+        if task_blocks != episode_blocks:
+            raise ValueError(f"episode {current_episode} task count disagrees with validation")
+        narration_object_name = _singular_task_noun(match.group(2), task_blocks)
+        object_instance_prefix = narration_object_name.replace(" ", "_")
+        if has_scene_metadata:
+            allowed_categories = CURRICULUM_TARGET_CATEGORIES_BY_COUNT.get(task_blocks, ())
+            allowed_objects = {
+                category_display_name(category): category for category in allowed_categories
+            }
+            if narration_object_name not in allowed_objects:
+                raise ValueError(
+                    f"episode {current_episode} task object/count combination is unsupported"
+                )
+            normalized: dict[str, int] = {}
+            for name in numeric_scene_features:
+                values = scene_metadata[name]
+                scalars = {
+                    float(value[0] if isinstance(value, (list, tuple, np.ndarray)) else value)
+                    for value in values
+                }
+                if len(scalars) != 1:
+                    raise ValueError(
+                        f"episode {current_episode} {name} is not constant"
+                    )
+                scalar = next(iter(scalars))
+                if not math.isfinite(scalar) or not scalar.is_integer() or scalar < 0:
+                    raise ValueError(
+                        f"episode {current_episode} {name} is not a non-negative integer"
+                    )
+                normalized[name] = int(scalar)
+            if normalized["collector_seed"] < 0:
+                raise ValueError(f"episode {current_episode} collector seed is invalid")
+            category_values = set(scene_metadata["distractor_categories"])
+            if len(category_values) != 1:
+                raise ValueError(
+                    f"episode {current_episode} distractor categories are not constant"
+                )
+            try:
+                distractor_categories = json.loads(next(iter(category_values)))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"episode {current_episode} distractor categories are invalid JSON"
+                ) from exc
+            if (
+                not isinstance(distractor_categories, list)
+                or not all(isinstance(value, str) for value in distractor_categories)
+                or len(distractor_categories)
+                != normalized["distractor_object_count"]
+                or len(set(distractor_categories)) != len(distractor_categories)
+                or not set(distractor_categories).issubset(DISTRACTOR_CATEGORIES)
+                or allowed_objects[narration_object_name] in distractor_categories
+            ):
+                raise ValueError(
+                    f"episode {current_episode} distractor category metadata is inconsistent"
+                )
+            if normalized["scene_object_count"] != (
+                episode_blocks
+                + normalized["initial_basket_object_count"]
+                + normalized["distractor_object_count"]
+            ):
+                raise ValueError(
+                    f"episode {current_episode} scene object count is inconsistent"
+                )
+            observed_task_counts[episode_blocks] = (
+                observed_task_counts.get(episode_blocks, 0) + 1
+            )
         observed_completion_frames.append(
-            _validate_success_episode(current_episode, sim_events, narrations, episode_blocks)
+            _validate_success_episode(
+                current_episode,
+                sim_events,
+                narrations,
+                episode_blocks,
+                object_name=narration_object_name if has_scene_metadata else None,
+                object_instance_prefix=object_instance_prefix if has_scene_metadata else None,
+            )
         )
         if completion_policy is not None:
             _validate_completion_timing_episode(
@@ -804,6 +946,7 @@ def validate_success_dataset(
         narrations = []
         states = []
         previous_narrations = []
+        scene_metadata = {name: [] for name in scene_features}
         episode_task_names = set()
 
     for path in sorted((root / "data").rglob("*.parquet")):
@@ -840,12 +983,21 @@ def validate_success_dataset(
             if completion_policy is not None:
                 states.append(row["observation.state"])
                 previous_narrations.append(row["previous_narrations"])
+            if has_scene_metadata:
+                for name in scene_features:
+                    scene_metadata[name].append(row[name])
             current_frame += 1
             expected_global_index += 1
     if current_frame:
         finish_episode()
     if current_episode != expected_episodes or expected_global_index != info.get("total_frames"):
         raise ValueError("dataset frame/episode totals are invalid")
+    if has_scene_metadata and blocks == 0 and expected_episodes == 500:
+        expected_histogram = {count: 100 for count in range(1, 6)}
+        if observed_task_counts != expected_histogram:
+            raise ValueError(
+                f"curriculum task-count histogram is invalid: {observed_task_counts!r}"
+            )
 
     for episode_index, metadata in enumerate(episode_rows):
         data_pair = (metadata["data/chunk_index"], metadata["data/file_index"])
@@ -949,11 +1101,9 @@ def _partitions(
     new_episode_ids: list[int],
     ablation_episodes: int,
     seed: int,
+    strata: Sequence[str] | None = None,
 ) -> tuple[list[int], list[int], list[int]]:
     validation_count = 20 if expected_episodes == 200 else max(1, round(expected_episodes * 0.1))
-    order = np.random.default_rng(seed).permutation(expected_episodes).tolist()
-    validation = sorted(order[:validation_count])
-    train = sorted(order[validation_count:])
     if ablation_episodes < 0:
         raise ValueError("ablation_episodes cannot be negative")
     if len(new_episode_ids) < ablation_episodes:
@@ -961,8 +1111,63 @@ def _partitions(
             f"requested {ablation_episodes} ablation episodes but the newly collected source has "
             f"only {len(new_episode_ids)}"
         )
-    ablation_order = np.random.default_rng(seed + 1).permutation(new_episode_ids).tolist()
-    return train, validation, sorted(ablation_order[:ablation_episodes])
+    if strata is None:
+        order = np.random.default_rng(seed).permutation(expected_episodes).tolist()
+        validation = sorted(order[:validation_count])
+        train = sorted(order[validation_count:])
+        ablation_order = np.random.default_rng(seed + 1).permutation(new_episode_ids).tolist()
+        return train, validation, sorted(ablation_order[:ablation_episodes])
+    if len(strata) != expected_episodes:
+        raise ValueError("strata length must equal expected_episodes")
+
+    def stratified_sample(ids: Sequence[int], count: int, sample_seed: int) -> list[int]:
+        if count == 0:
+            return []
+        groups: dict[str, list[int]] = {}
+        for episode_id in ids:
+            groups.setdefault(strata[episode_id], []).append(episode_id)
+        ideals = {
+            key: count * len(group) / len(ids) for key, group in groups.items()
+        }
+        allocations = {key: int(math.floor(value)) for key, value in ideals.items()}
+        remaining = count - sum(allocations.values())
+        ranked = sorted(
+            groups,
+            key=lambda key: (-(ideals[key] - allocations[key]), key),
+        )
+        for key in ranked[:remaining]:
+            allocations[key] += 1
+        rng = np.random.default_rng(sample_seed)
+        selected: list[int] = []
+        for key in sorted(groups):
+            order = rng.permutation(groups[key]).tolist()
+            selected.extend(order[: allocations[key]])
+        if len(selected) != count:
+            raise ValueError("stratified partition allocation is inconsistent")
+        return sorted(selected)
+
+    validation = stratified_sample(range(expected_episodes), validation_count, seed)
+    validation_set = set(validation)
+    train = [episode_id for episode_id in range(expected_episodes) if episode_id not in validation_set]
+    ablation = stratified_sample(new_episode_ids, ablation_episodes, seed + 1)
+    return train, validation, ablation
+
+
+def _source_episode_strata(sources: Sequence[Path]) -> list[str]:
+    """Read one canonical task string per episode, preserving aggregate order."""
+
+    strata: list[str] = []
+    for source in sources:
+        rows: list[dict[str, Any]] = []
+        for path in sorted((source / "meta/episodes").rglob("*.parquet")):
+            rows.extend(pq.read_table(path, columns=["episode_index", "tasks"]).to_pylist())
+        rows.sort(key=lambda row: row["episode_index"])
+        for expected_index, row in enumerate(rows):
+            tasks = row["tasks"]
+            if row["episode_index"] != expected_index or len(tasks) != 1:
+                raise ValueError(f"source episode task metadata is invalid: {source}")
+            strata.append(tasks[0])
+    return strata
 
 
 def prepare_success_dataset(
@@ -1027,11 +1232,24 @@ def prepare_success_dataset(
         raise ValueError(f"sources contain {total_episodes} episodes, expected {expected_episodes}")
 
     new_source_start = total_episodes - int(infos[-1]["total_episodes"])
+    scene_metadata_features = {
+        "scene_object_count",
+        "initial_basket_object_count",
+        "distractor_object_count",
+        "distractor_categories",
+        "collector_seed",
+    }
+    strata = (
+        _source_episode_strata(sources)
+        if all(scene_metadata_features.issubset(info.get("features", {})) for info in infos)
+        else None
+    )
     train, validation, ablation = _partitions(
         expected_episodes,
         list(range(new_source_start, total_episodes)),
         ablation_episodes,
         split_seed,
+        strata,
     )
 
     source_records: list[dict[str, Any]] = []
@@ -1060,13 +1278,19 @@ def prepare_success_dataset(
         "ablation_episode_ids": ablation,
         "ablation_episode_count": ablation_episodes,
         "partition_policy": {
-            "name": "numpy-pcg64-permutation",
+            "name": (
+                "task-stratified-numpy-pcg64"
+                if strata is not None
+                else "numpy-pcg64-permutation"
+            ),
             "seed": split_seed,
             "validation_fraction": 0.1,
             "ablation_eligible_source": "last",
             "episode_order": "source argument order, then source episode index",
         },
     }
+    if strata is not None:
+        manifest["partition_policy"]["strata"] = strata
     if source_completion_policies[0] is not None:
         if any(policy != source_completion_policies[0] for policy in source_completion_policies[1:]):
             raise ValueError("source completion timing policies disagree")
@@ -1118,6 +1342,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument(
+        "--raw-source",
+        action="store_true",
+        help="with --validate-only, validate a collector root that intentionally has no manifest",
+    )
+    parser.add_argument(
         "--allow-legacy-completion",
         action="store_true",
         help="allow an intentional legacy build whose sources predate completion timing sidecars",
@@ -1128,6 +1357,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="also reopen and hash the original source roots recorded in the manifest",
     )
     args = parser.parse_args(argv)
+    if args.raw_source and not args.validate_only:
+        parser.error("--raw-source requires --validate-only")
+    if args.raw_source and args.audit_sources:
+        parser.error("--audit-sources is only valid for a manifest-backed dataset")
     if not args.validate_only:
         if not args.source_root:
             parser.error("--source-root is required unless --validate-only is used")
@@ -1139,7 +1372,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     if args.validate_only:
-        validate_success_dataset(args.dst_root, args.expected_episodes, blocks=args.blocks)
+        validate_success_dataset(
+            args.dst_root,
+            args.expected_episodes,
+            blocks=args.blocks,
+            require_manifest=not args.raw_source,
+        )
         if args.audit_sources:
             audit_sources(args.dst_root)
         print(f"validated {args.expected_episodes} successful episodes in {args.dst_root}")

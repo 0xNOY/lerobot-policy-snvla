@@ -107,6 +107,9 @@ def test_collect_two_episodes_produces_valid_dataset(tmp_path):
 
     assert ds.meta.tasks.index.tolist() == ["Put 2 chocolate puddings into the basket."]
     assert json.loads((ds.root / COMPLETION_TIMING_POLICY_PATH).read_text()) == COMPLETION_TIMING_POLICY
+    from lerobot_policy_snvla.scripts.prepare_success_dataset import validate_success_dataset
+
+    validate_success_dataset(ds.root, expected_episodes=2, blocks=2, require_manifest=False)
 
 
 def test_parallel_collection_aggregates_shards(tmp_path):

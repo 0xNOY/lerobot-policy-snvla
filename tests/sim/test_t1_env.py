@@ -117,3 +117,40 @@ def test_make_t1_env_can_start_with_identical_objects_inside_basket(tmp_path):
         assert not env.check_success()
     finally:
         env.close()
+
+
+def test_libero_in_predicate_rejects_position_outside_real_contain_site(tmp_path):
+    from lerobot_policy_snvla.sim.collect import _libero_in_basket
+    from lerobot_policy_snvla.sim.t1_count_blocks import make_t1_env, object_body_names
+
+    env = make_t1_env(n_blocks=1, seed=0, camera_hw=128, out_dir=tmp_path)
+    try:
+        env.reset()
+        body = object_body_names(1)[0]
+        object_name = body.removesuffix("_main")
+        joint = env.env.get_object(object_name).joints[0]
+        basket_site = env.env.sim.data.get_site_xpos("basket_1_contain_region").copy()
+        qpos = env.env.sim.data.get_joint_qpos(joint).copy()
+        qpos[:3] = basket_site
+        env.env.sim.data.set_joint_qpos(joint, qpos)
+        env.env.sim.forward()
+        assert _libero_in_basket(env, body)
+
+        qpos[:3] = basket_site + np.array([0.075, 0.0, 0.0])
+        env.env.sim.data.set_joint_qpos(joint, qpos)
+        env.env.sim.forward()
+        assert not _libero_in_basket(env, body)
+    finally:
+        env.close()
+
+
+def test_robosuite_grasp_check_is_false_without_finger_contacts(tmp_path):
+    from lerobot_policy_snvla.sim.collect import _robosuite_grasping
+    from lerobot_policy_snvla.sim.t1_count_blocks import make_t1_env, object_body_names
+
+    env = make_t1_env(n_blocks=1, seed=0, camera_hw=128, out_dir=tmp_path)
+    try:
+        env.reset()
+        assert not _robosuite_grasping(env, object_body_names(1)[0])
+    finally:
+        env.close()

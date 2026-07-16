@@ -42,7 +42,7 @@ LEGACY_COMPLETION_TIMING_POLICY = {
     "collection_horizon": 1200,
     "task_completed_requires_all_placed": True,
 }
-COMPLETION_TIMING_POLICY = {
+PREVIOUS_COMPLETION_TIMING_POLICY = {
     "version": 2,
     "name": "return-home-before-task-completed",
     "home_target_type": "fixed_canonical",
@@ -73,6 +73,23 @@ COMPLETION_TIMING_POLICY = {
         "non_target_distractor_count": [2, 4],
         "goal_excludes_prefilled_and_non_target_objects": True,
     },
+}
+COMPLETION_TIMING_POLICY = {
+    **PREVIOUS_COMPLETION_TIMING_POLICY,
+    "version": 3,
+    "task_completed_requires_bddl_success": True,
+    "post_task_hold_requires_bddl_success": True,
+    "event_truth": {
+        "picked": "robosuite two-finger grasp and root-body z >= 0.12 for 3 frames",
+        "placed": "LIBERO registered In predicate for 5 frames",
+    },
+    "episode_provenance_features": [
+        "collector_seed",
+        "scene_object_count",
+        "initial_basket_object_count",
+        "distractor_object_count",
+        "distractor_categories",
+    ],
 }
 
 

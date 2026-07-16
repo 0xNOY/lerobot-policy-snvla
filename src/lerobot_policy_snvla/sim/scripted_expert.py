@@ -143,10 +143,20 @@ def get_body_pos(env, body_name: str) -> np.ndarray:
     return sim.data.body_xpos[sim.model.body_name2id(body_name)].copy()
 
 
+def get_observable_body_pos(obs, env, body_name: str) -> np.ndarray:
+    """Prefer robosuite's object-position observable, with a low-level fallback."""
+
+    observable_key = f"{body_name.removesuffix('_main')}_pos"
+    if observable_key in obs:
+        return np.asarray(obs[observable_key], dtype=np.float64).copy()
+    return get_body_pos(env, body_name)
+
+
 # かご内の置き位置オフセット。同一地点への積み重ねは避けつつ、壁との衝突で
 # 物体が外へ転がらないよう旧±0.03 mより中央側へ寄せる。±0.025 mなら、
 # かご内壁half≈0.064 mと物体footprint half≈0.025 mに対して約14 mmの余裕を
-# 保ちつつ、5個配置時の中心間隔を確保できる。
+# 保つ。5個目の中央slotは四隅とfootprintが重なり得るため、必ず最後に置いて
+# settled済み物体の上へ安定して積ませる。
 PLACE_OFFSETS = [
     np.array([-0.025, -0.025, 0.0]),
     np.array([0.025, 0.025, 0.0]),
@@ -164,6 +174,8 @@ def select_place_offsets(
     """Choose central release slots farthest from objects already inside the basket."""
 
     candidates = [offset.copy() for offset in PLACE_OFFSETS]
+    if n_blocks == len(PLACE_OFFSETS) and not np.asarray(occupied_xy).size:
+        return [offset.copy() for offset in PLACE_OFFSETS[:n_blocks]]
     if rng is not None:
         rng.shuffle(candidates)
     occupied = [np.asarray(xy, dtype=np.float64) for xy in np.asarray(occupied_xy).reshape(-1, 2)]
@@ -206,16 +218,28 @@ class T1Expert:
         self._initial_eef_pos: np.ndarray | None = None
         self._home_pos = np.asarray(CANONICAL_HOME_EEF_POSITION_M, dtype=np.float64)
         self._finished = False
-        scene_objects = n_blocks if n_scene_objects is None else n_scene_objects
-        if scene_objects < n_blocks:
+        self._scene_objects = n_blocks if n_scene_objects is None else n_scene_objects
+        if self._scene_objects < n_blocks:
             raise ValueError("n_scene_objects cannot be smaller than n_blocks")
-        basket_xy = get_body_pos(self.env, self.basket_body)[:2]
-        distractor_bodies = object_body_names(scene_objects, category or DEFAULT_CATEGORY)[n_blocks:]
+        self._category = category or DEFAULT_CATEGORY
+        self._rng = rng
+        self._offsets: list[np.ndarray] | None = None
+
+    def _initialize_offsets(self, obs) -> None:
+        if self._offsets is not None:
+            return
+        from .t1_count_blocks import object_body_names
+
+        basket_xy = get_observable_body_pos(obs, self.env, self.basket_body)[:2]
+        alias_bodies = object_body_names(self._scene_objects, self._category)[len(self.bodies) :]
         occupied_xy = np.asarray(
-            [get_body_pos(self.env, body)[:2] - basket_xy for body in distractor_bodies],
+            [
+                get_observable_body_pos(obs, self.env, body)[:2] - basket_xy
+                for body in alias_bodies
+            ],
             dtype=np.float64,
         ).reshape(-1, 2)
-        self._offsets = select_place_offsets(n_blocks, occupied_xy, rng=rng)
+        self._offsets = select_place_offsets(len(self.bodies), occupied_xy, rng=self._rng)
 
     @property
     def finished(self) -> bool:
@@ -239,6 +263,7 @@ class T1Expert:
 
     def act(self, obs) -> np.ndarray:
         eef = np.asarray(obs["robot0_eef_pos"])
+        self._initialize_offsets(obs)
         if self._initial_eef_pos is None:
             self._initial_eef_pos = eef.copy()
         if self.finished:
@@ -248,10 +273,11 @@ class T1Expert:
                 self._finished = True
                 return self._hold_open_action()
             return self._sm._move_action(eef, self._home_pos, -1.0)
-        obj = get_body_pos(self.env, self.bodies[self._idx])
+        obj = get_observable_body_pos(obs, self.env, self.bodies[self._idx])
+        assert self._offsets is not None
         offset = self._offsets[self._idx]
         # 高さはステートマシンのplace_transit/place_release(かご壁クリア/低ドロップ)が積む
-        place = get_body_pos(self.env, self.basket_body) + offset
+        place = get_observable_body_pos(obs, self.env, self.basket_body) + offset
         action, done = self._sm.step(eef, obj, place)
         if done:
             self._idx += 1

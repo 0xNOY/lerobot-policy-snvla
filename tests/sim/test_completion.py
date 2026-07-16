@@ -75,6 +75,9 @@ def test_completion_contract_rejects_horizon_cutoff_before_exact_hold():
     assert _completion_contract_satisfied(**common, post_task_hold_frames=10)
     assert not _completion_contract_satisfied(**common, post_task_hold_frames=11)
     assert not _completion_contract_satisfied(
+        **common, post_task_hold_frames=10, goal_hold_ok=False
+    )
+    assert not _completion_contract_satisfied(
         history,
         fmt,
         1,

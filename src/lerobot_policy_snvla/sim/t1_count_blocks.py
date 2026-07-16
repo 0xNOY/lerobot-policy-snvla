@@ -103,6 +103,8 @@ BLOCK_MIN_DIST = 0.10  # ブロック中心間の最小距離（footprint+把持
 DISTRACTOR_SPAWN_X = (-0.24, 0.24)
 DISTRACTOR_SPAWN_Y = (-0.08, 0.12)
 DISTRACTOR_MIN_DIST = 0.08
+DISTRACTOR_PATH_CLEARANCE = 0.08
+DISTRACTOR_BASKET_CLEARANCE = 0.14
 BASKET_SPAWN_X = (-0.08, 0.08)
 BASKET_SPAWN_Y = (0.22, 0.28)
 
@@ -117,6 +119,20 @@ def sample_layout(n_blocks: int, rng: np.random.Generator) -> tuple[list[tuple[f
             centers.append((x, y))
     basket = (rng.uniform(*BASKET_SPAWN_X), rng.uniform(*BASKET_SPAWN_Y))
     return centers, basket
+
+
+def _point_segment_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    stop: tuple[float, float],
+) -> float:
+    point_array = np.asarray(point, dtype=np.float64)
+    start_array = np.asarray(start, dtype=np.float64)
+    delta = np.asarray(stop, dtype=np.float64) - start_array
+    if np.allclose(delta, 0.0):
+        return float(np.linalg.norm(point_array - start_array))
+    fraction = float(np.clip(np.dot(point_array - start_array, delta) / np.dot(delta, delta), 0, 1))
+    return float(np.linalg.norm(point_array - (start_array + fraction * delta)))
 
 
 def make_t1_bddl(
@@ -172,6 +188,10 @@ def make_t1_bddl(
             if all(
                 np.hypot(x - existing_x, y - existing_y) >= DISTRACTOR_MIN_DIST
                 for existing_x, existing_y in occupied
+            ) and np.hypot(x - bx, y - by) >= DISTRACTOR_BASKET_CLEARANCE and all(
+                _point_segment_distance((x, y), target, (bx, by))
+                >= DISTRACTOR_PATH_CLEARANCE
+                for target in centers
             ):
                 break
         else:

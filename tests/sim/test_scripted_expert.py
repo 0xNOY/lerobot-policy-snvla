@@ -7,6 +7,7 @@ from lerobot_policy_snvla.sim.scripted_expert import (
     Phase,
     PickPlaceStateMachine,
     T1Expert,
+    get_observable_body_pos,
     select_place_offsets,
 )
 
@@ -30,6 +31,29 @@ def test_place_offsets_avoid_objects_already_inside_basket():
     assert len(selected) == 3
     assert all(np.max(np.abs(offset[:2])) <= 0.025 for offset in selected)
     assert np.linalg.norm(selected[0][:2] - occupied[0]) >= 0.07
+
+
+def test_five_object_layout_places_center_slot_last():
+    selected = select_place_offsets(5, np.empty((0, 2)), rng=np.random.default_rng(0))
+
+    assert np.array_equal(selected[-1], np.zeros(3))
+    assert all(not np.array_equal(offset, np.zeros(3)) for offset in selected[:-1])
+
+
+def test_object_position_prefers_robosuite_observable(monkeypatch):
+    expected = np.array([0.1, 0.2, 0.3])
+    monkeypatch.setattr(
+        "lerobot_policy_snvla.sim.scripted_expert.get_body_pos",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("fallback used")),
+    )
+
+    actual = get_observable_body_pos(
+        {"chocolate_pudding_1_pos": expected},
+        object(),
+        "chocolate_pudding_1_main",
+    )
+
+    assert np.array_equal(actual, expected)
 
 
 def run_until_phase(sm, eef, obj, place, phase, max_iters=500):

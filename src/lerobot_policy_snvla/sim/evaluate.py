@@ -18,12 +18,16 @@ from typing import Protocol
 import numpy as np
 
 from . import collect
-from .collect import BASKET_HALF_EXTENTS, MAX_STEPS_PER_BLOCK, PICK_HEIGHT
+from .collect import (
+    MAX_STEPS_PER_BLOCK,
+    PICK_HEIGHT,
+    _libero_in_basket,
+    _robosuite_grasping,
+)
 from .eval_metrics import NarrationAudit
-from .events import BasketRegion, EventTracker, NarrationFormat
+from .events import EventTracker, NarrationFormat
 from .scripted_expert import T1Expert, get_body_pos
 from .t1_count_blocks import (
-    BASKET_BODY,
     DEFAULT_CATEGORY,
     category_display_name,
     make_t1_env,
@@ -104,8 +108,18 @@ class EpisodeRecorder:
         if self._dataset is None:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+            collection_only = {
+                "sim_event",
+                "scene_object_count",
+                "initial_basket_object_count",
+                "distractor_object_count",
+                "distractor_categories",
+                "collector_seed",
+            }
             features = {
-                key: value for key, value in collect._features(self.camera_hw).items() if key != "sim_event"
+                key: value
+                for key, value in collect._features(self.camera_hw).items()
+                if key not in collection_only
             }
             probability = {"dtype": "float32", "shape": (1,), "names": None}
             truth_count = {"dtype": "int64", "shape": (1,), "names": None}
@@ -199,18 +213,19 @@ def _observe_new_narrations(
     picked: int,
     placed: int,
     n_blocks: int,
+    task_success: bool | None = None,
 ) -> str:
     """Audit append-only history plus a metrics-only fragment at most once."""
     if history[: len(audited_history)] == audited_history:
         for fragment in history[len(audited_history) :]:
-            audit.observe(fragment, picked, placed, n_blocks)
+            audit.observe(fragment, picked, placed, n_blocks, task_success)
             audited_history.append(fragment)
 
     current = metrics.get("current_narration", "")
     if not isinstance(current, str) or not current:
         return last_metric_fragment
     if (not history or current != history[-1]) and current != last_metric_fragment:
-        audit.observe(current, picked, placed, n_blocks)
+        audit.observe(current, picked, placed, n_blocks, task_success)
         audited_history.append(current)
     return current
 
@@ -229,11 +244,13 @@ def run_episode(
     stepper = make_stepper(env)
     stepper.reset()
     bodies = object_body_names(n_blocks, category)
-    region = BasketRegion(
-        center=get_body_pos(env, BASKET_BODY) + np.array([0.0, 0.0, 0.05]),
-        half_extents=BASKET_HALF_EXTENTS,
+    tracker = EventTracker(
+        None,
+        bodies,
+        placed_predicate=lambda body_name: _libero_in_basket(env, body_name),
+        picked_predicate=lambda body_name: _robosuite_grasping(env, body_name),
+        pick_height=PICK_HEIGHT,
     )
-    tracker = EventTracker(region, bodies, pick_height=PICK_HEIGHT)
     horizon = getattr(env.env, "horizon", 1000)
     max_steps = min(MAX_STEPS_PER_BLOCK * n_blocks, horizon - 2)
     t0 = time.perf_counter()
@@ -248,6 +265,7 @@ def run_episode(
         tracker.update(frame_idx, positions)
         picked = tracker.count("picked")
         placed = tracker.count("placed")
+        task_success = bool(env.check_success())
         picked_objects = {event.object_name for event in tracker.events if event.kind == "picked"}
         eef_object_distance = _distance_to_unpicked_object(obs, positions, picked_objects)
         if eef_object_distance is not None:
@@ -268,6 +286,7 @@ def run_episode(
             picked,
             placed,
             n_blocks,
+            task_success,
         )
         if recorder is not None:
             previous_narrations = metrics.get("previous_narrations", narration_history)
@@ -295,12 +314,13 @@ def run_episode(
             success = True
             break
     tracker.update(n_frames, {b: get_body_pos(env, b) for b in bodies})
+    current_placed = sum(_libero_in_basket(env, body) for body in bodies)
     if recorder is not None:
         recorder.save_episode()
     return EpisodeResult(
         seed=seed,
         success=success,
-        placed=tracker.count("placed"),
+        placed=current_placed,
         n_frames=n_frames,
         wall_time_s=time.perf_counter() - t0,
         narrations=stepper.narrations(),

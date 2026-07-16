@@ -33,6 +33,7 @@ from lerobot_policy_snvla.sim.completion import (
     CANONICAL_HOME_EEF_POSITION_M,
     COMPLETION_TIMING_POLICY,
     LEGACY_COMPLETION_TIMING_POLICY,
+    PREVIOUS_COMPLETION_TIMING_POLICY,
     write_completion_timing_policy,
 )
 
@@ -122,11 +123,38 @@ def test_validator_can_infer_mixed_episode_task_count(tmp_path):
     validate_success_dataset(source, expected_episodes=1, blocks=0, require_manifest=False)
 
 
+def test_mixed_curriculum_partitions_are_task_stratified():
+    strata = [f"task-{index // 10}" for index in range(50)]
+
+    train, validation, ablation = prepare_module._partitions(
+        50,
+        list(range(50)),
+        10,
+        123,
+        strata,
+    )
+
+    assert len(train) == 45
+    assert len(validation) == 5
+    assert len(ablation) == 10
+    assert {strata[index] for index in validation} == set(strata)
+    assert all(sum(strata[index] == task for index in ablation) == 2 for task in set(strata))
+
+
 def test_validator_accepts_legacy_completion_policy_sidecar(tmp_path):
     source = tmp_path / "source"
     _production_source(source, "local/source")
     policy_path = source / "meta/completion_timing_policy.json"
     policy_path.write_text(json.dumps(LEGACY_COMPLETION_TIMING_POLICY))
+
+    validate_success_dataset(source, expected_episodes=1, require_manifest=False)
+
+
+def test_validator_accepts_previous_v2_completion_policy_sidecar(tmp_path):
+    source = tmp_path / "source"
+    _production_source(source, "local/source")
+    policy_path = source / "meta/completion_timing_policy.json"
+    policy_path.write_text(json.dumps(PREVIOUS_COMPLETION_TIMING_POLICY))
 
     validate_success_dataset(source, expected_episodes=1, require_manifest=False)
 
@@ -263,6 +291,58 @@ def test_completion_validator_accepts_combined_done_and_next_action_targets():
     )
 
     assert completion == 6
+
+
+def test_success_validator_rejects_wrong_narration_or_event_object_identity():
+    narrations = [
+        "Picking up chocolate pudding 1 of 1...",
+        " (done)\nPutting chocolate pudding 1 of 1 into the basket...",
+        " (done)\n",
+        "Task completed.\n",
+    ]
+    valid_events = [
+        "",
+        json.dumps(
+            {
+                "kind": "picked",
+                "ordinal": 1,
+                "frame": 1,
+                "object_name": "chocolate_pudding_1_main",
+            }
+        ),
+        json.dumps(
+            {
+                "kind": "placed",
+                "ordinal": 1,
+                "frame": 2,
+                "object_name": "chocolate_pudding_1_main",
+            }
+        ),
+        "",
+    ]
+    with pytest.raises(ValueError, match="narration object"):
+        prepare_module._validate_success_episode(
+            0,
+            valid_events,
+            [value.replace("chocolate pudding", "tomato sauce") for value in narrations],
+            1,
+            object_name="chocolate pudding",
+            object_instance_prefix="chocolate_pudding",
+        )
+
+    wrong_events = list(valid_events)
+    wrong_events[2] = wrong_events[2].replace(
+        "chocolate_pudding_1_main", "alphabet_soup_1_main"
+    )
+    with pytest.raises(ValueError, match="object identities"):
+        prepare_module._validate_success_episode(
+            0,
+            wrong_events,
+            narrations,
+            1,
+            object_name="chocolate pudding",
+            object_instance_prefix="chocolate_pudding",
+        )
 
 
 def test_fresh_build_requires_and_preserves_strict_completion_policy(tmp_path):
@@ -628,11 +708,24 @@ def test_parse_validate_only_does_not_require_sources_or_repo_id(tmp_path):
     )
     assert args.validate_only
     assert args.audit_sources
+    assert not args.raw_source
     assert args.source_root == []
     assert args.dst_repo_id is None
 
     with pytest.raises(SystemExit):
         parse_args(["--dst-root", str(tmp_path), "--expected-episodes", "3"])
+
+    raw_args = parse_args(
+        [
+            "--validate-only",
+            "--raw-source",
+            "--dst-root",
+            str(tmp_path),
+            "--expected-episodes",
+            "1",
+        ]
+    )
+    assert raw_args.raw_source
 
 
 def test_parse_builder_cli_with_repeated_sources(tmp_path):

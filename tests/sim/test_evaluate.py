@@ -146,6 +146,8 @@ def test_run_episode_audits_only_new_metrics_fragment_and_records_truth(monkeypa
         "chocolate_pudding_1_main": np.array([2.0, 0.0, 0.0]),
     }
     monkeypatch.setattr(evaluate_module, "get_body_pos", lambda _env, body: positions[body])
+    monkeypatch.setattr(evaluate_module, "_robosuite_grasping", lambda _env, _body: True)
+    monkeypatch.setattr(evaluate_module, "_libero_in_basket", lambda _env, _body: False)
     monkeypatch.setattr(evaluate_module, "PICK_HEIGHT", 0.0)
     monkeypatch.setattr(evaluate_module.collect, "_state8", lambda _obs: np.zeros(8, np.float32))
     monkeypatch.setattr(evaluate_module.collect, "_images", lambda _obs: {})

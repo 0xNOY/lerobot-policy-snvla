@@ -29,6 +29,23 @@ def test_leaving_region_resets_settle_counter():
     assert tracker.update(4, {"blk_1": IN}) is not None
 
 
+def test_exact_placed_predicate_overrides_broad_fallback_region():
+    exact = {"blk_1": False}
+    tracker = EventTracker(
+        REGION,
+        ["blk_1"],
+        placed_predicate=lambda name: exact[name],
+        settle_frames=2,
+    )
+    assert tracker.update(0, {"blk_1": IN}) is None
+    assert tracker.update(1, {"blk_1": IN}) is None
+    exact["blk_1"] = True
+    assert tracker.update(2, {"blk_1": IN}) is None
+    assert tracker.update(3, {"blk_1": IN}) == Event(
+        kind="placed", object_name="blk_1", frame=3, ordinal=1
+    )
+
+
 def test_event_fires_once_per_object_and_ordinals_increment():
     tracker = EventTracker(REGION, ["blk_1", "blk_2"], settle_frames=1)
     ev1 = tracker.update(0, {"blk_1": IN, "blk_2": OUT})
@@ -53,6 +70,25 @@ def test_picked_event_fires_on_lift_threshold_with_per_kind_ordinals():
     # その後かごに置かれたら placed が ordinal=1 で発火（ordinalはkindごと）
     ev2 = tracker.update(4, {"blk_1": IN})
     assert ev2 == Event(kind="placed", object_name="blk_1", frame=4, ordinal=1)
+
+
+def test_pick_requires_exact_grasp_predicate_when_provided():
+    grasping = {"blk_1": False}
+    tracker = EventTracker(
+        REGION,
+        ["blk_1"],
+        pick_height=0.12,
+        pick_frames=2,
+        picked_predicate=lambda name: grasping[name],
+    )
+    high = np.array([0.3, -0.2, 0.20])
+    assert tracker.update(0, {"blk_1": high}) is None
+    assert tracker.update(1, {"blk_1": high}) is None
+    grasping["blk_1"] = True
+    assert tracker.update(2, {"blk_1": high}) is None
+    assert tracker.update(3, {"blk_1": high}) == Event(
+        kind="picked", object_name="blk_1", frame=3, ordinal=1
+    )
 
 
 def test_simultaneous_settles_are_emitted_one_per_frame():

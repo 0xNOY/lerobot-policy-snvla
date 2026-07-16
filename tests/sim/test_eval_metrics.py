@@ -39,6 +39,20 @@ def test_canonical_fragment_stream_accepts_tracker_transitions_after_start():
     assert audit.false_task_completed == 0
 
 
+def test_task_completed_uses_current_libero_success_not_historical_progress():
+    audit = NarrationAudit()
+
+    audit.observe(
+        "Task completed.\n",
+        picked=1,
+        placed=1,
+        n_blocks=1,
+        task_success=False,
+    )
+
+    assert audit.false_task_completed == 1
+
+
 def test_done_without_a_matching_start_is_ignored_and_start_resets_baseline():
     audit = NarrationAudit()
 
