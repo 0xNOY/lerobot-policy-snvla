@@ -758,17 +758,16 @@ def test_update_policy_exposes_exact_epoch_duration_metrics_across_resume(monkey
     )
 
     tracker, first_output = train_bf16_fsdp.update_policy(tracker)
-    assert first_output["requested_epochs"].item() == pytest.approx(8.0)
-    assert first_output["calculated_steps"].item() == 16
-    assert first_output["steps_per_epoch"].item() == 2
-    assert first_output["initial_step"].item() == 3
-    assert first_output["effective_epoch_progress"].item() == pytest.approx(2.0)
-    assert tracker.to_dict()["effective_epoch_progress"] == pytest.approx(2.0)
+    assert first_output == {}
+    assert tracker.to_dict()["requested_epochs"] == pytest.approx(8.0)
     assert tracker.to_dict()["calculated_steps"] == 16
+    assert tracker.to_dict()["steps_per_epoch"] == 2
+    assert tracker.to_dict()["initial_step"] == 3
+    assert tracker.to_dict()["effective_epoch_progress"] == pytest.approx(2.0)
 
     tracker.step()
     tracker, second_output = train_bf16_fsdp.update_policy(tracker)
-    assert second_output["effective_epoch_progress"].item() == pytest.approx(2.5)
+    assert second_output == {}
     assert tracker.to_dict()["effective_epoch_progress"] == pytest.approx(2.5)
 
 
@@ -785,20 +784,23 @@ def test_record_output_metrics_adds_scalar_average_meters():
     assert tracker.metrics["text_loss"].avg == pytest.approx(0.5)
 
 
-def test_record_output_metrics_ignores_non_scalar_values():
+def test_record_output_metrics_accepts_python_scalars_and_ignores_other_values():
     tracker = make_tracker()
+    output = {
+        "vector": torch.ones(2),
+        "matrix": torch.ones(1, 1),
+        "python_float": 0.25,
+        "metadata": "ignored",
+    }
 
-    record_output_metrics(
-        tracker,
-        {
-            "vector": torch.ones(2),
-            "matrix": torch.ones(1, 1),
-            "python_float": 0.25,
-            "metadata": "ignored",
-        },
-    )
+    record_output_metrics(tracker, output)
 
-    assert tracker.metrics == {}
+    assert set(tracker.metrics) == {"python_float"}
+    assert tracker.metrics["python_float"].avg == pytest.approx(0.25)
+    assert set(output) == {"vector", "matrix", "metadata"}
+    torch.testing.assert_close(output["vector"], torch.ones(2))
+    torch.testing.assert_close(output["matrix"], torch.ones(1, 1))
+    assert output["metadata"] == "ignored"
 
 
 class SimulatedTwoRankAccelerator:

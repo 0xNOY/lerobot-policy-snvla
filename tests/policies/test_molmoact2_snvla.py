@@ -11,6 +11,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot_policy_snvla.configuration_molmoact2_snvla import MolmoAct2SNVLAConfig
 from lerobot_policy_snvla.modeling_molmoact2_snvla import (
     MolmoAct2SNVLAPolicy,
+    _add_masked_metric,
     mask_narration_targets_for_action,
     narration_ce_per_example,
 )
@@ -141,6 +142,21 @@ def test_narration_ce_is_reduced_per_example():
     assert losses.shape == (2,)
     assert torch.isfinite(losses).all()
     assert (losses < 1.1).all()
+
+
+def test_masked_metrics_expose_global_sum_and_count():
+    metrics = {}
+
+    _add_masked_metric(
+        metrics,
+        "selected_loss",
+        torch.tensor([1.0, 3.0, 9.0]),
+        torch.tensor([True, True, False]),
+    )
+
+    assert metrics["selected_loss"] == pytest.approx(2.0)
+    assert metrics["__metric_numerator__/selected_loss"] == pytest.approx(4.0)
+    assert metrics["__metric_count__/selected_loss"] == pytest.approx(2.0)
 
 
 def test_sparse_narration_ce_matches_dense_loss_and_gradients():

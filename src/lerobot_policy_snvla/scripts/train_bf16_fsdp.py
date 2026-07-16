@@ -141,6 +141,7 @@ def _record_globally_weighted_metrics(
             meter.val = 0.0
             if meter.count == 0:
                 meter.avg = 0.0
+        output_dict.pop(name, None)
     return set(metric_names)
 
 
@@ -155,14 +156,24 @@ def record_output_metrics(
 
     globally_weighted = _record_globally_weighted_metrics(train_metrics, output_dict, accelerator)
 
-    for name, value in output_dict.items():
+    for name, value in list(output_dict.items()):
         if name in globally_weighted:
             continue
-        if not isinstance(value, torch.Tensor) or value.ndim != 0:
+        if isinstance(value, torch.Tensor):
+            if value.ndim != 0:
+                continue
+            scalar = value.detach().item()
+        elif isinstance(value, int | float):
+            scalar = value
+        else:
             continue
         if name not in train_metrics.metrics:
             train_metrics.metrics[name] = AverageMeter(name, ":.4f", reduction="mean")
-        train_metrics.metrics[name].update(value.detach().item())
+        train_metrics.metrics[name].update(scalar)
+        # LeRobot merges output_dict over the distributed tracker immediately
+        # before W&B logging. Remove registered scalars so rank-local values do
+        # not overwrite the reduced metrics and Tensor values are not rejected.
+        output_dict.pop(name)
 
 
 def update_policy(*args, **kwargs):
@@ -206,13 +217,16 @@ def update_policy(*args, **kwargs):
                 "lr_scheduler_final_lr": torch.tensor(_active_scheduler_metrics.final_lr),
             }
         )
-    record_output_metrics(train_metrics, output_dict, accelerator)
+    progress_value = None
     if _active_epoch_metrics is not None:
+        progress_value = current_step / _active_epoch_metrics.steps_per_epoch
+    record_output_metrics(train_metrics, output_dict, accelerator)
+    if progress_value is not None:
         # W&B merges output_dict over tracker.to_dict(), and the meter is also
         # kept point-in-time so neither path reports a window average as current
         # epoch progress.
         progress = train_metrics.metrics["effective_epoch_progress"]
-        progress.val = output_dict["effective_epoch_progress"].item()
+        progress.val = progress_value
         progress.avg = progress.val
         progress.sum = progress.val
         progress.count = 1

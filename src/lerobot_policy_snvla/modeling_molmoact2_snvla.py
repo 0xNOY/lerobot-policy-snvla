@@ -12,7 +12,11 @@ from torch import Tensor
 
 from .configuration_molmoact2_snvla import MolmoAct2SNVLAConfig
 from .constants import (
+    GROUP_METRIC_COUNT_PREFIX,
+    GROUP_METRIC_NUMERATOR_PREFIX,
     NARRATION_TARGET_MASK,
+    OBSERVATION_NOISE_MASK,
+    OBSERVATION_NOISE_SCALE,
     SNVLA_NARRATION_LABELS,
     SNVLA_STATE_HIDDEN_PREFIX,
     STATE_DROPOUT_MASK,
@@ -61,6 +65,21 @@ def mask_narration_targets_for_action(
     if encoder_attention_mask.shape != narration_labels.shape:
         raise ValueError("Narration labels must match the action-expert encoder mask shape.")
     return encoder_attention_mask.to(dtype=torch.bool) & (narration_labels == -100)
+
+
+def _add_masked_metric(
+    metrics: dict[str, Tensor],
+    name: str,
+    values: Tensor,
+    mask: Tensor,
+) -> None:
+    mask = mask.to(device=values.device, dtype=torch.bool).reshape(-1)
+    values = values.detach().float().reshape(-1)
+    numerator = values[mask].sum()
+    count = mask.float().sum()
+    metrics[name] = numerator / count.clamp_min(1.0)
+    metrics[f"{GROUP_METRIC_NUMERATOR_PREFIX}{name}"] = numerator
+    metrics[f"{GROUP_METRIC_COUNT_PREFIX}{name}"] = count
 
 
 class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
@@ -265,28 +284,50 @@ class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
         if narration_target is None:
             narration_target = torch.zeros_like(dropout)
         narration_target = narration_target.to(text_loss.device, dtype=torch.bool)
-        metrics = {
-            "loss": total.detach().float().mean().item(),
-            "action_flow_loss": flow_loss.detach().float().mean().item(),
-            "narration_ce_loss": text_loss.detach().float().mean().item(),
-            "narration_ce_loss_state_dropped": (
-                text_loss[dropout].detach().float().mean().item() if bool(dropout.any()) else 0.0
-            ),
-            "narration_ce_loss_state_present": (
-                text_loss[~dropout].detach().float().mean().item()
-                if bool((~dropout).any())
-                else 0.0
-            ),
-            "mode_eos_loss": (
-                text_loss[~narration_target].detach().float().mean().item()
-                if bool((~narration_target).any())
-                else 0.0
-            ),
-            "mode_non_eos_loss": (
-                text_loss[narration_target].detach().float().mean().item()
-                if bool(narration_target.any())
-                else 0.0
-            ),
+        noise = batch.get(OBSERVATION_NOISE_MASK)
+        if noise is None:
+            noise = torch.zeros_like(dropout)
+        noise = noise.to(text_loss.device, dtype=torch.bool).reshape(-1)
+        noise_scale = batch.get(OBSERVATION_NOISE_SCALE)
+        if noise_scale is None:
+            noise_scale = torch.zeros_like(text_loss)
+        noise_scale = noise_scale.to(text_loss.device, dtype=torch.float32).reshape(-1)
+
+        output_metrics: dict[str, Tensor] = {
+            "action_flow_loss": flow_loss.detach().float().mean(),
+            "narration_ce_loss": text_loss.detach().float().mean(),
+            "state_dropout_fraction": dropout.float().mean(),
+            "observation_noise_fraction": noise.float().mean(),
+            "narration_target_fraction": narration_target.float().mean(),
         }
-        self.latest_metrics = metrics
-        return (total.mean() if reduction == "mean" else total), metrics
+        _add_masked_metric(
+            output_metrics,
+            "narration_ce_loss_state_dropped",
+            text_loss,
+            dropout,
+        )
+        _add_masked_metric(
+            output_metrics,
+            "narration_ce_loss_state_present",
+            text_loss,
+            ~dropout,
+        )
+        _add_masked_metric(output_metrics, "mode_eos_loss", text_loss, ~narration_target)
+        _add_masked_metric(
+            output_metrics,
+            "mode_non_eos_loss",
+            text_loss,
+            narration_target,
+        )
+        _add_masked_metric(
+            output_metrics,
+            "observation_noise_scale",
+            noise_scale,
+            noise,
+        )
+        self.latest_metrics = {
+            name: float(value.detach().item())
+            for name, value in output_metrics.items()
+            if not name.startswith("__metric_")
+        }
+        return (total.mean() if reduction == "mean" else total), output_metrics
