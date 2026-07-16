@@ -66,7 +66,18 @@ def test_collect_two_episodes_produces_valid_dataset(tmp_path):
         streams[ep] = streams.get(ep, "") + cn
         if se:
             event = json.loads(se)
-            assert cn == " (done)\n"  # 真値イベントフレームの実況は完了断片
+            if event["kind"] == "picked":
+                assert cn == (
+                    " (done)\n"
+                    f"Putting chocolate pudding {event['ordinal']} of 2 into the basket..."
+                )
+            elif event["ordinal"] < 2:
+                assert cn == (
+                    " (done)\n"
+                    f"Picking up chocolate pudding {event['ordinal'] + 1} of 2..."
+                )
+            else:
+                assert cn == " (done)\n"
             events_per_ep.setdefault(ep, []).append(event["kind"])
     for ep in range(ds.num_episodes):
         assert streams[ep] == expected_stream

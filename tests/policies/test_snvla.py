@@ -175,6 +175,12 @@ def test_observation_noise_config_defaults_and_validation():
             dataclasses.replace(cfg, **changes)
 
 
+def test_combined_narration_default_reserves_full_text_loss_target():
+    cfg = make_test_config()
+
+    assert cfg.max_text_loss_tokens == 24
+
+
 def test_snvla_training_masks_are_complementary_data():
     batch = {
         "state_dropout_mask": torch.tensor([False, True]),

@@ -1,9 +1,9 @@
 """Automated T1 data collection: scripted expert + ground-truth narrations → LeRobot dataset.
 
-実況は so101_wn 互換の断片列で書き込む:
-``Placing X 1 of N in the basket...`` → `` completed.\n`` → ... → ``Task completed.\n``
-開始断片は各ブロックの動作開始フレーム、完了断片は真値イベント（settle）フレーム、
-task_completed は最後の完了断片後にEEFを固定canonical homeへ戻してから発行される。
+実況はso101_wn互換の連結ストリームを保ちつつ、真値イベントの確定フレームで
+完了断片と次動作予告をまとめて書き込む:
+``Picking ...`` → `` (done)\nPutting ...`` → ... → `` (done)\n`` → ``Task completed.\n``
+task_completedは最後の完了断片後にEEFを固定canonical homeへ戻してから発行される。
 """
 
 import argparse
@@ -156,12 +156,10 @@ def _run_episode(
 ) -> tuple[list[dict], bool, bool]:
     """1エピソード実行。(frames, success, narration_ok) を返す。
 
-    実況断片は1フレームに1つだけ発行する。同一フレームで複数の断片が確定した場合
-    はFIFOで次フレームへ繰り越す。narration_okは、発行断片の連結が
+    実況targetは1フレームに1つだけ発行する。イベント確定時は完了断片と次動作予告を
+    同じtargetに連結する。narration_okは、発行targetの連結が
     fmt.expected_stream(n_blocks) と完全一致したかどうか。
     """
-    from .scripted_expert import Phase
-
     bodies = object_body_names(n_blocks, category)
     obs = env.reset()
     pre_roll = _move_to_initial_pose(
@@ -182,9 +180,6 @@ def _run_episode(
     frames: list[dict] = []
     # (narration_fragment, sim_event_json) のFIFO
     pending: list[tuple[str, str]] = [(fmt.pick_narration(1, n_blocks), "")]
-    pick_started = 1  # pick開始断片を発行済みのブロック数
-    place_started = 0  # place開始断片を発行済みのブロック数
-    place_phases = {Phase.MOVE, Phase.LOWER, Phase.RELEASE, Phase.RETREAT}
     task_completed_emitted = False
     task_completed_frame_written = False
     post_task_hold_frames = 0
@@ -196,24 +191,14 @@ def _run_episode(
         positions = {b: get_body_pos(env, b) for b in bodies}
         event = tracker.update(frame_idx, positions)
         if event:
-            pending.append((fmt.done_fragment, json.dumps(dataclasses.asdict(event))))
+            pending.append(
+                (
+                    fmt.event_narration(event.kind, event.ordinal, n_blocks),
+                    json.dumps(dataclasses.asdict(event)),
+                )
+            )
 
         action = expert.act(obs)
-        if not expert.finished:
-            cur_block = expert._idx + 1
-            # 次ブロックへの着手（actでの_idx遷移）をpick開始断片として発行
-            if cur_block <= n_blocks and cur_block > pick_started:
-                pick_started = cur_block
-                pending.append((fmt.pick_narration(cur_block, n_blocks), ""))
-            # 運搬フェーズ入りをplace開始断片として発行。pickedイベントが未確定の
-            # うちは保留し、「... (done)\nPutting ...」の順序を保証する
-            if (
-                place_started < cur_block
-                and expert._sm.phase in place_phases
-                and tracker.count("picked") >= cur_block
-            ):
-                place_started = cur_block
-                pending.append((fmt.place_narration(cur_block, n_blocks), ""))
 
         if (
             expert.finished

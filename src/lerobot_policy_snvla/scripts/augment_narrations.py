@@ -16,6 +16,7 @@ from lerobot.datasets.utils import DATA_DIR
 
 CURRENT_NARRATION_KEY = "current_narration"
 PREVIOUS_NARRATIONS_KEY = "previous_narrations"
+DEFAULT_NARRATION_WINDOW_SIZE = 20
 
 
 @dataclass
@@ -220,7 +221,12 @@ def main():
     )
     parser.add_argument("dst_path", type=Path, help="Path to the destination dataset")
     parser.add_argument("--dst-repo-id", type=str, help="Repository ID for the destination dataset")
-    parser.add_argument("--window-size", type=int, default=5, help="Window size for augmentation")
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=DEFAULT_NARRATION_WINDOW_SIZE,
+        help="Frame radius for narration augmentation (default: 20)",
+    )
     parser.add_argument(
         "--forward-only",
         action="store_true",

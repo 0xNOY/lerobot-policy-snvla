@@ -88,8 +88,10 @@ class NarrationFormat:
     実況は断片の列で、連結すると完全なストリームになる:
     ``Picking up X 1 of N... (done)\\nPutting X 1 of N into the basket... (done)\\n
     ... Task completed.\\n``
-    開始断片は動作開始時、`` (done)\\n`` は真値イベントの確定フレーム（P3規約）、
-    task_completed は最後の (done) 後、EEFが固定canonical homeへ戻ってから発行される。
+    最初の開始断片はepisode開始時に発行する。以後は真値イベントの確定フレームで
+    `` (done)\\n`` と次の動作予告を1つの実況として発行する（例:
+    `` (done)\\nPutting ...``）。最後のplaceだけは次動作がないためdone単独とし、
+    task_completedはその後EEFが固定canonical homeへ戻ってから発行する。
     """
 
     object_name: str = "chocolate pudding"
@@ -111,15 +113,29 @@ class NarrationFormat:
     def place_narration(self, ordinal: int, n_total: int) -> str:
         return f"Putting {self.object_name} {ordinal} of {n_total} into the basket..."
 
+    def event_narration(self, kind: str, ordinal: int, n_total: int) -> str:
+        """Return the done result and next-action preview emitted at an event."""
+
+        if kind == "picked":
+            return self.done_fragment + self.place_narration(ordinal, n_total)
+        if kind == "placed":
+            if ordinal < n_total:
+                return self.done_fragment + self.pick_narration(ordinal + 1, n_total)
+            return self.done_fragment
+        raise ValueError(f"unsupported narration event kind: {kind!r}")
+
+    def expected_narrations(self, n_total: int) -> list[str]:
+        """Expected per-frame targets for the combined transition format."""
+
+        if n_total <= 0:
+            raise ValueError("n_total must be positive")
+        parts = [self.pick_narration(1, n_total)]
+        for ordinal in range(1, n_total + 1):
+            parts.append(self.event_narration("picked", ordinal, n_total))
+            parts.append(self.event_narration("placed", ordinal, n_total))
+        parts.append(self.task_completed_fragment)
+        return parts
+
     def expected_stream(self, n_total: int) -> str:
         """全断片を正しい順に連結した期待ストリーム（収集時の検証・評価用）。"""
-        parts = []
-        for k in range(1, n_total + 1):
-            parts += [
-                self.pick_narration(k, n_total),
-                self.done_fragment,
-                self.place_narration(k, n_total),
-                self.done_fragment,
-            ]
-        parts.append(self.task_completed_fragment)
-        return "".join(parts)
+        return "".join(self.expected_narrations(n_total))

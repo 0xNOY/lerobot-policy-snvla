@@ -200,6 +200,57 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_completion_validator_accepts_combined_done_and_next_action_targets():
+    narrations = [
+        "Picking up block 1 of 2...",
+        " (done)\nPutting block 1 of 2 into the basket...",
+        " (done)\nPicking up block 2 of 2...",
+        " (done)\nPutting block 2 of 2 into the basket...",
+        " (done)\n",
+        "",
+        "Task completed.\n",
+        *([""] * 10),
+    ]
+    events_by_frame = {
+        1: ("picked", 1),
+        2: ("placed", 1),
+        3: ("picked", 2),
+        4: ("placed", 2),
+    }
+    sim_events = []
+    for frame in range(len(narrations)):
+        event = events_by_frame.get(frame)
+        sim_events.append(
+            json.dumps({"kind": event[0], "ordinal": event[1], "frame": frame})
+            if event
+            else ""
+        )
+    history: list[str] = []
+    previous_narrations = []
+    for narration in narrations:
+        previous_narrations.append(json.dumps(history))
+        if narration:
+            history.append(narration)
+    home = np.asarray(CANONICAL_HOME_EEF_POSITION_M, dtype=np.float32)
+    states = [
+        home + np.array([0.03, 0.0, 0.0], dtype=np.float32),
+        *(home + np.array([0.02, 0.01, 0.02], dtype=np.float32) for _ in range(5)),
+        *(home.copy() for _ in range(11)),
+    ]
+
+    completion = prepare_module._validate_success_episode(0, sim_events, narrations, 2)
+    prepare_module._validate_completion_timing_episode(
+        0,
+        sim_events,
+        narrations,
+        previous_narrations,
+        states,
+        2,
+    )
+
+    assert completion == 6
+
+
 def test_fresh_build_requires_and_preserves_strict_completion_policy(tmp_path):
     source = tmp_path / "production-source"
     second_source = tmp_path / "production-source-2"

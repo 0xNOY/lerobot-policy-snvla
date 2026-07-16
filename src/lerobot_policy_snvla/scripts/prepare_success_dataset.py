@@ -38,6 +38,10 @@ _PICK_RE = re.compile(r"^Picking up .+ (\d+) of (\d+)\.\.\.\s*$")
 _PLACE_RE = re.compile(r"^Putting .+ (\d+) of (\d+) into the basket\.\.\.\s*$")
 _DONE_FRAGMENT = " (done)\n"
 _TASK_COMPLETED_FRAGMENT = "Task completed.\n"
+_DONE_PICK_RE = re.compile(r"^ \(done\)\nPicking up .+ (\d+) of (\d+)\.\.\.\s*$")
+_DONE_PLACE_RE = re.compile(
+    r"^ \(done\)\nPutting .+ (\d+) of (\d+) into the basket\.\.\.\s*$"
+)
 
 
 def _read_completion_timing_policy(root: Path) -> dict[str, Any] | None:
@@ -148,6 +152,12 @@ def _validate_success_episode(
         elif match := _PLACE_RE.fullmatch(narration):
             places.append((frame_index, int(match.group(1)), int(match.group(2))))
             ordered_centers.append(("placed", int(match.group(1)), int(match.group(2))))
+        elif match := _DONE_PICK_RE.fullmatch(narration):
+            picks.append((frame_index, int(match.group(1)), int(match.group(2))))
+            ordered_centers.append(("picked", int(match.group(1)), int(match.group(2))))
+        elif match := _DONE_PLACE_RE.fullmatch(narration):
+            places.append((frame_index, int(match.group(1)), int(match.group(2))))
+            ordered_centers.append(("placed", int(match.group(1)), int(match.group(2))))
         elif narration.strip() == "Task completed.":
             completions.append(frame_index)
     canonical = [(ordinal, blocks) for ordinal in range(1, blocks + 1)]
@@ -182,21 +192,56 @@ def _validate_completion_timing_episode(
 
     transitions = _narration_transitions(narrations)
     fragments = [fragment for _, fragment in transitions]
-    expected_kinds: list[str] = []
-    for _ in range(blocks):
-        expected_kinds.extend(("pick", "done", "place", "done"))
-    expected_kinds.append("task")
-    if len(fragments) != len(expected_kinds):
-        raise ValueError(f"episode {episode_index} narration stream is not canonical")
-    for fragment, kind in zip(fragments, expected_kinds, strict=True):
-        valid = {
-            "pick": _PICK_RE.fullmatch(fragment) is not None,
-            "done": fragment == _DONE_FRAGMENT,
-            "place": _PLACE_RE.fullmatch(fragment) is not None,
-            "task": fragment == _TASK_COMPLETED_FRAGMENT,
-        }[kind]
-        if not valid:
+    combined = any(
+        fragment.startswith(_DONE_FRAGMENT) and fragment != _DONE_FRAGMENT
+        for fragment in fragments
+    )
+    if combined:
+        expected_fragments = 2 * blocks + 2
+        if len(fragments) != expected_fragments:
             raise ValueError(f"episode {episode_index} narration stream is not canonical")
+        first = _PICK_RE.fullmatch(fragments[0])
+        if first is None or (int(first.group(1)), int(first.group(2))) != (1, blocks):
+            raise ValueError(f"episode {episode_index} narration stream is not canonical")
+        cursor = 1
+        for ordinal in range(1, blocks + 1):
+            place = _DONE_PLACE_RE.fullmatch(fragments[cursor])
+            if place is None or (int(place.group(1)), int(place.group(2))) != (
+                ordinal,
+                blocks,
+            ):
+                raise ValueError(f"episode {episode_index} narration stream is not canonical")
+            cursor += 1
+            if ordinal < blocks:
+                pick = _DONE_PICK_RE.fullmatch(fragments[cursor])
+                if pick is None or (int(pick.group(1)), int(pick.group(2))) != (
+                    ordinal + 1,
+                    blocks,
+                ):
+                    raise ValueError(
+                        f"episode {episode_index} narration stream is not canonical"
+                    )
+            elif fragments[cursor] != _DONE_FRAGMENT:
+                raise ValueError(f"episode {episode_index} narration stream is not canonical")
+            cursor += 1
+        if fragments[cursor] != _TASK_COMPLETED_FRAGMENT:
+            raise ValueError(f"episode {episode_index} narration stream is not canonical")
+    else:
+        expected_kinds: list[str] = []
+        for _ in range(blocks):
+            expected_kinds.extend(("pick", "done", "place", "done"))
+        expected_kinds.append("task")
+        if len(fragments) != len(expected_kinds):
+            raise ValueError(f"episode {episode_index} narration stream is not canonical")
+        for fragment, kind in zip(fragments, expected_kinds, strict=True):
+            valid = {
+                "pick": _PICK_RE.fullmatch(fragment) is not None,
+                "done": fragment == _DONE_FRAGMENT,
+                "place": _PLACE_RE.fullmatch(fragment) is not None,
+                "task": fragment == _TASK_COMPLETED_FRAGMENT,
+            }[kind]
+            if not valid:
+                raise ValueError(f"episode {episode_index} narration stream is not canonical")
     for frame_index, (current, raw_previous) in enumerate(
         zip(narrations, previous_narrations, strict=True)
     ):
@@ -231,7 +276,9 @@ def _validate_completion_timing_episode(
     events = _event_transitions(sim_events)
     event_frames = [frame_index for frame_index, _ in events]
     done_frames = [
-        frame_index for frame_index, narration in transitions if narration == _DONE_FRAGMENT
+        frame_index
+        for frame_index, narration in transitions
+        if narration.startswith(_DONE_FRAGMENT)
     ]
     if done_frames != event_frames:
         raise ValueError(f"episode {episode_index} done fragments do not align with simulator events")

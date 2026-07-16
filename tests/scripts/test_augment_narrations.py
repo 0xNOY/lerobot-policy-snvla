@@ -1,4 +1,11 @@
-from lerobot_policy_snvla.scripts.augment_narrations import compute_window
+from lerobot_policy_snvla.scripts.augment_narrations import (
+    DEFAULT_NARRATION_WINDOW_SIZE,
+    compute_window,
+)
+
+
+def test_default_narration_window_covers_two_ten_action_boundaries():
+    assert DEFAULT_NARRATION_WINDOW_SIZE == 20
 
 
 def test_symmetric_window_matches_legacy_behavior():

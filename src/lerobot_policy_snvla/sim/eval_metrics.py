@@ -20,6 +20,10 @@ class NarrationAudit:
     _pending_baseline: int = 0
 
     def observe(self, fragment: str, picked: int, placed: int, n_blocks: int) -> None:
+        if fragment.startswith(" (done)\n") and fragment != " (done)\n":
+            self.observe(" (done)\n", picked, placed, n_blocks)
+            self.observe(fragment.removeprefix(" (done)\n"), picked, placed, n_blocks)
+            return
         if fragment.startswith("Picking up "):
             self._pending_kind = "picked"
             self._pending_baseline = picked

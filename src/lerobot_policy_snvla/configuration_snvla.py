@@ -97,7 +97,9 @@ class SNVLAConfig(PreTrainedConfig):
     compile_mode: str = "max-autotune"
     compile_cudagraphs: bool = True
     training_padding_length: int | None = None
-    max_text_loss_tokens: int = 16
+    # Combined transition targets such as ``(done)\nPutting ...`` require 19
+    # loss-bearing target tokens with the current tokenizer (BON/text/EOS/BOA).
+    max_text_loss_tokens: int = 24
     attention_backend: str = "sdpa"
     fuse_qkv: bool = True
 

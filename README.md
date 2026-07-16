@@ -291,7 +291,7 @@ ground-truth event, preserving the observation-description convention):
 
 ```bash
 snvla-augment-narrations ~/datasets/t1_n3 ~/datasets/t1_n3_aug \
-  --dst-repo-id local/t1_n3_aug --window-size 10 --forward-only
+  --dst-repo-id local/t1_n3_aug --window-size 20 --forward-only
 ```
 
 Simulation tests are marked `sim`:
