@@ -482,3 +482,18 @@ W&B run
 [`p5e2-molmoact2-success500-w20-b8-e1-r1`](https://wandb.ai/0xnoy-tamagawa-university/snvla-p5/runs/p5e2-molmoact2-success500-w20-b8-e1-r1)
 has artifacts disabled. `agy` monitoring confirmed healthy progress through step 120, step-100
 loss `42.634`, GPU memory about `25.4/24.6 GB`, and no strict-load warning or runtime failure.
+
+Two production-only issues were corrected without discarding learned state. First, distributed
+component metrics and augmentation fractions were made W&B-safe and globally reduced
+(`6858327`). Second, PID-level GPU inspection found rank 1 retaining approximately 11.4 GB on
+rank 0 because both workers initially loaded onto plain `cuda`; rank-local preconstruction device
+selection removed that duplication (`5cc82f8`).
+
+SIGUSR1 created complete checkpoints at steps 231 and 300, proving live save semantics. The active
+run restored model, optimizer, scheduler, RNG, sampler position, and the same W&B run from step
+300. At step 350 each A100 held only its own approximately 24.7 GB worker allocation, leaving
+approximately 16.3 GB headroom. Metrics were finite and included action-flow `0.0761`, narration
+CE `0.0615`, dropout fraction `0.2437`, noise fraction `0.3063`, and selected noise scale `0.0111`.
+The current resume log contains no forbidden load warning, W&B ignored-value warning, OOM,
+NaN/Inf, NCCL error, or traceback. Final local verification is `285 passed, 16 deselected`, with
+Ruff passing.
