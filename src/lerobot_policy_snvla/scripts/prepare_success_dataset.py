@@ -24,6 +24,7 @@ from lerobot.utils.utils import flatten_dict
 from lerobot_policy_snvla.sim.completion import (
     COMPLETION_TIMING_POLICY,
     COMPLETION_TIMING_POLICY_PATH,
+    LEGACY_COMPLETION_TIMING_POLICY,
     write_completion_timing_policy,
 )
 
@@ -58,9 +59,9 @@ def _read_completion_timing_policy(root: Path) -> dict[str, Any] | None:
 
 
 def _validate_completion_timing_policy(policy: Any) -> None:
-    if policy != COMPLETION_TIMING_POLICY:
+    if policy not in (LEGACY_COMPLETION_TIMING_POLICY, COMPLETION_TIMING_POLICY):
         raise ValueError(
-            "completion timing policy is invalid; expected the exact production completion contract"
+            "completion timing policy is invalid; expected a supported production completion contract"
         )
 
 

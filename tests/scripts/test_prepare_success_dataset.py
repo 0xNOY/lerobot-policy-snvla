@@ -32,6 +32,7 @@ from lerobot_policy_snvla.scripts.trim_success_dataset import trim_success_datas
 from lerobot_policy_snvla.sim.completion import (
     CANONICAL_HOME_EEF_POSITION_M,
     COMPLETION_TIMING_POLICY,
+    LEGACY_COMPLETION_TIMING_POLICY,
     write_completion_timing_policy,
 )
 
@@ -119,6 +120,15 @@ def test_validator_can_infer_mixed_episode_task_count(tmp_path):
     _source(source, "local/source", [1], blocks=2)
 
     validate_success_dataset(source, expected_episodes=1, blocks=0, require_manifest=False)
+
+
+def test_validator_accepts_legacy_completion_policy_sidecar(tmp_path):
+    source = tmp_path / "source"
+    _production_source(source, "local/source")
+    policy_path = source / "meta/completion_timing_policy.json"
+    policy_path.write_text(json.dumps(LEGACY_COMPLETION_TIMING_POLICY))
+
+    validate_success_dataset(source, expected_episodes=1, require_manifest=False)
 
 
 def _production_source(
