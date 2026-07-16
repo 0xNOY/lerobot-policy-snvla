@@ -76,6 +76,19 @@ class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
         self._previous_narrations: list[str] = []
         self._snvla_text_processor: Any | None = None
 
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, **kwargs):
+        """Fail closed when restoring a LeRobot-format SNVLA checkpoint."""
+
+        kwargs.pop("strict", None)
+        policy = super(MolmoAct2Policy, cls).from_pretrained(
+            pretrained_name_or_path,
+            strict=True,
+            **kwargs,
+        )
+        print("All keys loaded successfully!", flush=True)
+        return policy
+
     def reset(self) -> None:
         super().reset()
         self.latest_metrics = {}

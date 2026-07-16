@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies import factory as policy_factory
+from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 from lerobot_policy_snvla.configuration_molmoact2_snvla import MolmoAct2SNVLAConfig
@@ -40,6 +41,31 @@ def test_molmoact2_snvla_registers_as_third_party_policy():
 
     assert isinstance(config, MolmoAct2SNVLAConfig)
     assert policy_factory.get_policy_class("snvla_molmoact2") is MolmoAct2SNVLAPolicy
+
+
+def test_molmoact2_snvla_checkpoint_restore_is_always_strict(monkeypatch, capsys):
+    sentinel = object()
+    observed = {}
+
+    def fake_from_pretrained(cls, path, **kwargs):
+        observed.update(cls=cls, path=path, kwargs=kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        PreTrainedPolicy,
+        "from_pretrained",
+        classmethod(fake_from_pretrained),
+    )
+
+    loaded = MolmoAct2SNVLAPolicy.from_pretrained("/tmp/checkpoint", strict=False)
+
+    assert loaded is sentinel
+    assert observed == {
+        "cls": MolmoAct2SNVLAPolicy,
+        "path": "/tmp/checkpoint",
+        "kwargs": {"strict": True},
+    }
+    assert "All keys loaded successfully!" in capsys.readouterr().out
 
 
 def test_molmoact2_snvla_defaults_avoid_discrete_action_tokens():
