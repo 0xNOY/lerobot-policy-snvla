@@ -214,6 +214,28 @@ def copy_dataset(src: LeRobotDataset, dst_path: Path, dst_repo_id: str | None = 
     return LeRobotDataset(repo_id=dst_repo_id, root=dst_path)
 
 
+def record_augmentation_policy(
+    root: Path,
+    *,
+    window_size: int,
+    forward_only: bool,
+) -> None:
+    """Persist the exact narration-window transform in the portable manifest."""
+
+    manifest_path = root / "meta/success_dataset_manifest.json"
+    if not manifest_path.is_file():
+        return
+    manifest = json.loads(manifest_path.read_text())
+    manifest["narration_augmentation_policy"] = {
+        "version": 1,
+        "window_size": window_size,
+        "direction": "forward-only" if forward_only else "bidirectional",
+        "neighbor_conflict_policy": "midpoint-clipped",
+        "applied_once": True,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -252,6 +274,11 @@ def main():
         collect_updates(narration_frames, all_updates)
 
     apply_updates_to_dataset(dst, all_updates)
+    record_augmentation_policy(
+        dst.root,
+        window_size=args.window_size,
+        forward_only=args.forward_only,
+    )
 
     print("Done")
 

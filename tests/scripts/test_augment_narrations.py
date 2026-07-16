@@ -1,6 +1,9 @@
+import json
+
 from lerobot_policy_snvla.scripts.augment_narrations import (
     DEFAULT_NARRATION_WINDOW_SIZE,
     compute_window,
+    record_augmentation_policy,
 )
 
 
@@ -46,3 +49,16 @@ def test_forward_only_adjacent_centers_do_not_overlap():
     b = compute_window(102, 0, 1000, 10, 100, None, forward_only=True)
     assert set(a).isdisjoint(set(b))
     assert min(b) == 102
+
+
+def test_record_augmentation_policy_updates_portable_manifest(tmp_path):
+    manifest_path = tmp_path / "meta/success_dataset_manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps({"repo_id": "local/test"}))
+
+    record_augmentation_policy(tmp_path, window_size=20, forward_only=True)
+
+    policy = json.loads(manifest_path.read_text())["narration_augmentation_policy"]
+    assert policy["window_size"] == 20
+    assert policy["direction"] == "forward-only"
+    assert policy["applied_once"] is True
