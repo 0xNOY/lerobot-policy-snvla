@@ -657,7 +657,7 @@ def configure_automatic_lr_scheduler(cfg: TrainPipelineConfig) -> SchedulerMetri
     schedule fitting identical for PI05 SNVLA, MolmoAct2 SNVLA, and future
     backbones while leaving optimizer parameter groups owned by each policy.
     """
-    policy = cfg.policy
+    policy = getattr(cfg, "policy", None)
     if not bool(getattr(policy, "scheduler_auto_steps_enabled", False)):
         return None
     if not cfg.use_policy_training_preset:
@@ -923,6 +923,36 @@ class NativeBF16FSDPAccelerator(Accelerator):
             yield
 
 
+def configure_rank_local_policy_device(
+    cfg: TrainPipelineConfig,
+    accelerator: Accelerator,
+) -> None:
+    """Load each distributed policy directly onto its rank-local CUDA device.
+
+    LeRobot constructs the policy before ``accelerator.prepare``. With a plain
+    ``device=cuda`` config, every process first materializes the full checkpoint
+    on CUDA device 0; nonzero ranks then move it to their own device but leave a
+    large CUDA allocator reservation behind on rank 0. Resolve the local device
+    before policy construction to avoid that duplicate allocation.
+    """
+
+    policy = getattr(cfg, "policy", None)
+    device = getattr(accelerator, "device", None)
+    if (
+        policy is None
+        or not isinstance(device, torch.device)
+        or device.type != "cuda"
+        or int(getattr(accelerator, "num_processes", 1)) <= 1
+    ):
+        return
+    policy.device = str(device)
+    logging.info(
+        "Rank-local policy device: process_index=%s device=%s",
+        getattr(accelerator, "process_index", 0),
+        policy.device,
+    )
+
+
 def main(accelerator: Accelerator | None = None) -> None:
     require_wandb_cli_args(sys.argv)
     duration = parse_training_duration(sys.argv[1:])
@@ -938,6 +968,7 @@ def main(accelerator: Accelerator | None = None) -> None:
                 mixed_precision="no",
                 kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
             )
+        configure_rank_local_policy_device(cfg, accelerator)
         if duration.epochs is not None and cfg.job.is_remote:
             raise ValueError(
                 "Float epochs are unsupported for remote jobs because the staged lerobot-train "

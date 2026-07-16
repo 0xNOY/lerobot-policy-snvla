@@ -1021,3 +1021,33 @@ def test_require_wandb_leaves_debug_runs_unchanged_when_env_is_unset(monkeypatch
     monkeypatch.delenv("SNVLA_REQUIRE_WANDB", raising=False)
 
     require_wandb_cli_args(["train"])
+
+
+def test_distributed_policy_loads_directly_on_rank_local_cuda_device():
+    cfg = SimpleNamespace(policy=SimpleNamespace(device="cuda"))
+    accelerator = SimpleNamespace(
+        device=torch.device("cuda", 1),
+        num_processes=2,
+        process_index=1,
+    )
+
+    train_bf16_fsdp.configure_rank_local_policy_device(cfg, accelerator)
+
+    assert cfg.policy.device == "cuda:1"
+
+
+@pytest.mark.parametrize(
+    "device,num_processes",
+    [(torch.device("cpu"), 2), (torch.device("cuda", 0), 1)],
+)
+def test_rank_local_device_override_is_distributed_cuda_only(device, num_processes):
+    cfg = SimpleNamespace(policy=SimpleNamespace(device="cuda"))
+    accelerator = SimpleNamespace(
+        device=device,
+        num_processes=num_processes,
+        process_index=0,
+    )
+
+    train_bf16_fsdp.configure_rank_local_policy_device(cfg, accelerator)
+
+    assert cfg.policy.device == "cuda"
