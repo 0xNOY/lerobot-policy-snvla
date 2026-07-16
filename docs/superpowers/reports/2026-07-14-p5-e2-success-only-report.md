@@ -455,3 +455,30 @@ state-dropout/noise fractions are zero. A detached `p5e2-agy-monitor` session co
 5. Record duration, W&B run, checkpoint paths, success, picked/placed, approach distance, false
    pick/place/task-completed counters, and the adoption decision. Run final non-sim tests/Ruff and
    commit reports only.
+
+## MolmoAct2 migration result (2026-07-17)
+
+The pi05 production process was stopped cleanly after the user ended further pi05 evaluation. Its
+latest complete checkpoint remains step `89888`. A common-interface MolmoAct2 SNVLA backend was
+implemented from generic `allenai/MolmoAct2` with continuous actions, EOS/non-EOS mode selection,
+VLM LoRA, full Action Expert fine-tuning, state dropout, observation noise, automatic LR fitting,
+signal checkpointing, and strict saved-checkpoint restores.
+
+Batch selection was measured on both allowed DGX A100s rather than copied from the prior run. The
+seven-case result selected microbatch 8 per rank: `4.5188 examples/s` with `15.36 GB` headroom at
+the benchmark's global-batch-32 accumulation layout. Since production has no gradient accumulation,
+`--batch_size=8` gives global batch 16 and remains the adopted value. All 14 case/rank base loads
+were strict; every case had finite loss/gradients and no forbidden warning, OOM, or traceback.
+
+The production-equivalent two-step preflight passed, saved complete model/optimizer/scheduler/RNG
+state, and passed a strict restore. Local verification after the implementation fixes is
+`280 passed, 16 deselected`; Ruff passed.
+
+One-epoch production training is active at
+`/raid/takenaka/snvla/checkpoints/snvla_molmoact2_t1_curriculum_v11_prod_b8_e1`, using the 450
+training episodes from the validated Window-20 curriculum, batch 8 per rank/global 16, state
+dropout 0.25, noise ratio 0.25 at scale `0.0..0.025`, and checkpoints every 5718 of 22872 steps.
+W&B run
+[`p5e2-molmoact2-success500-w20-b8-e1-r1`](https://wandb.ai/0xnoy-tamagawa-university/snvla-p5/runs/p5e2-molmoact2-success500-w20-b8-e1-r1)
+has artifacts disabled. `agy` monitoring confirmed healthy progress through step 120, step-100
+loss `42.634`, GPU memory about `25.4/24.6 GB`, and no strict-load warning or runtime failure.
