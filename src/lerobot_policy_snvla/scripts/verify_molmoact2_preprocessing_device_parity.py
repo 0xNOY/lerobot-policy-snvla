@@ -181,7 +181,9 @@ def main(argv: list[str] | None = None) -> int:
     dist.barrier()
     passed = torch.tensor(int(result["passed"]), device=device)
     dist.all_reduce(passed, op=dist.ReduceOp.MIN)
-    return 0 if bool(passed.item()) else 1
+    exit_code = 0 if bool(passed.item()) else 1
+    dist.destroy_process_group()
+    return exit_code
 
 
 if __name__ == "__main__":
