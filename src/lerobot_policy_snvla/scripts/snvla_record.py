@@ -177,6 +177,8 @@ class SNVLADatasetRecordConfig(DatasetRecordConfig):
     rename_map: dict[str, str] = field(default_factory=dict)
     # Narrations inserted into the dataset. Press "n" during recording to advance.
     narrations: list[str] | None = None
+    # Insert the first narration into the first recorded frame of every episode.
+    auto_insert_first_narration: bool = True
 
 
 class NarrationManager:
@@ -201,6 +203,9 @@ class NarrationManager:
         if self._next_narration_index >= len(self._narrations):
             return None
         return self._narrations[self._next_narration_index]
+
+    def is_at_episode_start(self) -> bool:
+        return self.is_enabled() and self._next_narration_index == 0
 
     def reset(self) -> None:
         self._next_narration_index = 0
@@ -364,6 +369,7 @@ def record_loop(
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
     narration_manager: NarrationManager | None = None,
+    auto_insert_first_narration: bool = True,
 ):
     if narration_manager is None:
         narration_manager = NarrationManager(narrations=None)
@@ -460,15 +466,19 @@ def record_loop(
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
-        narration_occurred = events.get("narration_occurred", False)
+        narration_requested = events.get("narration_occurred", False)
+        narration_inserted = False
         current_narration = ""
         previous_narrations_json_str = json.dumps([])
         next_narration = None
         if narration_manager.is_enabled():
-            if narration_occurred:
+            if narration_requested or (
+                auto_insert_first_narration and narration_manager.is_at_episode_start()
+            ):
                 events["narration_occurred"] = False
                 current_narration, previous_narrations_json_str = narration_manager.pop()
                 next_narration = narration_manager.get_next_narration()
+                narration_inserted = True
                 logging.info("Inserted narration: %s", current_narration)
                 log_say(current_narration)
             else:
@@ -492,7 +502,7 @@ def record_loop(
                 action=action_values,
                 compress_images=display_compressed_images,
             )
-            if narration_occurred or (timestamp == 0 and narration_manager.is_enabled()):
+            if narration_inserted or (timestamp == 0 and narration_manager.is_enabled()):
                 log_visualization_narrations(
                     display_mode,
                     current_narration=current_narration,
@@ -650,6 +660,7 @@ def record(
                     display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
                     narration_manager=narration_manager,
+                    auto_insert_first_narration=cfg.dataset.auto_insert_first_narration,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment

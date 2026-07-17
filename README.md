@@ -182,7 +182,9 @@ snvla-record \
   --dataset.narrations='["approach the scoop", "scoop beans", "move to the bowl", "pour beans"]'
 ```
 
-During recording, press `n` to insert the next narration into the current frame.
+At the start of each episode, the first narration is inserted into the first recorded frame
+automatically. During recording, press `n` to insert each subsequent narration into the current frame.
+Set `--dataset.auto_insert_first_narration=false` to require pressing `n` for the first narration too.
 The command writes `current_narration` and `previous_narrations` columns directly
 into the LeRobot dataset, so the resulting dataset can be consumed by
 `lerobot-train --policy.type=snvla` without the original SN-VLA LeRobot fork. Press `t` to change the
