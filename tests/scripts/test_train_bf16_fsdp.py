@@ -13,6 +13,7 @@ from lerobot.utils.logging_utils import MetricsTracker
 from torch.utils.data import Dataset
 
 from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
+from lerobot_policy_snvla.configuration_molmoact2_snvla import MolmoAct2SNVLAConfig
 from lerobot_policy_snvla.configuration_snvla import SNVLAConfig
 from lerobot_policy_snvla.constants import (
     CURRENT_NARRATION,
@@ -31,9 +32,11 @@ from lerobot_policy_snvla.scripts.train_bf16_fsdp import (
     configure_epoch_duration,
     epoch_aware_cycle,
     epochs_to_steps,
+    parse_ddp_options,
     parse_training_duration,
     record_output_metrics,
     require_wandb_cli_args,
+    resolve_ddp_find_unused_parameters,
 )
 
 
@@ -73,6 +76,39 @@ def make_processor_config(**kwargs) -> SNVLAConfig:
 
 def test_epochs_to_steps_uses_distributed_batches():
     assert epochs_to_steps(2.5, num_frames=101, batch_size=8, world_size=2) == 18
+
+
+@pytest.mark.parametrize(
+    "argv,expected,remaining",
+    [
+        (["--batch_size=8"], None, ["--batch_size=8"]),
+        (["--ddp-find-unused-parameters=false", "--batch_size=8"], False, ["--batch_size=8"]),
+        (["--ddp-find-unused-parameters", "true"], True, []),
+    ],
+)
+def test_parse_ddp_options(argv, expected, remaining):
+    options = parse_ddp_options(argv)
+
+    assert options.find_unused_parameters is expected
+    assert options.remaining_argv == remaining
+
+
+@pytest.mark.parametrize("value", ["yes", "False", "1", ""])
+def test_parse_ddp_options_rejects_non_strict_booleans(value):
+    with pytest.raises(ValueError, match="must be true or false"):
+        parse_ddp_options([f"--ddp-find-unused-parameters={value}"])
+
+
+def test_ddp_unused_parameter_default_is_narrowly_disabled_for_generic_molmoact2():
+    generic = object.__new__(MolmoAct2SNVLAConfig)
+    generic.checkpoint_path = "allenai/MolmoAct2"
+    alternate = object.__new__(MolmoAct2SNVLAConfig)
+    alternate.checkpoint_path = "allenai/MolmoAct2-Think"
+
+    assert resolve_ddp_find_unused_parameters(SimpleNamespace(policy=generic), None) is False
+    assert resolve_ddp_find_unused_parameters(SimpleNamespace(policy=alternate), None) is True
+    assert resolve_ddp_find_unused_parameters(SimpleNamespace(policy=object()), None) is True
+    assert resolve_ddp_find_unused_parameters(SimpleNamespace(policy=generic), True) is True
 
 
 class ReiterableBatches:
@@ -147,9 +183,7 @@ def test_epoch_aware_cycle_aligns_actual_dataloader_shard_absolute_epoch():
         make_processor_config(state_dropout_enabled=False, observation_noise_enabled=True),
     ],
 )
-def test_step_based_snvla_augmentation_annotates_epochs_without_changing_duration(
-    policy, monkeypatch
-):
+def test_step_based_snvla_augmentation_annotates_epochs_without_changing_duration(policy, monkeypatch):
     cfg = SimpleNamespace(
         policy=policy,
         batch_size=2,
@@ -538,13 +572,9 @@ def test_processor_factory_keeps_existing_snvla_pretrained_path_and_injects_over
 
     def fake_factory(inner_cfg, *args, **kwargs):
         seen.update(policy_cfg=inner_cfg, args=args, kwargs=kwargs)
-        step_config = kwargs["preprocessor_overrides"][train_bf16_fsdp._SNVLA_TOKENIZER_STEP][
-            "config"
-        ]
+        step_config = kwargs["preprocessor_overrides"][train_bf16_fsdp._SNVLA_TOKENIZER_STEP]["config"]
         return (
-            SimpleNamespace(
-                steps=[SNVLAPrepareTrainingTokenizerProcessorStep(config=step_config)]
-            ),
+            SimpleNamespace(steps=[SNVLAPrepareTrainingTokenizerProcessorStep(config=step_config)]),
             object(),
         )
 
@@ -562,9 +592,7 @@ def test_processor_factory_keeps_existing_snvla_pretrained_path_and_injects_over
     assert seen["kwargs"]["pretrained_path"].endswith("pretrained_model")
     assert seen["kwargs"]["dataset_stats"] is dataset_stats
     assert (
-        seen["kwargs"]["preprocessor_overrides"][train_bf16_fsdp._SNVLA_TOKENIZER_STEP][
-            "config"
-        ]
+        seen["kwargs"]["preprocessor_overrides"][train_bf16_fsdp._SNVLA_TOKENIZER_STEP]["config"]
         is policy_cfg
     )
 

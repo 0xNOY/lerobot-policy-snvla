@@ -207,12 +207,8 @@ def update_policy(*args, **kwargs):
         output_dict.update(
             {
                 "lr_scheduler_auto_adjusted": torch.tensor(1.0),
-                "lr_scheduler_warmup_steps": torch.tensor(
-                    _active_scheduler_metrics.warmup_steps
-                ),
-                "lr_scheduler_decay_steps": torch.tensor(
-                    _active_scheduler_metrics.decay_steps
-                ),
+                "lr_scheduler_warmup_steps": torch.tensor(_active_scheduler_metrics.warmup_steps),
+                "lr_scheduler_decay_steps": torch.tensor(_active_scheduler_metrics.decay_steps),
                 "lr_scheduler_peak_lr": torch.tensor(_active_scheduler_metrics.peak_lr),
                 "lr_scheduler_final_lr": torch.tensor(_active_scheduler_metrics.final_lr),
             }
@@ -282,6 +278,63 @@ class SignalCheckpointOptions:
     remaining_argv: list[str]
 
 
+@dataclass(frozen=True)
+class DDPOptions:
+    """Entrypoint-only DDP traversal options removed before Draccus parsing."""
+
+    find_unused_parameters: bool | None
+    remaining_argv: list[str]
+
+
+def parse_ddp_options(argv: Sequence[str]) -> DDPOptions:
+    """Parse an optional strict boolean DDP unused-parameter override."""
+    option = "--ddp-find-unused-parameters"
+    value: bool | None = None
+    seen = False
+    remaining: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == option:
+            if seen:
+                raise ValueError(f"Duplicate {option} is not allowed")
+            raw = argv[index + 1] if index + 1 < len(argv) else None
+            consumed = 2
+        elif argument.startswith(f"{option}="):
+            if seen:
+                raise ValueError(f"Duplicate {option} is not allowed")
+            raw = argument.split("=", 1)[1]
+            consumed = 1
+        else:
+            remaining.append(argument)
+            index += 1
+            continue
+        if raw not in {"true", "false"}:
+            raise ValueError(f"{option} must be true or false")
+        value = raw == "true"
+        seen = True
+        index += consumed
+    return DDPOptions(value, remaining)
+
+
+def resolve_ddp_find_unused_parameters(
+    cfg: TrainPipelineConfig,
+    override: bool | None,
+) -> bool:
+    """Use the fast DDP traversal only for the proven generic MolmoAct2 graph."""
+    if override is not None:
+        return override
+    policy = cfg.policy
+    if not isinstance(policy, MolmoAct2SNVLAConfig):
+        return True
+    # The generic checkpoint has no action-expert depth gate. Its continuous
+    # full-view flow always traverses every trainable VLM LoRA and full action
+    # expert parameter; state dropout/noise only add or alter inputs. Keep the
+    # conservative legacy behavior for other checkpoints whose optional modules
+    # may not participate in SNVLA's custom joint flow path.
+    return policy.checkpoint_path != "allenai/MolmoAct2"
+
+
 def parse_signal_checkpoint_options(argv: Sequence[str]) -> SignalCheckpointOptions:
     """Parse opt-in checkpoint signaling without intercepting termination signals."""
 
@@ -342,7 +395,9 @@ def parse_signal_checkpoint_options(argv: Sequence[str]) -> SignalCheckpointOpti
 class SignalCheckpointController:
     """Turn a process-local Unix signal into an all-rank safe-step save request."""
 
-    def __init__(self, cfg: TrainPipelineConfig, accelerator: Accelerator, signum: int, pid_file: Path | None):
+    def __init__(
+        self, cfg: TrainPipelineConfig, accelerator: Accelerator, signum: int, pid_file: Path | None
+    ):
         if not cfg.save_checkpoint:
             raise ValueError("--checkpoint-on-signal requires --save_checkpoint=true")
         if cfg.save_freq <= 0:
@@ -595,15 +650,10 @@ def _assert_current_molmoact2_snvla_processor_config(
     preprocessor,
     policy_cfg: MolmoAct2SNVLAConfig,
 ) -> None:
-    steps = [
-        step
-        for step in preprocessor.steps
-        if isinstance(step, MolmoAct2SNVLAPackInputsProcessorStep)
-    ]
+    steps = [step for step in preprocessor.steps if isinstance(step, MolmoAct2SNVLAPackInputsProcessorStep)]
     if len(steps) != 1:
         raise AssertionError(
-            "MolmoAct2 SNVLA preprocessor must contain exactly one packing step; "
-            f"found {len(steps)}"
+            f"MolmoAct2 SNVLA preprocessor must contain exactly one packing step; found {len(steps)}"
         )
     step = steps[0]
     fields = (
@@ -619,9 +669,7 @@ def _assert_current_molmoact2_snvla_processor_config(
         "observation_noise_scale_max",
         "observation_noise_standard_normal_clip",
     )
-    mismatches = [
-        field for field in fields if getattr(step, field) != getattr(policy_cfg, field)
-    ]
+    mismatches = [field for field in fields if getattr(step, field) != getattr(policy_cfg, field)]
     if mismatches:
         raise AssertionError(
             "MolmoAct2 SNVLA processor config does not match the active policy config: "
@@ -661,9 +709,7 @@ def configure_automatic_lr_scheduler(cfg: TrainPipelineConfig) -> SchedulerMetri
     if not bool(getattr(policy, "scheduler_auto_steps_enabled", False)):
         return None
     if not cfg.use_policy_training_preset:
-        raise ValueError(
-            "scheduler_auto_steps_enabled requires --use_policy_training_preset=true"
-        )
+        raise ValueError("scheduler_auto_steps_enabled requires --use_policy_training_preset=true")
     if cfg.scheduler is None:
         raise ValueError("Automatic LR scheduling requires a resolved scheduler preset")
 
@@ -686,9 +732,7 @@ def configure_automatic_lr_scheduler(cfg: TrainPipelineConfig) -> SchedulerMetri
         )
     if cfg.resume:
         fields = ("num_warmup_steps", "num_decay_steps", "peak_lr", "decay_lr")
-        mismatches = [
-            name for name in fields if getattr(cfg.scheduler, name) != getattr(resolved, name)
-        ]
+        mismatches = [name for name in fields if getattr(cfg.scheduler, name) != getattr(resolved, name)]
         if mismatches:
             raise ValueError(
                 "Automatic LR scheduler cannot change across resume; start a fresh run or "
@@ -709,8 +753,7 @@ def configure_automatic_lr_scheduler(cfg: TrainPipelineConfig) -> SchedulerMetri
         final_lr=resolved.decay_lr,
     )
     logging.info(
-        "Automatic LR schedule: total_steps=%s, warmup_steps=%s, decay_steps=%s, "
-        "peak_lr=%s, final_lr=%s",
+        "Automatic LR schedule: total_steps=%s, warmup_steps=%s, decay_steps=%s, peak_lr=%s, final_lr=%s",
         cfg.steps,
         resolved.num_warmup_steps,
         resolved.num_decay_steps,
@@ -820,12 +863,9 @@ def _epoch_training_patches(
                 initial_step=initial_step,
             )
             _log_epoch_duration(duration, inner_cfg, steps_per_epoch, initial_step)
-        elif (
-            steps_per_epoch is None
-            and (
-                bool(getattr(inner_cfg.policy, "state_dropout_enabled", False))
-                or bool(getattr(inner_cfg.policy, "observation_noise_enabled", False))
-            )
+        elif steps_per_epoch is None and (
+            bool(getattr(inner_cfg.policy, "state_dropout_enabled", False))
+            or bool(getattr(inner_cfg.policy, "observation_noise_enabled", False))
         ):
             steps_per_epoch = epochs_to_steps(
                 1.0,
@@ -835,8 +875,7 @@ def _epoch_training_patches(
             )
             initial_step = _read_resume_step(inner_cfg.checkpoint_path) if inner_cfg.resume else 0
             logging.info(
-                "Step-based SNVLA augmentation epoch annotation: "
-                "steps_per_epoch=%s, initial_step=%s",
+                "Step-based SNVLA augmentation epoch annotation: steps_per_epoch=%s, initial_step=%s",
                 steps_per_epoch,
                 initial_step,
             )
@@ -883,9 +922,7 @@ def _epoch_training_patches(
                 args = (None, *args[1:])
             else:
                 kwargs["pretrained_path"] = None
-            preprocessor, postprocessor = original_make_processors(
-                policy_cfg, *args, **kwargs
-            )
+            preprocessor, postprocessor = original_make_processors(policy_cfg, *args, **kwargs)
             _assert_current_snvla_processor_config(preprocessor, policy_cfg)
             return preprocessor, postprocessor
 
@@ -957,16 +994,32 @@ def main(accelerator: Accelerator | None = None) -> None:
     require_wandb_cli_args(sys.argv)
     duration = parse_training_duration(sys.argv[1:])
     signal_options = parse_signal_checkpoint_options(duration.remaining_argv)
+    ddp_options = parse_ddp_options(signal_options.remaining_argv)
     original_argv = sys.argv[:]
     try:
-        sys.argv[1:] = signal_options.remaining_argv
+        sys.argv[1:] = ddp_options.remaining_argv
         lerobot_train.register_third_party_plugins()
         cfg = _parse_train_config()
         if accelerator is None:
+            find_unused_parameters = resolve_ddp_find_unused_parameters(
+                cfg,
+                ddp_options.find_unused_parameters,
+            )
+            logging.info(
+                "DDP find_unused_parameters=%s%s",
+                find_unused_parameters,
+                " (explicit override)"
+                if ddp_options.find_unused_parameters is not None
+                else " (policy-safe default)",
+            )
             accelerator = NativeBF16FSDPAccelerator(
                 step_scheduler_with_optimizer=False,
                 mixed_precision="no",
-                kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+                kwargs_handlers=[
+                    DistributedDataParallelKwargs(
+                        find_unused_parameters=find_unused_parameters,
+                    )
+                ],
             )
         configure_rank_local_policy_device(cfg, accelerator)
         if duration.epochs is not None and cfg.job.is_remote:

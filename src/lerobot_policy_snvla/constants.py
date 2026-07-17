@@ -7,6 +7,7 @@ CURRENT_NARRATION = "current_narration"
 PREVIOUS_NARRATIONS = "previous_narrations"
 
 STATE_DROPOUT_MASK = "state_dropout_mask"
+STATE_HIDDEN_ROW_INDICES = "state_hidden_row_indices"
 OBSERVATION_NOISE_MASK = "observation_noise_mask"
 OBSERVATION_NOISE_SCALE = "observation_noise_scale"
 TRAINING_EPOCH = "training_epoch"

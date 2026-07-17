@@ -30,6 +30,7 @@ from .constants import (
     SNVLA_NARRATION_LABELS,
     SNVLA_STATE_HIDDEN_PREFIX,
     STATE_DROPOUT_MASK,
+    STATE_HIDDEN_ROW_INDICES,
     TRAINING_EPOCH,
 )
 from .processor_snvla import _apply_observation_noise, parse_previous_narrations
@@ -43,9 +44,7 @@ def _single_epoch(complementary: dict[str, Any], batch_size: int) -> tuple[torch
     frame_ids = torch.as_tensor(frame_ids).reshape(batch_size)
     epochs = complementary.get(TRAINING_EPOCH)
     if epochs is None:
-        raise ValueError(
-            f"'{TRAINING_EPOCH}' not found in complementary data for SNVLA augmentation."
-        )
+        raise ValueError(f"'{TRAINING_EPOCH}' not found in complementary data for SNVLA augmentation.")
     epochs = torch.as_tensor(epochs).reshape(-1)
     if (
         epochs.numel() == 0
@@ -70,9 +69,77 @@ def _add_progress_to_task(task: str, previous_narrations: Any) -> str:
     return f"{task}. Progress so far: {history}"
 
 
+def validate_packed_sequence_length(
+    actual_length: int,
+    *,
+    max_sequence_length: int,
+    training_compile_padding_length: int | None,
+) -> None:
+    """Fail closed instead of truncating a compiled full-view prompt."""
+    if (
+        training_compile_padding_length is not None
+        and actual_length > training_compile_padding_length
+    ):
+        raise ValueError(
+            f"MolmoAct2 SNVLA sequence length {actual_length} exceeds compiled training "
+            f"padding length={training_compile_padding_length}; truncation is disabled."
+        )
+    if (
+        training_compile_padding_length is not None
+        and actual_length < training_compile_padding_length
+    ):
+        raise ValueError(
+            f"MolmoAct2 SNVLA processor returned sequence length {actual_length}; compiled "
+            f"training requires fixed padding length={training_compile_padding_length}."
+        )
+    if actual_length > max_sequence_length:
+        raise ValueError(
+            f"MolmoAct2 SNVLA sequence length {actual_length} exceeds "
+            f"max_sequence_length={max_sequence_length}."
+        )
+
+
+def process_with_exact_final_padding(
+    processor: Any,
+    processor_kwargs: dict[str, Any],
+    target_length: int,
+) -> dict[str, Any]:
+    """Pad to an exact final tensor length across processor token offsets.
+
+    MolmoAct2's processor currently appends one special token after applying
+    tokenizer ``max_length``. Try ``target-1`` first, then retry ``target`` only
+    when the processor demonstrably has no offset. Neither call truncates.
+    """
+    first_request = max(1, target_length - 1)
+    first_kwargs = {
+        **processor_kwargs,
+        "max_length": first_request,
+        "truncation": False,
+    }
+    inputs = dict(processor(**first_kwargs))
+    actual_length = int(inputs["input_ids"].shape[1])
+    if actual_length == target_length or first_request == target_length:
+        return inputs
+    if actual_length != first_request:
+        # A prompt longer than the requested budget remains longer because
+        # truncation is disabled; preserve it for the fail-closed validator.
+        return inputs
+
+    retry_kwargs = {
+        **processor_kwargs,
+        "max_length": target_length,
+        "truncation": False,
+    }
+    return dict(processor(**retry_kwargs))
+
+
 def _select_rows(value: Any, indices: torch.Tensor, batch_size: int) -> Any:
     if torch.is_tensor(value):
-        return value.index_select(0, indices.to(value.device)) if value.ndim and value.shape[0] == batch_size else value
+        return (
+            value.index_select(0, indices.to(value.device))
+            if value.ndim and value.shape[0] == batch_size
+            else value
+        )
     if isinstance(value, np.ndarray):
         return value[indices.cpu().numpy()] if value.ndim and value.shape[0] == batch_size else value
     if isinstance(value, list) and len(value) == batch_size:
@@ -98,6 +165,7 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
     observation_noise_scale_min: float = 0.0
     observation_noise_scale_max: float = 0.025
     observation_noise_standard_normal_clip: float = 2.0
+    training_compile_padding_length: int | None = None
 
     def __post_init__(self) -> None:
         if self.action_mode != "continuous":
@@ -120,18 +188,15 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
                 "observation_noise_scale_min": self.observation_noise_scale_min,
                 "observation_noise_scale_max": self.observation_noise_scale_max,
                 "observation_noise_standard_normal_clip": self.observation_noise_standard_normal_clip,
+                "training_compile_padding_length": self.training_compile_padding_length,
             }
         )
         return config
 
-    def _build_narration_labels(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
+    def _build_narration_labels(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         labels = torch.full_like(input_ids, -100)
         for batch_idx in range(input_ids.shape[0]):
-            positions = (input_ids[batch_idx] == self._action_output_id).nonzero(
-                as_tuple=False
-            )
+            positions = (input_ids[batch_idx] == self._action_output_id).nonzero(as_tuple=False)
             if positions.numel() == 0:
                 raise ValueError("MolmoAct2 SNVLA prompt has no <action_output> token.")
             start = int(positions[-1].item()) + 1
@@ -164,10 +229,7 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
         if self.normalize_language:
             tasks = [_normalize_question_text(task) for task in tasks]
         previous = _as_text_list(complementary.get(PREVIOUS_NARRATIONS), batch_size)
-        tasks = [
-            _add_progress_to_task(task, history)
-            for task, history in zip(tasks, previous, strict=True)
-        ]
+        tasks = [_add_progress_to_task(task, history) for task, history in zip(tasks, previous, strict=True)]
         current = _as_text_list(complementary.get(CURRENT_NARRATION), batch_size)
 
         action_padded = None
@@ -178,9 +240,7 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
             action_is_pad = complementary.get("action_is_pad")
             if action_is_pad is None:
                 action_is_pad = complementary.get("action_horizon_is_pad")
-            action_padded, action_horizon_is_pad, action_dim_is_pad = self._pad_action(
-                action, action_is_pad
-            )
+            action_padded, action_horizon_is_pad, action_dim_is_pad = self._pad_action(action, action_is_pad)
             real_action_dim = int(action.shape[-1])
         elif real_action_dim > 0:
             action_dim_is_pad[:, :real_action_dim] = False
@@ -209,11 +269,8 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
                 else prompt
             )
 
-        inputs = dict(
-            self.processor(text=texts, images=flat_images, return_tensors="pt", padding=True)
-        )
-        action_horizon = self.chunk_size if action is None else (
-            1 if action.ndim == 2 else int(action.shape[1])
+        action_horizon = (
+            self.chunk_size if action is None else (1 if action.ndim == 2 else int(action.shape[1]))
         )
         max_sequence_length = self.max_sequence_length or infer_molmoact2_max_sequence_length(
             num_images=max((len(images) for images in images_by_example), default=0),
@@ -222,11 +279,27 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
             action_horizon=action_horizon,
             include_discrete_action=False,
         )
-        if int(inputs["input_ids"].shape[1]) > max_sequence_length:
-            raise ValueError(
-                f"MolmoAct2 SNVLA sequence length {inputs['input_ids'].shape[1]} exceeds "
-                f"max_sequence_length={max_sequence_length}."
+        fixed_padding_length = self.training_compile_padding_length if not hide_state else None
+        processor_kwargs: dict[str, Any] = {
+            "text": texts,
+            "images": flat_images,
+            "return_tensors": "pt",
+            "padding": "max_length" if fixed_padding_length is not None else True,
+        }
+        if fixed_padding_length is not None:
+            inputs = process_with_exact_final_padding(
+                self.processor,
+                processor_kwargs,
+                int(fixed_padding_length),
             )
+        else:
+            inputs = dict(self.processor(**processor_kwargs))
+        actual_length = int(inputs["input_ids"].shape[1])
+        validate_packed_sequence_length(
+            actual_length,
+            max_sequence_length=max_sequence_length,
+            training_compile_padding_length=fixed_padding_length,
+        )
         if include_targets:
             inputs[SNVLA_NARRATION_LABELS] = self._build_narration_labels(
                 inputs["input_ids"], inputs["attention_mask"]
@@ -295,9 +368,9 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
         # dropout rows need an additional state-free narration view.
         if bool(dropout.any()):
             selected = dropout.nonzero(as_tuple=False).flatten()
+            complementary[STATE_HIDDEN_ROW_INDICES] = selected
             hidden_observation = {
-                key: _select_rows(value, selected, batch_size)
-                for key, value in observation.items()
+                key: _select_rows(value, selected, batch_size) for key, value in observation.items()
             }
             hidden_complementary = {
                 key: _select_rows(value, selected, batch_size)
@@ -330,9 +403,7 @@ def make_snvla_molmoact2_pre_post_processors(
     preprocessor, postprocessor = make_molmoact2_pre_post_processors(
         config, dataset_stats=dataset_stats, dataset_meta=dataset_meta
     )
-    original = next(
-        step for step in preprocessor.steps if isinstance(step, MolmoAct2PackInputsProcessorStep)
-    )
+    original = next(step for step in preprocessor.steps if isinstance(step, MolmoAct2PackInputsProcessorStep))
     replacement = MolmoAct2SNVLAPackInputsProcessorStep(
         **original.get_config(),
         state_dropout_enabled=config.state_dropout_enabled,
@@ -346,6 +417,9 @@ def make_snvla_molmoact2_pre_post_processors(
         observation_noise_scale_min=config.observation_noise_scale_min,
         observation_noise_scale_max=config.observation_noise_scale_max,
         observation_noise_standard_normal_clip=config.observation_noise_standard_normal_clip,
+        training_compile_padding_length=(
+            config.effective_training_compile_padding_length if config.compile_model else None
+        ),
     )
     preprocessor.steps[preprocessor.steps.index(original)] = replacement
     return preprocessor, postprocessor

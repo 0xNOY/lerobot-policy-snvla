@@ -1,4 +1,5 @@
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,13 +13,19 @@ from lerobot_policy_snvla.configuration_molmoact2_snvla import MolmoAct2SNVLACon
 from lerobot_policy_snvla.modeling_molmoact2_snvla import (
     MolmoAct2SNVLAPolicy,
     _add_masked_metric,
+    compile_training_flow_kernel,
+    flow_training_batch,
     mask_narration_targets_for_action,
     narration_ce_per_example,
+    prepare_compiled_transformer_rope_caches,
+    run_training_flow_kernel,
 )
 from lerobot_policy_snvla.processor_molmoact2_snvla import (
     MolmoAct2SNVLAPackInputsProcessorStep,
     _add_progress_to_task,
     _narration_answer,
+    process_with_exact_final_padding,
+    validate_packed_sequence_length,
 )
 
 
@@ -80,7 +87,17 @@ def test_molmoact2_snvla_defaults_avoid_discrete_action_tokens():
     assert config.train_action_expert_only is False
     assert config.max_sequence_length == 768
     assert config.state_dropout_start_epoch == 0
+    assert config.state_dropout_share_image_features is True
     assert config.observation_noise_start_epoch == 0
+    assert config.compile_model is False
+    assert config.compile_mode == "default"
+    assert config.compile_cudagraphs is False
+
+
+def test_state_dropout_image_feature_sharing_can_be_disabled():
+    config = dataclasses.replace(make_config(), state_dropout_share_image_features=False)
+
+    assert config.state_dropout_share_image_features is False
 
 
 @pytest.mark.parametrize(
@@ -200,3 +217,301 @@ def test_teacher_forced_narration_is_hidden_from_action_expert():
         result,
         torch.tensor([[True, True, False, False, False]]),
     )
+
+
+def test_compile_kernel_is_noop_by_default():
+    function = lambda value: value  # noqa: E731
+
+    assert compile_training_flow_kernel(function, make_config()) is function
+
+
+def test_compile_kernel_uses_explicit_safe_options(monkeypatch):
+    captured = {}
+
+    def fake_compile(function, **kwargs):
+        captured.update(kwargs)
+        return ("compiled", function)
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    function = lambda value: value  # noqa: E731
+    config = dataclasses.replace(
+        make_config(),
+        compile_model=True,
+        compile_backend="inductor",
+        compile_mode="max-autotune-no-cudagraphs",
+        compile_fullgraph=False,
+        compile_dynamic=False,
+        compile_cudagraphs=True,
+    )
+
+    compiled = compile_training_flow_kernel(function, config)
+
+    assert compiled == ("compiled", function)
+    assert captured == {
+        "backend": "inductor",
+        "fullgraph": False,
+        "dynamic": False,
+        "options": {"triton.cudagraphs": False, "max_autotune": True},
+    }
+
+
+def test_compile_config_rejects_dynamic_cuda_graphs():
+    with pytest.raises(ValueError, match="compile_cudagraphs"):
+        dataclasses.replace(
+            make_config(),
+            compile_model=True,
+            compile_dynamic=True,
+            compile_cudagraphs=True,
+        )
+
+
+def test_training_compile_padding_defaults_to_safety_limit_and_accepts_640():
+    config = make_config()
+    assert config.training_compile_padding_length is None
+    assert config.effective_training_compile_padding_length == 768
+
+    production = dataclasses.replace(config, training_compile_padding_length=640)
+    assert production.max_sequence_length == 768
+    assert production.effective_training_compile_padding_length == 640
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 769])
+def test_training_compile_padding_validation(invalid):
+    with pytest.raises(ValueError, match="training_compile_padding_length"):
+        dataclasses.replace(make_config(), training_compile_padding_length=invalid)
+
+
+def test_compiled_padding_fails_closed_above_640_before_safety_limit():
+    with pytest.raises(ValueError, match="padding length=640; truncation is disabled"):
+        validate_packed_sequence_length(
+            641,
+            max_sequence_length=768,
+            training_compile_padding_length=640,
+        )
+
+
+def test_compiled_padding_requires_exact_fixed_length():
+    with pytest.raises(ValueError, match="requires fixed padding length=640"):
+        validate_packed_sequence_length(
+            639,
+            max_sequence_length=768,
+            training_compile_padding_length=640,
+        )
+
+
+def test_hidden_view_uses_only_safety_limit_without_compile_padding():
+    validate_packed_sequence_length(
+        700,
+        max_sequence_length=768,
+        training_compile_padding_length=None,
+    )
+
+
+@pytest.mark.parametrize("target", [640, 768])
+def test_exact_final_padding_handles_processor_special_token_plus_one(target):
+    requests = []
+
+    def processor(**kwargs):
+        requests.append(kwargs["max_length"])
+        return {"input_ids": torch.zeros(1, kwargs["max_length"] + 1, dtype=torch.long)}
+
+    inputs = process_with_exact_final_padding(
+        processor,
+        {"padding": "max_length"},
+        target,
+    )
+
+    assert inputs["input_ids"].shape[1] == target
+    assert requests == [target - 1]
+
+
+def test_exact_final_padding_retries_processor_without_special_offset():
+    requests = []
+
+    def processor(**kwargs):
+        requests.append(kwargs["max_length"])
+        return {"input_ids": torch.zeros(1, kwargs["max_length"], dtype=torch.long)}
+
+    inputs = process_with_exact_final_padding(
+        processor,
+        {"padding": "max_length"},
+        640,
+    )
+
+    assert inputs["input_ids"].shape[1] == 640
+    assert requests == [639, 640]
+
+
+def test_compiled_flow_batch_excludes_variable_state_dropout_views():
+    batch = {
+        ACTION: torch.zeros(2, 10, 32),
+        "action_dim_is_pad": torch.zeros(2, 32, dtype=torch.bool),
+        "action_horizon_is_pad": torch.zeros(2, 10, dtype=torch.bool),
+        "state_dropout_mask": torch.tensor([True, False]),
+        "snvla_state_hidden.input_ids": torch.zeros(1, 768, dtype=torch.long),
+    }
+
+    selected = flow_training_batch(batch)
+
+    assert set(selected) == {ACTION, "action_dim_is_pad", "action_horizon_is_pad"}
+
+
+def test_cuda_graph_step_marker_runs_once_before_each_joint_kernel(monkeypatch):
+    events = []
+    config = dataclasses.replace(
+        make_config(),
+        compile_model=True,
+        compile_cudagraphs=True,
+    )
+    monkeypatch.setattr(
+        torch.compiler,
+        "cudagraph_mark_step_begin",
+        lambda: events.append("mark"),
+    )
+
+    def kernel(**_kwargs):
+        events.append("kernel")
+        return "output"
+
+    prewarm = lambda: events.append("prewarm")  # noqa: E731
+    assert (
+        run_training_flow_kernel(kernel, config, prewarm_rope_cache=prewarm, batch={})
+        == "output"
+    )
+    assert (
+        run_training_flow_kernel(kernel, config, prewarm_rope_cache=prewarm, batch={})
+        == "output"
+    )
+    assert events == [
+        "prewarm",
+        "mark",
+        "kernel",
+        "prewarm",
+        "mark",
+        "kernel",
+    ]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"compile_model": False, "compile_cudagraphs": True},
+        {"compile_model": True, "compile_cudagraphs": False},
+    ],
+)
+def test_cuda_graph_step_marker_is_noop_unless_both_flags_are_enabled(monkeypatch, changes):
+    calls = []
+    monkeypatch.setattr(
+        torch.compiler,
+        "cudagraph_mark_step_begin",
+        lambda: calls.append(True),
+    )
+    config = dataclasses.replace(make_config(), **changes)
+
+    assert run_training_flow_kernel(lambda **_kwargs: 1, config) == 1
+    assert calls == []
+
+
+def test_cuda_graph_step_marker_fails_clearly_when_torch_api_is_missing(monkeypatch):
+    config = dataclasses.replace(
+        make_config(),
+        compile_model=True,
+        compile_cudagraphs=True,
+    )
+    monkeypatch.delattr(torch.compiler, "cudagraph_mark_step_begin")
+
+    with pytest.raises(RuntimeError, match="torch.compiler.cudagraph_mark_step_begin"):
+        run_training_flow_kernel(
+            lambda **_kwargs: None,
+            config,
+            prewarm_rope_cache=lambda: None,
+        )
+
+
+class _FakeRotary:
+    def __init__(self, cache_length):
+        self.cache_length = cache_length
+        self.ready = False
+        self.calls = 0
+
+    def _target_cache_seq_len(self, _probe, _position_ids):
+        return self.cache_length
+
+    def _rope_cache_ready(self, _device, length):
+        return self.ready and length <= self.cache_length
+
+    def __call__(self, _probe, _position_ids):
+        self.calls += 1
+        self.ready = True
+
+
+@pytest.mark.parametrize("scaled", [False, True])
+def test_compiled_rope_prewarm_supports_single_and_scaled_mappings(scaled):
+    default = _FakeRotary(cache_length=1024)
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(rope_scaling_layers=[1] if scaled else None),
+        parameters=lambda: iter(()),
+    )
+    expected = [default]
+    if scaled:
+        scaling = _FakeRotary(cache_length=2048)
+        transformer.rotary_embs = {"default": default, "scaling": scaling}
+        expected.append(scaling)
+    else:
+        transformer.rotary_emb = default
+    policy = SimpleNamespace(
+        config=SimpleNamespace(effective_training_compile_padding_length=640),
+        _backbone=lambda: SimpleNamespace(transformer=transformer),
+    )
+
+    prepare_compiled_transformer_rope_caches(
+        policy,
+        {"input_ids": torch.zeros(1, 640, dtype=torch.long)},
+    )
+    prepare_compiled_transformer_rope_caches(
+        policy,
+        {"input_ids": torch.zeros(1, 640, dtype=torch.long)},
+    )
+
+    assert [rotary.calls for rotary in expected] == [1] * len(expected)
+
+
+def test_compiled_rope_prewarm_fails_for_unsupported_transformer():
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(rope_scaling_layers=None),
+        parameters=lambda: iter(()),
+    )
+    policy = SimpleNamespace(
+        config=SimpleNamespace(effective_training_compile_padding_length=640),
+        _backbone=lambda: SimpleNamespace(transformer=transformer),
+    )
+
+    with pytest.raises(RuntimeError, match="exposes no rotary_emb cache"):
+        prepare_compiled_transformer_rope_caches(
+            policy,
+            {"input_ids": torch.zeros(1, 640, dtype=torch.long)},
+        )
+
+
+def test_compiled_rope_prewarm_accepts_shared_image_inputs_embeds_only():
+    rotary = _FakeRotary(cache_length=1024)
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(rope_scaling_layers=None),
+        rotary_emb=rotary,
+        parameters=lambda: iter(()),
+    )
+    policy = SimpleNamespace(
+        config=SimpleNamespace(effective_training_compile_padding_length=640),
+        _backbone=lambda: SimpleNamespace(transformer=transformer),
+    )
+    position_ids = torch.arange(640).unsqueeze(0)
+
+    prepare_compiled_transformer_rope_caches(
+        policy,
+        {
+            "inputs_embeds": torch.zeros(2, 640, 8, dtype=torch.bfloat16),
+            "position_ids": position_ids,
+        },
+    )
+
+    assert rotary.calls == 1

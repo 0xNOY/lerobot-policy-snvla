@@ -497,3 +497,34 @@ CE `0.0615`, dropout fraction `0.2437`, noise fraction `0.3063`, and selected no
 The current resume log contains no forbidden load warning, W&B ignored-value warning, OOM,
 NaN/Inf, NCCL error, or traceback. Final local verification is `285 passed, 16 deselected`, with
 Ruff passing.
+
+### MolmoAct2 production performance tuning
+
+The complete step-7399 external-signal checkpoint was retained while the slow approximately
+`3.5--3.7 s/update` path was tuned. The selected implementation uses fixed 640-token full views,
+selective Inductor compilation of the joint VLM/Action-Expert flow kernel, eager image preparation
+with differentiable reuse for the state-hidden narration branch, eager prewarmed RoPE caches, and
+CUDA Graph step markers. Dynamic narration paths remain eager. Vision, state-hidden, and joint
+gradient checkpointing remain enabled; disabling the first two together OOMed.
+
+Static batch-8/rank benchmarks measured `2.3031 s/update` without CUDA Graph and `2.2548 s/update`
+with it. The latter had graph breaks/recompiles `0/0`, finite parity, and approximately 13.0 GiB
+headroom. A production-only zero-dropout rank initially caused raw images to enter a second compiled
+path; that attempted resume was stopped after one update. Full-view image embeddings are now always
+prepared outside the compiled kernel, independent of the number of selected dropout rows.
+
+The corrected alternating zero/nonzero-dropout CUDA-Graph gate used one unique graph, recorded graph
+breaks/recompiles `0/0`, finite losses/gradients and parity, and measured `1.9853 s/update`, `8.0591`
+global examples/s with approximately 13.1 GiB headroom. Its result is
+`/raid/takenaka/snvla/benchmarks/molmoact2_dropout_alternating_cudagraph_r2_20260717.json`.
+Generic `allenai/MolmoAct2` additionally disables DDP unused-parameter traversal after verifying
+that every trainable VLM LoRA and Action Expert parameter is used by the mandatory full path.
+
+The authoritative production process resumed from step 7399 on `CUDA_VISIBLE_DEVICES=2,3` and the
+same artifact-disabled W&B run. It printed four exact strict-load success lines and no forbidden
+state-dict warning. After a one-time approximately 314-second compile, monitored steady updates were
+approximately `2.19--2.32 s`, with finite metrics through at least step 7464 and no graph-break,
+recompile, CUDA-Graph overwrite, OOM, NCCL, or traceback. The active log is
+`/raid/takenaka/snvla/logs/molmoact2_t1_curriculum_v11_prod_b8_e1_resume_007399_optimized_r2.log`.
+Local non-simulator verification after all performance changes is `352 passed, 16 deselected`;
+Ruff and `git diff --check` pass.
