@@ -12,6 +12,7 @@ import json
 import os
 import random
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ os.environ.setdefault("HF_HOME", "/raid/takenaka/huggingface")
 import torch
 import torch.distributed as dist
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.factory import make_policy
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import ACTION
@@ -34,6 +36,7 @@ from lerobot_policy_snvla.constants import (
 from lerobot_policy_snvla.processor_molmoact2_snvla import (
     make_snvla_molmoact2_pre_post_processors,
 )
+from lerobot_policy_snvla.modeling_molmoact2_snvla import MolmoAct2SNVLAPolicy
 from lerobot_policy_snvla.training_schedule import state_dropout_mask
 
 DEFAULT_DATASET_ROOT = Path("/home/takenaka/datasets/t1_curriculum_v11_success500_aug_w20")
@@ -144,9 +147,57 @@ def _config(case: dict[str, Any], *, image_keys: list[str]) -> MolmoAct2SNVLACon
     device = case["device"]
     compile_scope = case.get("compile_scope") or "whole"
     compile_training_flow = bool(case.get("compile_model")) and compile_scope == "training_flow"
+    checkpoint = Path(os.environ.get("SNVLA_MOLMOACT2_CHECKPOINT", DEFAULT_CHECKPOINT))
+    saved_train_config = checkpoint / "train_config.json"
+    common = {
+        "device": device,
+        "model_dtype": str(overrides.get("model_dtype", "bfloat16")),
+        "num_flow_timesteps": int(overrides.get("num_flow_timesteps", 8)),
+        "gradient_checkpointing": bool(overrides.get("gradient_checkpointing", True)),
+        "gradient_checkpointing_joint": optional_bool("gradient_checkpointing_joint"),
+        "gradient_checkpointing_vision": optional_bool("gradient_checkpointing_vision"),
+        "gradient_checkpointing_state_hidden": optional_bool("gradient_checkpointing_state_hidden"),
+        "enable_lora_vlm": bool(overrides.get("enable_lora_vlm", True)),
+        "enable_lora_action_expert": bool(overrides.get("enable_lora_action_expert", False)),
+        "state_dropout_enabled": float(overrides.get("state_dropout_ratio", 0.25)) > 0,
+        "state_dropout_ratio": float(overrides.get("state_dropout_ratio", 0.25)),
+        "state_dropout_seed": int(case["seed"]),
+        "state_dropout_start_epoch": 0,
+        "observation_noise_enabled": False,
+        "max_sequence_length": int(overrides.get("max_sequence_length", 768)),
+        "state_dropout_share_image_features": bool(
+            overrides.get("state_dropout_share_image_features", True)
+        ),
+        "compile_model": compile_training_flow,
+        "compile_backend": str(case.get("compile_backend") or "inductor"),
+        "compile_mode": str(case.get("compile_mode") or "default"),
+        "compile_dynamic": case.get("compile_dynamic"),
+        "compile_cudagraphs": bool(case.get("inductor_cudagraphs") or False),
+        "training_compile_padding_length": (
+            int(overrides["training_compile_padding_length"])
+            if "training_compile_padding_length" in overrides
+            else None
+        ),
+        "training_compile_padding_buckets": (
+            tuple(int(value) for value in overrides["training_compile_padding_buckets"])
+            if "training_compile_padding_buckets" in overrides
+            else None
+        ),
+        "setup_type": "single franka robotic arm in libero",
+        "control_mode": "delta end-effector pose",
+        "image_keys": image_keys,
+        "push_to_hub": False,
+    }
+    if saved_train_config.is_file() and (checkpoint / "model.safetensors").is_file():
+        pipeline = TrainPipelineConfig.from_pretrained(saved_train_config)
+        saved = pipeline.policy
+        if not isinstance(saved, MolmoAct2SNVLAConfig):
+            raise TypeError(
+                f"Expected saved MolmoAct2SNVLAConfig, got {type(saved).__name__}."
+            )
+        return replace(saved, **common)
     return MolmoAct2SNVLAConfig(
         checkpoint_path=os.environ.get("SNVLA_MOLMOACT2_CHECKPOINT", DEFAULT_CHECKPOINT),
-        device=device,
         action_mode="continuous",
         inference_action_mode="continuous",
         chunk_size=10,
@@ -154,42 +205,7 @@ def _config(case: dict[str, Any], *, image_keys: list[str]) -> MolmoAct2SNVLACon
         max_state_dim=32,
         max_action_dim=32,
         expected_max_action_dim=32,
-        model_dtype=str(overrides.get("model_dtype", "bfloat16")),
-        num_flow_timesteps=int(overrides.get("num_flow_timesteps", 8)),
-        gradient_checkpointing=bool(overrides.get("gradient_checkpointing", True)),
-        gradient_checkpointing_joint=optional_bool("gradient_checkpointing_joint"),
-        gradient_checkpointing_vision=optional_bool("gradient_checkpointing_vision"),
-        gradient_checkpointing_state_hidden=optional_bool("gradient_checkpointing_state_hidden"),
-        enable_lora_vlm=bool(overrides.get("enable_lora_vlm", True)),
-        enable_lora_action_expert=bool(overrides.get("enable_lora_action_expert", False)),
-        state_dropout_enabled=float(overrides.get("state_dropout_ratio", 0.25)) > 0,
-        state_dropout_ratio=float(overrides.get("state_dropout_ratio", 0.25)),
-        state_dropout_seed=int(case["seed"]),
-        state_dropout_start_epoch=0,
-        observation_noise_enabled=False,
-        max_sequence_length=int(overrides.get("max_sequence_length", 768)),
-        state_dropout_share_image_features=bool(
-            overrides.get("state_dropout_share_image_features", True)
-        ),
-        compile_model=compile_training_flow,
-        compile_backend=str(case.get("compile_backend") or "inductor"),
-        compile_mode=str(case.get("compile_mode") or "default"),
-        compile_dynamic=case.get("compile_dynamic"),
-        compile_cudagraphs=bool(case.get("inductor_cudagraphs") or False),
-        training_compile_padding_length=(
-            int(overrides["training_compile_padding_length"])
-            if "training_compile_padding_length" in overrides
-            else None
-        ),
-        training_compile_padding_buckets=(
-            tuple(int(value) for value in overrides["training_compile_padding_buckets"])
-            if "training_compile_padding_buckets" in overrides
-            else None
-        ),
-        setup_type="single franka robotic arm in libero",
-        control_mode="delta end-effector pose",
-        image_keys=image_keys,
-        push_to_hub=False,
+        **common,
     )
 
 
@@ -242,7 +258,11 @@ def make_molmoact2_benchmark_trial(
         raise RuntimeError("MolmoAct2 benchmark fixed rows produced an empty batch.")
     batch[TRAINING_EPOCH] = torch.zeros(micro_batch_size, dtype=torch.long)
 
-    policy = make_policy(config, ds_meta=dataset.meta)
+    checkpoint = Path(os.environ.get("SNVLA_MOLMOACT2_CHECKPOINT", DEFAULT_CHECKPOINT))
+    if (checkpoint / "model.safetensors").is_file():
+        policy = MolmoAct2SNVLAPolicy.from_pretrained(checkpoint, config=config)
+    else:
+        policy = make_policy(config, ds_meta=dataset.meta)
     preprocessor, _ = make_snvla_molmoact2_pre_post_processors(
         config,
         dataset_stats=dataset.meta.stats,
