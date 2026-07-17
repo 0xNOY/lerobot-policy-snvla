@@ -365,6 +365,22 @@ def test_trial_config_compiles_only_production_training_flow_scope():
     assert diagnostic.compile_model is False
 
 
+def test_trial_config_forwards_max_autotune_mode():
+    case = {
+        "overrides": {"micro_batch_size": 1, "state_dropout_ratio": 0.25},
+        "device": "cpu",
+        "seed": 0,
+        "compile_model": True,
+        "compile_scope": "training_flow",
+        "compile_backend": "inductor",
+        "compile_mode": "max-autotune",
+    }
+
+    config = _config(case, image_keys=["cam"])
+
+    assert config.compile_mode == "max-autotune"
+
+
 def test_padding_image_plan_compares_four_production_variants_in_one_parity_group():
     cases = compile_padding_image_plan()["cases"]
     assert len(cases) == 4

@@ -63,6 +63,7 @@ class CaseSpec:
     compile_model: bool = False
     compile_scope: str | None = None
     compile_backend: str | None = None
+    compile_mode: str | None = None
     compile_dynamic: bool | None = None
     inductor_cudagraphs: bool | None = None
     max_graph_breaks: int | None = None
@@ -91,6 +92,7 @@ class CaseSpec:
             for value in (
                 case.compile_scope,
                 case.compile_backend,
+                case.compile_mode,
                 case.compile_dynamic,
                 case.inductor_cudagraphs,
             )
@@ -98,6 +100,14 @@ class CaseSpec:
             raise ValueError(f"{case.name}: compile options require compile_model=true.")
         if case.inductor_cudagraphs is not None and case.compile_backend != "inductor":
             raise ValueError(f"{case.name}: inductor_cudagraphs requires compile_backend='inductor'.")
+        if case.compile_mode not in {
+            None,
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        }:
+            raise ValueError(f"{case.name}: unsupported compile_mode={case.compile_mode!r}.")
         for field_name in ("max_graph_breaks", "max_recompiles"):
             value = getattr(case, field_name)
             if value is not None and (
@@ -799,6 +809,7 @@ def run_case(
         "compile_model": case.compile_model,
         "compile_scope": case.compile_scope,
         "compile_backend": case.compile_backend,
+        "compile_mode": case.compile_mode,
         "compile_dynamic": case.compile_dynamic,
         "inductor_cudagraphs": case.inductor_cudagraphs,
         "rank": rank,

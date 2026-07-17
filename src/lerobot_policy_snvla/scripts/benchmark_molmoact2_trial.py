@@ -173,6 +173,7 @@ def _config(case: dict[str, Any], *, image_keys: list[str]) -> MolmoAct2SNVLACon
         ),
         compile_model=compile_training_flow,
         compile_backend=str(case.get("compile_backend") or "inductor"),
+        compile_mode=str(case.get("compile_mode") or "default"),
         compile_dynamic=case.get("compile_dynamic"),
         compile_cudagraphs=bool(case.get("inductor_cudagraphs") or False),
         training_compile_padding_length=(
