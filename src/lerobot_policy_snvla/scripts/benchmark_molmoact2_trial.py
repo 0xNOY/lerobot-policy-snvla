@@ -180,6 +180,11 @@ def _config(case: dict[str, Any], *, image_keys: list[str]) -> MolmoAct2SNVLACon
             if "training_compile_padding_length" in overrides
             else None
         ),
+        training_compile_padding_buckets=(
+            tuple(int(value) for value in overrides["training_compile_padding_buckets"])
+            if "training_compile_padding_buckets" in overrides
+            else None
+        ),
         setup_type="single franka robotic arm in libero",
         control_mode="delta end-effector pose",
         image_keys=image_keys,

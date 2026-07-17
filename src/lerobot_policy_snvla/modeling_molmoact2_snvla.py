@@ -191,14 +191,31 @@ def prepare_compiled_transformer_rope_caches(
             f"{'input_ids' if input_ids is not None else 'inputs_embeds'}, "
             f"got shape {tuple(representative.shape)}."
         )
-    target_length = policy.config.effective_training_compile_padding_length
-    if target_length is None or target_length <= 0:
+    target_length = int(representative.shape[1])
+    configured_buckets = getattr(
+        policy.config,
+        "effective_training_compile_padding_buckets",
+        None,
+    )
+    if configured_buckets is not None:
+        if target_length not in configured_buckets:
+            raise RuntimeError(
+                "Compiled MolmoAct2 RoPE prewarm sequence length is not one of the "
+                f"configured buckets: {target_length} not in {configured_buckets}."
+            )
+    else:
+        expected_length = policy.config.effective_training_compile_padding_length
+        if expected_length is None or expected_length <= 0:
+            raise RuntimeError(
+                "Compiled MolmoAct2 RoPE prewarm requires a fixed positive sequence length."
+            )
+        if target_length != int(expected_length):
+            raise RuntimeError(
+                f"Compiled MolmoAct2 RoPE prewarm expected sequence length {expected_length}, "
+                f"got {target_length}."
+            )
+    if target_length <= 0:
         raise RuntimeError("Compiled MolmoAct2 RoPE prewarm requires a fixed positive sequence length.")
-    if int(representative.shape[1]) != int(target_length):
-        raise RuntimeError(
-            f"Compiled MolmoAct2 RoPE prewarm expected sequence length {target_length}, "
-            f"got {int(representative.shape[1])}."
-        )
 
     transformer = getattr(policy._backbone(), "transformer", None)
     if transformer is None:
@@ -672,9 +689,9 @@ class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
             noise_scale,
             noise,
         )
-        self.latest_metrics = {
-            name: float(value.detach().item())
-            for name, value in output_metrics.items()
-            if not name.startswith("__metric_")
-        }
+        # Training consumes output_metrics directly. Materializing the same
+        # values into Python floats here would force a GPU synchronization per
+        # metric on every update; inference metrics are populated by the
+        # generation path instead.
+        self.latest_metrics = {}
         return (total.mean() if reduction == "mean" else total), output_metrics

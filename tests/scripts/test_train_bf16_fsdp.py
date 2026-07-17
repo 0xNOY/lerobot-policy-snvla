@@ -10,7 +10,7 @@ from accelerate.data_loader import DataLoaderShard
 from lerobot.datasets import EpisodeAwareSampler
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.logging_utils import MetricsTracker
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 from lerobot_policy_snvla.compat import FeatureType, PolicyFeature
 from lerobot_policy_snvla.configuration_molmoact2_snvla import MolmoAct2SNVLAConfig
@@ -937,6 +937,57 @@ def test_record_output_metrics_globally_aggregates_narration_and_action_modes():
     assert action_meter.count == pytest.approx(0.0)
     assert torch.isfinite(torch.tensor(action_meter.avg))
     assert action_output == {}
+
+
+def test_record_output_metrics_reduces_all_weighted_groups_once():
+    class CountingAccelerator:
+        def __init__(self):
+            self.calls = 0
+
+        def reduce(self, tensor, reduction="sum"):
+            self.calls += 1
+            assert reduction == "sum"
+            assert tensor.shape == (2, 2)
+            return tensor
+
+    output = {
+        "first": torch.tensor(2.0),
+        "__metric_numerator__/first": torch.tensor(4.0),
+        "__metric_count__/first": torch.tensor(2.0),
+        "second": torch.tensor(3.0),
+        "__metric_numerator__/second": torch.tensor(9.0),
+        "__metric_count__/second": torch.tensor(3.0),
+    }
+    accelerator = CountingAccelerator()
+    tracker = make_tracker()
+
+    record_output_metrics(tracker, output, accelerator)
+
+    assert accelerator.calls == 1
+    assert tracker.metrics["first"].avg == pytest.approx(2.0)
+    assert tracker.metrics["second"].avg == pytest.approx(3.0)
+    assert output == {}
+
+
+def test_native_accelerator_keeps_only_raw_dataloader_on_cpu(monkeypatch):
+    observed = {}
+
+    def fake_prepare(self, *args, device_placement=None):
+        del self
+        observed["args"] = args
+        observed["device_placement"] = device_placement
+        return args
+
+    monkeypatch.setattr("accelerate.Accelerator.prepare", fake_prepare)
+    accelerator = object.__new__(train_bf16_fsdp.NativeBF16FSDPAccelerator)
+    accelerator.keep_raw_dataloaders_on_cpu = True
+    loader = DataLoader([torch.tensor(1.0)])
+    policy = torch.nn.Linear(1, 1)
+
+    result = accelerator.prepare(policy, loader, object())
+
+    assert result == (policy, loader, observed["args"][2])
+    assert observed["device_placement"] == [True, False, True]
 
 
 @pytest.mark.parametrize(

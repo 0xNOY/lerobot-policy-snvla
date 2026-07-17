@@ -75,6 +75,13 @@ class MolmoAct2SNVLAConfig(MolmoAct2Config):
     # Fixed full-view length used only by the compiled training kernel. None
     # preserves the old behavior by falling back to max_sequence_length.
     training_compile_padding_length: int | None = None
+    # Optional static-shape buckets for compiled training. The processor pads
+    # every full-state microbatch to the smallest bucket that fits without
+    # truncation. This preserves the objective while avoiding compute on a
+    # dataset-wide worst-case sequence length. Each bucket produces at most one
+    # compiled graph and remains valid when the dataset length distribution
+    # changes. Mutually exclusive with training_compile_padding_length.
+    training_compile_padding_buckets: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -179,6 +186,28 @@ class MolmoAct2SNVLAConfig(MolmoAct2Config):
                 raise ValueError(
                     "training_compile_padding_length cannot exceed max_sequence_length"
                 )
+        if self.training_compile_padding_buckets is not None:
+            buckets = self.training_compile_padding_buckets
+            if not isinstance(buckets, (list, tuple)) or not buckets:
+                raise ValueError("training_compile_padding_buckets must be a non-empty sequence")
+            if any(
+                isinstance(bucket, bool) or not isinstance(bucket, int) or bucket <= 0
+                for bucket in buckets
+            ):
+                raise ValueError("training_compile_padding_buckets must contain positive integers")
+            if tuple(sorted(set(buckets))) != tuple(buckets):
+                raise ValueError(
+                    "training_compile_padding_buckets must be strictly increasing and unique"
+                )
+            if self.training_compile_padding_length is not None:
+                raise ValueError(
+                    "training_compile_padding_buckets and training_compile_padding_length "
+                    "are mutually exclusive"
+                )
+            if self.max_sequence_length is not None and buckets[-1] > self.max_sequence_length:
+                raise ValueError(
+                    "training_compile_padding_buckets cannot exceed max_sequence_length"
+                )
         if self.compile_cudagraphs and self.compile_dynamic:
             raise ValueError("compile_cudagraphs requires compile_dynamic=false")
         if self.compile_backend != "inductor" and (self.compile_cudagraphs or self.compile_mode != "default"):
@@ -188,4 +217,12 @@ class MolmoAct2SNVLAConfig(MolmoAct2Config):
 
     @property
     def effective_training_compile_padding_length(self) -> int | None:
+        if self.training_compile_padding_buckets is not None:
+            return self.training_compile_padding_buckets[-1]
         return self.training_compile_padding_length or self.max_sequence_length
+
+    @property
+    def effective_training_compile_padding_buckets(self) -> tuple[int, ...] | None:
+        if self.training_compile_padding_buckets is None:
+            return None
+        return tuple(self.training_compile_padding_buckets)

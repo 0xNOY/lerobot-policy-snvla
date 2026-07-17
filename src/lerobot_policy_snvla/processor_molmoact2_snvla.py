@@ -133,6 +133,41 @@ def process_with_exact_final_padding(
     return dict(processor(**retry_kwargs))
 
 
+def select_compile_padding_bucket(
+    actual_length: int,
+    buckets: tuple[int, ...] | list[int],
+) -> int:
+    """Return the smallest static bucket that fits, failing before truncation."""
+    for bucket in buckets:
+        if actual_length <= int(bucket):
+            return int(bucket)
+    raise ValueError(
+        f"MolmoAct2 SNVLA sequence length {actual_length} exceeds the largest compiled "
+        f"training padding bucket={int(buckets[-1])}; truncation is disabled."
+    )
+
+
+def process_with_compile_padding_buckets(
+    processor: Any,
+    processor_kwargs: dict[str, Any],
+    buckets: tuple[int, ...] | list[int],
+) -> tuple[dict[str, Any], int]:
+    """Pack once to measure the batch, then repack to its smallest static shape."""
+    inputs = dict(processor(**processor_kwargs))
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None or attention_mask.ndim != 2:
+        raise ValueError("MolmoAct2 bucketed packing requires a rank-2 attention_mask.")
+    unpadded_length = int(attention_mask.sum(dim=1).max().item())
+    target_length = select_compile_padding_bucket(unpadded_length, buckets)
+    if int(inputs["input_ids"].shape[1]) != target_length:
+        inputs = process_with_exact_final_padding(
+            processor,
+            {**processor_kwargs, "padding": "max_length"},
+            target_length,
+        )
+    return inputs, target_length
+
+
 def _select_rows(value: Any, indices: torch.Tensor, batch_size: int) -> Any:
     if torch.is_tensor(value):
         return (
@@ -166,6 +201,7 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
     observation_noise_scale_max: float = 0.025
     observation_noise_standard_normal_clip: float = 2.0
     training_compile_padding_length: int | None = None
+    training_compile_padding_buckets: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.action_mode != "continuous":
@@ -189,6 +225,7 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
                 "observation_noise_scale_max": self.observation_noise_scale_max,
                 "observation_noise_standard_normal_clip": self.observation_noise_standard_normal_clip,
                 "training_compile_padding_length": self.training_compile_padding_length,
+                "training_compile_padding_buckets": self.training_compile_padding_buckets,
             }
         )
         return config
@@ -280,6 +317,7 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
             include_discrete_action=False,
         )
         fixed_padding_length = self.training_compile_padding_length if not hide_state else None
+        padding_buckets = self.training_compile_padding_buckets if not hide_state else None
         processor_kwargs: dict[str, Any] = {
             "text": texts,
             "images": flat_images,
@@ -293,7 +331,14 @@ class MolmoAct2SNVLAPackInputsProcessorStep(MolmoAct2PackInputsProcessorStep):
                 int(fixed_padding_length),
             )
         else:
-            inputs = dict(self.processor(**processor_kwargs))
+            if padding_buckets is not None:
+                inputs, fixed_padding_length = process_with_compile_padding_buckets(
+                    self.processor,
+                    processor_kwargs,
+                    padding_buckets,
+                )
+            else:
+                inputs = dict(self.processor(**processor_kwargs))
         actual_length = int(inputs["input_ids"].shape[1])
         validate_packed_sequence_length(
             actual_length,
@@ -418,7 +463,12 @@ def make_snvla_molmoact2_pre_post_processors(
         observation_noise_scale_max=config.observation_noise_scale_max,
         observation_noise_standard_normal_clip=config.observation_noise_standard_normal_clip,
         training_compile_padding_length=(
-            config.effective_training_compile_padding_length if config.compile_model else None
+            config.effective_training_compile_padding_length
+            if config.compile_model and config.effective_training_compile_padding_buckets is None
+            else None
+        ),
+        training_compile_padding_buckets=(
+            config.effective_training_compile_padding_buckets if config.compile_model else None
         ),
     )
     preprocessor.steps[preprocessor.steps.index(original)] = replacement

@@ -528,3 +528,19 @@ recompile, CUDA-Graph overwrite, OOM, NCCL, or traceback. The active log is
 `/raid/takenaka/snvla/logs/molmoact2_t1_curriculum_v11_prod_b8_e1_resume_007399_optimized_r2.log`.
 Local non-simulator verification after all performance changes is `352 passed, 16 deselected`;
 Ruff and `git diff --check` pass.
+
+### Follow-up objective-preserving performance implementation
+
+The follow-up patch adds four data-independent changes without altering the loss, sample order,
+optimizer update rule, or trainable parameter set: raw Molmo batches remain on CPU until the
+official processor's final device step; distributed numerator/count metrics share one all-reduce;
+MolmoAct2 DDP disables immutable buffer broadcasts and uses gradient bucket views; and compiled
+training can opt into non-truncating static sequence-length buckets. Fixed 640 padding remains the
+default and the active production process is unchanged.
+
+The bucket path validates configuration ordering/uniqueness/cap, processor output length, largest
+bucket overflow, and RoPE shape membership. A local RTX 3090 CUDA test passed loss and gradient
+parity for eager versus Inductor/CUDA Graph over three static shapes. The local non-simulator suite
+passed (`312 passed`), Ruff passed, and `git diff --check` passed. DGX throughput comparison is
+deferred until the active production run no longer occupies the allowed GPUs 2,3; therefore this
+report makes no speedup claim for the new patch yet.

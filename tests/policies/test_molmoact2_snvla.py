@@ -24,7 +24,9 @@ from lerobot_policy_snvla.processor_molmoact2_snvla import (
     MolmoAct2SNVLAPackInputsProcessorStep,
     _add_progress_to_task,
     _narration_answer,
+    process_with_compile_padding_buckets,
     process_with_exact_final_padding,
+    select_compile_padding_bucket,
     validate_packed_sequence_length,
 )
 
@@ -275,6 +277,69 @@ def test_training_compile_padding_defaults_to_safety_limit_and_accepts_640():
     assert production.effective_training_compile_padding_length == 640
 
 
+def test_training_compile_padding_buckets_are_static_and_mutually_exclusive():
+    config = dataclasses.replace(
+        make_config(),
+        training_compile_padding_buckets=(384, 512, 640),
+    )
+
+    assert config.effective_training_compile_padding_buckets == (384, 512, 640)
+    assert config.effective_training_compile_padding_length == 640
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        dataclasses.replace(config, training_compile_padding_length=640)
+
+
+@pytest.mark.parametrize(
+    "buckets",
+    [(), (512, 384), (384, 384), (384, 0), (384, 769)],
+)
+def test_training_compile_padding_bucket_validation(buckets):
+    with pytest.raises(ValueError, match="training_compile_padding_buckets"):
+        dataclasses.replace(make_config(), training_compile_padding_buckets=buckets)
+
+
+@pytest.mark.parametrize(
+    "actual,expected",
+    [(1, 384), (384, 384), (385, 512), (605, 640), (640, 640)],
+)
+def test_select_compile_padding_bucket_uses_smallest_non_truncating_shape(actual, expected):
+    assert select_compile_padding_bucket(actual, (384, 512, 640)) == expected
+
+
+def test_select_compile_padding_bucket_fails_closed_above_largest_bucket():
+    with pytest.raises(ValueError, match="largest compiled training padding bucket=640"):
+        select_compile_padding_bucket(641, (384, 512, 640))
+
+
+def test_bucketed_packing_reuses_exact_shape_and_never_truncates():
+    requests = []
+
+    def processor(**kwargs):
+        requested = kwargs.get("max_length")
+        requests.append(requested)
+        length = 401 if requested is None else requested + 1
+        return {
+            "input_ids": torch.zeros(2, length, dtype=torch.long),
+            "attention_mask": torch.cat(
+                [
+                    torch.ones(2, min(length, 401), dtype=torch.long),
+                    torch.zeros(2, max(0, length - 401), dtype=torch.long),
+                ],
+                dim=1,
+            ),
+        }
+
+    inputs, target = process_with_compile_padding_buckets(
+        processor,
+        {"padding": True},
+        (384, 512, 640),
+    )
+
+    assert target == 512
+    assert inputs["input_ids"].shape == (2, 512)
+    assert requests == [None, 511]
+
+
 @pytest.mark.parametrize("invalid", [0, -1, True, 769])
 def test_training_compile_padding_validation(invalid):
     with pytest.raises(ValueError, match="training_compile_padding_length"):
@@ -515,3 +580,40 @@ def test_compiled_rope_prewarm_accepts_shared_image_inputs_embeds_only():
     )
 
     assert rotary.calls == 1
+
+
+def test_compiled_rope_prewarm_accepts_configured_static_bucket():
+    rotary = _FakeRotary(cache_length=1024)
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(rope_scaling_layers=None),
+        rotary_emb=rotary,
+        parameters=lambda: iter(()),
+    )
+    policy = SimpleNamespace(
+        config=SimpleNamespace(
+            effective_training_compile_padding_length=640,
+            effective_training_compile_padding_buckets=(384, 512, 640),
+        ),
+        _backbone=lambda: SimpleNamespace(transformer=transformer),
+    )
+
+    prepare_compiled_transformer_rope_caches(
+        policy,
+        {"input_ids": torch.zeros(2, 512, dtype=torch.long)},
+    )
+
+    assert rotary.calls == 1
+
+
+def test_compiled_rope_prewarm_rejects_unconfigured_shape():
+    policy = SimpleNamespace(
+        config=SimpleNamespace(
+            effective_training_compile_padding_length=640,
+            effective_training_compile_padding_buckets=(384, 512, 640),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="not one of the configured buckets"):
+        prepare_compiled_transformer_rope_caches(
+            policy,
+            {"input_ids": torch.zeros(2, 500, dtype=torch.long)},
+        )

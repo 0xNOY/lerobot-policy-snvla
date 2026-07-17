@@ -26,6 +26,7 @@ from lerobot.scripts import lerobot_train
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+from torch.utils.data import DataLoader
 
 from lerobot_policy_snvla.constants import (
     GROUP_METRIC_COUNT_PREFIX,
@@ -115,6 +116,7 @@ def _record_globally_weighted_metrics(
         for name in output_dict
         if name.startswith(GROUP_METRIC_NUMERATOR_PREFIX)
     ]
+    local_totals = []
     for name in metric_names:
         output_dict.pop(name, None)
         numerator = output_dict.pop(f"{GROUP_METRIC_NUMERATOR_PREFIX}{name}")
@@ -122,9 +124,15 @@ def _record_globally_weighted_metrics(
         if count_key not in output_dict:
             raise KeyError(f"Missing distributed metric count for {name}")
         count = output_dict.pop(count_key)
-        totals = torch.stack([numerator.detach().float(), count.detach().float()])
-        if accelerator is not None:
-            totals = accelerator.reduce(totals, reduction="sum")
+        local_totals.append(torch.stack([numerator.detach().float(), count.detach().float()]))
+    if not local_totals:
+        return set()
+    reduced_totals = torch.stack(local_totals)
+    if accelerator is not None:
+        # One collective preserves the exact numerator/count formulas while
+        # avoiding one all-reduce and host synchronization per metric group.
+        reduced_totals = accelerator.reduce(reduced_totals, reduction="sum")
+    for name, totals in zip(metric_names, reduced_totals, strict=True):
         global_numerator, global_count = totals
         global_mean = torch.where(
             global_count > 0,
@@ -670,6 +678,18 @@ def _assert_current_molmoact2_snvla_processor_config(
         "observation_noise_standard_normal_clip",
     )
     mismatches = [field for field in fields if getattr(step, field) != getattr(policy_cfg, field)]
+    expected_buckets = (
+        policy_cfg.effective_training_compile_padding_buckets if policy_cfg.compile_model else None
+    )
+    expected_length = (
+        policy_cfg.effective_training_compile_padding_length
+        if policy_cfg.compile_model and expected_buckets is None
+        else None
+    )
+    if step.training_compile_padding_length != expected_length:
+        mismatches.append("training_compile_padding_length")
+    if step.training_compile_padding_buckets != expected_buckets:
+        mismatches.append("training_compile_padding_buckets")
     if mismatches:
         raise AssertionError(
             "MolmoAct2 SNVLA processor config does not match the active policy config: "
@@ -953,6 +973,19 @@ def _epoch_training_patches(
 class NativeBF16FSDPAccelerator(Accelerator):
     """An Accelerator that does not create fp32 FSDP master parameters."""
 
+    def __init__(self, *args, keep_raw_dataloaders_on_cpu: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.keep_raw_dataloaders_on_cpu = bool(keep_raw_dataloaders_on_cpu)
+
+    def prepare(self, *args, device_placement=None):
+        if self.keep_raw_dataloaders_on_cpu and device_placement is None:
+            # Molmo packing converts raw images/state to CPU NumPy and its final
+            # DeviceProcessorStep transfers the packed tensors to the target
+            # device. Prevent Accelerate from doing a redundant raw H2D before
+            # that CPU preprocessing step.
+            device_placement = [not isinstance(value, DataLoader) for value in args]
+        return super().prepare(*args, device_placement=device_placement)
+
     @contextmanager
     def autocast(self, autocast_handler=None):
         del autocast_handler
@@ -1001,6 +1034,7 @@ def main(accelerator: Accelerator | None = None) -> None:
         lerobot_train.register_third_party_plugins()
         cfg = _parse_train_config()
         if accelerator is None:
+            is_molmoact2 = isinstance(cfg.policy, MolmoAct2SNVLAConfig)
             find_unused_parameters = resolve_ddp_find_unused_parameters(
                 cfg,
                 ddp_options.find_unused_parameters,
@@ -1015,9 +1049,15 @@ def main(accelerator: Accelerator | None = None) -> None:
             accelerator = NativeBF16FSDPAccelerator(
                 step_scheduler_with_optimizer=False,
                 mixed_precision="no",
+                keep_raw_dataloaders_on_cpu=is_molmoact2,
                 kwargs_handlers=[
                     DistributedDataParallelKwargs(
                         find_unused_parameters=find_unused_parameters,
+                        # Released MolmoAct2 has no mutable running-stat
+                        # buffers. Keep legacy synchronization for other policy
+                        # families handled by this shared entrypoint.
+                        broadcast_buffers=not is_molmoact2,
+                        gradient_as_bucket_view=is_molmoact2,
                     )
                 ],
             )
