@@ -166,20 +166,20 @@ def test_full_view_compiled_inputs_stay_stable_for_zero_and_nonzero_dropout():
         MolmoAct2SNVLAPolicy._prepare_full_view_with_shared_image_features(
             receiver,
             dict(base_inputs),
-            torch.zeros(3, dtype=torch.bool),
+            None,
         )
     )
     some_inputs, some_features = (
         MolmoAct2SNVLAPolicy._prepare_full_view_with_shared_image_features(
             receiver,
             dict(base_inputs),
-            torch.tensor([False, True, False]),
+            torch.tensor([1]),
         )
     )
 
     assert set(zero_inputs) == set(some_inputs) == {"attention_mask", "inputs_embeds"}
     assert zero_inputs["inputs_embeds"].shape == some_inputs["inputs_embeds"].shape == (3, 5, 4)
-    assert zero_features.shape == (0, 4)
+    assert zero_features is None
     assert some_features.shape == (1, 4)
     assert backbone.vision_forward_count == 2
 
@@ -192,15 +192,15 @@ def test_alternating_zero_and_nonzero_dropout_never_restores_raw_visual_keys():
         _backbone=lambda: backbone,
     )
     signatures = []
-    for dropout in (
-        torch.zeros(3, dtype=torch.bool),
-        torch.tensor([True, False, True]),
-        torch.zeros(3, dtype=torch.bool),
+    for selected_rows in (
+        None,
+        torch.tensor([0, 2]),
+        None,
     ):
         prepared, _ = MolmoAct2SNVLAPolicy._prepare_full_view_with_shared_image_features(
             receiver,
             {"input_ids": full_ids, "pixel_values": images},
-            dropout,
+            selected_rows,
         )
         signatures.append((tuple(sorted(prepared)), tuple(prepared["inputs_embeds"].shape)))
 

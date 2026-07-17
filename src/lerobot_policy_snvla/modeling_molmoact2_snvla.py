@@ -69,13 +69,19 @@ def select_image_features_by_rows(
             f"{image_features.shape[0]} != {total_patches}."
         )
     offsets = F.pad(patch_counts.cumsum(dim=0), (1, 0))
-    chunks = [
-        image_features[int(offsets[row].item()) : int(offsets[row + 1].item())]
-        for row in row_indices.tolist()
-    ]
-    if not chunks:
+    if row_indices.numel() == 0:
         return image_features.new_empty((0, image_features.shape[-1]))
-    return torch.cat(chunks, dim=0)
+    # Build every selected contiguous segment on device. Using the fixed token
+    # width as the upper bound avoids a GPU->CPU `.item()` for each selected
+    # row while preserving arbitrary row ordering.
+    selected_counts = patch_counts.index_select(0, row_indices)
+    selected_offsets = offsets.index_select(0, row_indices)
+    relative = torch.arange(input_ids.shape[1], device=input_ids.device)
+    relative = relative.unsqueeze(0).expand(row_indices.numel(), -1)
+    selected_indices = (selected_offsets.unsqueeze(1) + relative)[
+        relative < selected_counts.unsqueeze(1)
+    ]
+    return image_features.index_select(0, selected_indices)
 
 
 def build_text_embeddings_with_image_features(
@@ -470,7 +476,7 @@ class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
     def _prepare_full_view_with_shared_image_features(
         self,
         model_inputs: dict[str, Tensor],
-        dropout: Tensor,
+        selected_rows: Tensor | None,
     ) -> tuple[dict[str, Tensor], Tensor | None]:
         """Encode images once and retain selected differentiable patch features."""
         if not self.config.state_dropout_share_image_features:
@@ -506,19 +512,20 @@ class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
         if image_features is None:
             return model_inputs, None
 
-        selected_rows = dropout.nonzero(as_tuple=False).flatten()
-        selected_features = select_image_features_by_rows(
-            image_features,
-            input_ids,
-            selected_rows,
-            image_patch_token_id=int(backbone.config.image_patch_id),
-        )
         prepared = {
             key: value
             for key, value in model_inputs.items()
             if key != "input_ids" and key not in _VISUAL_MODEL_INPUT_KEYS
         }
         prepared["inputs_embeds"] = inputs_embeds
+        if selected_rows is None:
+            return prepared, None
+        selected_features = select_image_features_by_rows(
+            image_features,
+            input_ids,
+            selected_rows,
+            image_patch_token_id=int(backbone.config.image_patch_id),
+        )
         return prepared, selected_features
 
     def _state_hidden_outputs(
@@ -582,19 +589,25 @@ class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
             dropout = dropout.to(device=labels.device, dtype=torch.bool).reshape(-1)
         if dropout.numel() != labels.shape[0]:
             raise ValueError("state_dropout_mask must contain one value per full-view row.")
-        validate_state_hidden_row_indices(
+        selected_rows = validate_state_hidden_row_indices(
             dropout,
             batch.get(STATE_HIDDEN_ROW_INDICES),
         )
+
+        hidden_inputs = self._state_hidden_model_inputs(batch)
+        if selected_rows.numel() and not hidden_inputs:
+            raise RuntimeError("State-dropout rows require a state-hidden MolmoAct2 view.")
 
         model_inputs = self._model_inputs(batch)
         shared_image_features = None
         if self.config.state_dropout_share_image_features:
             # Keep the compiled joint-kernel signature identical even when a
-            # rank happens to select zero state-dropout rows. Only the optional
-            # hidden text branch depends on dropout.any().
+            # rank happens to select zero state-dropout rows. Hidden-view key
+            # presence decides the eager branch without synchronizing a CUDA
+            # boolean back to Python.
             model_inputs, shared_image_features = self._prepare_full_view_with_shared_image_features(
-                model_inputs, dropout
+                model_inputs,
+                selected_rows if hidden_inputs else None,
             )
         self._active_narration_labels = labels
         try:
@@ -622,10 +635,7 @@ class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
         )
 
         dropout = dropout.to(device=text_loss.device)
-        if bool(dropout.any()):
-            hidden_inputs = self._state_hidden_model_inputs(batch)
-            if not hidden_inputs:
-                raise RuntimeError("State-dropout rows require a state-hidden MolmoAct2 view.")
+        if hidden_inputs:
             hidden_outputs = self._state_hidden_outputs(
                 hidden_inputs,
                 shared_image_features,
@@ -638,7 +648,7 @@ class MolmoAct2SNVLAPolicy(SNVLARuntimeMixin, MolmoAct2Policy):
                 hidden_labels,
                 self.model.lm_head.weight,
             )
-            if dropped_text_loss.numel() != int(dropout.sum().item()):
+            if dropped_text_loss.numel() != selected_rows.numel():
                 raise RuntimeError("State-hidden view batch does not match state_dropout_mask.")
             text_loss = text_loss.clone()
             text_loss[dropout] = dropped_text_loss
