@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.collate import lerobot_collate_fn
 
 from lerobot_policy_snvla.configuration_molmoact2_snvla import MolmoAct2SNVLAConfig
@@ -117,7 +118,11 @@ def main(argv: list[str] | None = None) -> int:
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
 
-    config = MolmoAct2SNVLAConfig.from_pretrained(args.checkpoint)
+    train_config_path = args.checkpoint / "train_config.json"
+    pipeline = TrainPipelineConfig.from_pretrained(train_config_path)
+    config = pipeline.policy
+    if not isinstance(config, MolmoAct2SNVLAConfig):
+        raise TypeError(f"Expected MolmoAct2SNVLAConfig, got {type(config).__name__}")
     config.device = str(device)
     dataset = _make_dataset(args.dataset_root, chunk_size=int(config.chunk_size))
     os.environ["SNVLA_BENCHMARK_MANIFEST"] = str(args.manifest)
