@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from accelerate.data_loader import DataLoaderShard
+from accelerate.utils import DistributedType
 from lerobot.datasets import EpisodeAwareSampler
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.logging_utils import MetricsTracker
@@ -981,6 +982,7 @@ def test_native_accelerator_keeps_only_raw_dataloader_on_cpu(monkeypatch):
     monkeypatch.setattr("accelerate.Accelerator.prepare", fake_prepare)
     accelerator = object.__new__(train_bf16_fsdp.NativeBF16FSDPAccelerator)
     accelerator.keep_raw_dataloaders_on_cpu = True
+    accelerator.state = SimpleNamespace(distributed_type=DistributedType.MULTI_GPU)
     loader = DataLoader([torch.tensor(1.0)])
     policy = torch.nn.Linear(1, 1)
 
@@ -988,6 +990,24 @@ def test_native_accelerator_keeps_only_raw_dataloader_on_cpu(monkeypatch):
 
     assert result == (policy, loader, observed["args"][2])
     assert observed["device_placement"] == [True, False, True]
+
+
+def test_native_accelerator_preserves_default_fsdp_device_placement(monkeypatch):
+    observed = {}
+
+    def fake_prepare(self, *args, device_placement=None):
+        del self
+        observed["device_placement"] = device_placement
+        return args
+
+    monkeypatch.setattr("accelerate.Accelerator.prepare", fake_prepare)
+    accelerator = object.__new__(train_bf16_fsdp.NativeBF16FSDPAccelerator)
+    accelerator.keep_raw_dataloaders_on_cpu = True
+    accelerator.state = SimpleNamespace(distributed_type=DistributedType.FSDP)
+
+    accelerator.prepare(torch.nn.Linear(1, 1), DataLoader([torch.tensor(1.0)]))
+
+    assert observed["device_placement"] is None
 
 
 @pytest.mark.parametrize(

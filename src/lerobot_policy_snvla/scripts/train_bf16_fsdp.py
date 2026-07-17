@@ -21,7 +21,7 @@ from typing import Any
 
 import torch
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DistributedDataParallelKwargs, DistributedType
 from lerobot.scripts import lerobot_train
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -978,12 +978,29 @@ class NativeBF16FSDPAccelerator(Accelerator):
         self.keep_raw_dataloaders_on_cpu = bool(keep_raw_dataloaders_on_cpu)
 
     def prepare(self, *args, device_placement=None):
-        if self.keep_raw_dataloaders_on_cpu and device_placement is None:
+        supports_per_object_placement = self.distributed_type in {
+            DistributedType.NO,
+            DistributedType.MULTI_GPU,
+        }
+        if (
+            self.keep_raw_dataloaders_on_cpu
+            and supports_per_object_placement
+            and device_placement is None
+        ):
             # Molmo packing converts raw images/state to CPU NumPy and its final
             # DeviceProcessorStep transfers the packed tensors to the target
             # device. Prevent Accelerate from doing a redundant raw H2D before
             # that CPU preprocessing step.
             device_placement = [not isinstance(value, DataLoader) for value in args]
+        elif self.keep_raw_dataloaders_on_cpu and not supports_per_object_placement:
+            # Accelerate explicitly does not support per-object placement with
+            # FSDP/DeepSpeed. Preserve the established placement path instead
+            # of silently changing distributed semantics.
+            logging.warning(
+                "Raw DataLoader CPU placement is unavailable for distributed_type=%s; "
+                "using Accelerate's default placement.",
+                self.distributed_type,
+            )
         return super().prepare(*args, device_placement=device_placement)
 
     @contextmanager
