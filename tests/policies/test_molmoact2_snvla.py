@@ -27,6 +27,7 @@ from lerobot_policy_snvla.processor_molmoact2_snvla import (
     process_with_compile_padding_buckets,
     process_with_exact_final_padding,
     select_compile_padding_bucket,
+    synchronize_distributed_sequence_length,
     validate_packed_sequence_length,
 )
 
@@ -309,6 +310,21 @@ def test_select_compile_padding_bucket_uses_smallest_non_truncating_shape(actual
 def test_select_compile_padding_bucket_fails_closed_above_largest_bucket():
     with pytest.raises(ValueError, match="largest compiled training padding bucket=640"):
         select_compile_padding_bucket(641, (384, 512, 640))
+
+
+def test_compile_padding_bucket_uses_distributed_global_maximum(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "gloo")
+
+    def all_reduce(value, op):
+        assert op == torch.distributed.ReduceOp.MAX
+        value.fill_(605)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    assert synchronize_distributed_sequence_length(489) == 605
 
 
 def test_bucketed_packing_reuses_exact_shape_and_never_truncates():

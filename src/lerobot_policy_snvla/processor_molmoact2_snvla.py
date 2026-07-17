@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from lerobot.policies.molmoact2.processor_molmoact2 import (
     ACTION_OUTPUT_TOKEN,
     MolmoAct2PackInputsProcessorStep,
@@ -147,6 +148,22 @@ def select_compile_padding_bucket(
     )
 
 
+def synchronize_distributed_sequence_length(actual_length: int) -> int:
+    """Use one global batch maximum so every rank selects the same graph shape."""
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return actual_length
+    backend = str(dist.get_backend()).lower()
+    if "nccl" in backend:
+        if not torch.cuda.is_available():
+            raise RuntimeError("NCCL padding synchronization requires CUDA.")
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device("cpu")
+    global_length = torch.tensor(actual_length, device=device, dtype=torch.int64)
+    dist.all_reduce(global_length, op=dist.ReduceOp.MAX)
+    return int(global_length.item())
+
+
 def process_with_compile_padding_buckets(
     processor: Any,
     processor_kwargs: dict[str, Any],
@@ -158,6 +175,7 @@ def process_with_compile_padding_buckets(
     if attention_mask is None or attention_mask.ndim != 2:
         raise ValueError("MolmoAct2 bucketed packing requires a rank-2 attention_mask.")
     unpadded_length = int(attention_mask.sum(dim=1).max().item())
+    unpadded_length = synchronize_distributed_sequence_length(unpadded_length)
     target_length = select_compile_padding_bucket(unpadded_length, buckets)
     if int(inputs["input_ids"].shape[1]) != target_length:
         inputs = process_with_exact_final_padding(
