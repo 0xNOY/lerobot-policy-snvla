@@ -112,7 +112,7 @@ def _format_narration_html(value):
 
 
 def _parse_previous_narrations(value, fallback):
-    """Return the recorded narration history, falling back if it is unusable."""
+    """Return cumulative narration history, carrying it across sparse empty records."""
     if not isinstance(value, str) or not value:
         return fallback, False
     try:
@@ -121,7 +121,11 @@ def _parse_previous_narrations(value, fallback):
         return fallback, False
     if not isinstance(narrations, list) or not all(isinstance(item, str) for item in narrations):
         return fallback, False
-    return "".join(narrations), True
+    recorded = "".join(narrations)
+    # Evaluation metrics may only populate history on inference frames and
+    # leave "[]" on intervening frames. Narration history is cumulative
+    # within an episode, so an empty record must not erase known history.
+    return recorded or fallback, True
 
 
 def _render_narration(previous, current, font_size):
@@ -320,10 +324,15 @@ def load_data(
             len(current_narrations),
         )
 
-    timestamp_column = rows.get("real_timestamp")
-    if timestamp_column is None:
-        timestamp_column = values("timestamp", 0.0)
-    timestamps = [float(safe_item(value)) for value in timestamp_column]
+    # MP4 frames are stored at the dataset's fixed FPS, so video lookup must
+    # use LeRobot's frame-derived timestamp. real_timestamp is the measured,
+    # irregular wall-clock time and is only appropriate for display/playback.
+    video_timestamps = [float(value) for value in values("timestamp", 0.0)]
+    display_timestamp_column = rows.get("real_timestamp")
+    if display_timestamp_column is None:
+        display_timestamps = video_timestamps
+    else:
+        display_timestamps = [float(safe_item(value)) for value in display_timestamp_column]
 
     task_indices = values("task_index", 0)
     task_instruction = "Execute the task."
@@ -337,13 +346,13 @@ def load_data(
         "prob_boa": [float(value) for value in values("prob_boa", 0.0)],
         "current_narration": current_narrations,
         "previous_narrations": previous_narrations,
-        "timestamp": timestamps,
+        "timestamp": display_timestamps,
         "task_instruction": task_instruction,
     }
     image_loader = EpisodeImageLoader(
         dataset,
         episode_index,
-        timestamps,
+        video_timestamps,
         image_decode_batch_size,
         image_cache_size,
         image_transport,

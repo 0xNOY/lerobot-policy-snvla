@@ -10,6 +10,7 @@ from lerobot_policy_snvla.scripts.visualize_snvla_eval import (
     _frames_to_data_urls,
     _parse_previous_narrations,
     _render_narration,
+    load_data,
 )
 
 
@@ -28,10 +29,13 @@ def test_frames_to_data_urls_encodes_browser_decodable_webp():
 
 def test_previous_narrations_uses_recorded_json_and_falls_back_safely():
     recorded, used_recorded = _parse_previous_narrations('["first", " (done)\\n"]', "fallback")
+    sparse, sparse_is_valid = _parse_previous_narrations("[]", "first")
     invalid, used_invalid = _parse_previous_narrations("{invalid", "fallback")
 
     assert recorded == "first (done)\n"
     assert used_recorded is True
+    assert sparse == "first"
+    assert sparse_is_valid is True
     assert invalid == "fallback"
     assert used_invalid is False
 
@@ -91,3 +95,46 @@ def test_episode_image_loader_prefetches_next_compressed_chunk():
     assert len(dataset.reader.queries) >= 2
     assert all(value.startswith("data:image/webp;base64,") for value in first.values())
     assert all(value.startswith("data:image/webp;base64,") for value in prefetched.values())
+
+
+def test_load_data_uses_frame_timestamps_for_video_and_real_timestamps_for_display():
+    rows = {
+        "timestamp": [0.0, 1 / 30, 2 / 30],
+        "real_timestamp": [0.0, 0.57, 0.61],
+        "current_narration": ["first", "", "second"],
+        "previous_narrations": ["[]", "[]", '["first"]'],
+    }
+
+    class FrameTable:
+        def __getitem__(self, index):
+            assert index == slice(0, 3)
+            return rows
+
+    class Reader:
+        hf_dataset = FrameTable()
+
+    class Metadata:
+        episodes = {"dataset_from_index": [0], "dataset_to_index": [3]}
+        camera_keys = ["camera.main"]
+
+    class Dataset:
+        meta = Metadata()
+
+        def _ensure_reader(self):
+            return Reader()
+
+    data, _, image_loader = load_data(
+        Dataset(),
+        episode_index=0,
+        image_decode_batch_size=2,
+        image_cache_size=4,
+        image_transport="webp",
+        image_quality=60,
+        image_encoding_workers=1,
+    )
+    try:
+        assert data["timestamp"] == rows["real_timestamp"]
+        assert data["previous_narrations"] == ["", "first", "first"]
+        assert image_loader.timestamps == rows["timestamp"]
+    finally:
+        image_loader.close()
